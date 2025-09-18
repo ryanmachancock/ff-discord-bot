@@ -15,6 +15,13 @@ SEASON_ID = int(os.getenv('ESPN_SEASON_ID'))
 SWID = os.getenv('ESPN_SWID')
 ESPN_S2 = os.getenv('ESPN_S2')
 
+# Debug environment variables
+print(f"TOKEN present: {bool(TOKEN)}")
+print(f"LEAGUE_ID: {LEAGUE_ID}")
+print(f"SEASON_ID: {SEASON_ID}")
+print(f"SWID present: {bool(SWID)}")
+print(f"ESPN_S2 present: {bool(ESPN_S2)}")
+
 class MyClient(discord.Client):
     def __init__(self, *, intents: discord.Intents):
         super().__init__(intents=intents)
@@ -29,6 +36,7 @@ client = MyClient(intents=intents)
 @client.event
 async def on_ready():
     print(f'Logged in as {client.user} (ID: {client.user.id})')
+    print('Bot is ready and commands are synced!')
 
 @client.tree.command(name="ping", description="Check if the bot is alive.")
 async def ping(interaction: discord.Interaction):
@@ -146,13 +154,37 @@ async def player(interaction: discord.Interaction, player_name: str):
         if not found_player:
             await interaction.followup.send(f"Player '{player_name}' not found in any team.")
             return
-        # Get player stats
-        actual_points = getattr(found_player, 'points', 'N/A')
-        proj_points = getattr(found_player, 'projected_points', 'N/A')
+        # Try different opponent attribute names
+        opponent = (
+            getattr(found_player, 'opponent', None) or
+            getattr(found_player, 'proOpponent', None) or
+            getattr(found_player, 'nextOpponent', None) or
+            getattr(found_player, 'opp', None) or
+            'N/A'
+        )
+        
+        # Get player stats - use the same logic as team command
+        def get_points(player):
+            return (
+                getattr(player, 'points', None)
+                or getattr(player, 'total_points', None)
+                or getattr(player, 'score', None)
+                or 'N/A'
+            )
+        
+        def get_proj(player):
+            return (
+                getattr(player, 'projected_points', None)
+                or getattr(player, 'projected_total_points', None)
+                or getattr(player, 'proj_score', None)
+                or 'N/A'
+            )
+        
+        actual_points = get_points(found_player)
+        proj_points = get_proj(found_player)
         season_total = getattr(found_player, 'total_points', 'N/A')
         injury_status = getattr(found_player, 'injuryStatus', 'N/A')
         nfl_team = getattr(found_player, 'proTeam', 'N/A')
-        opponent = getattr(found_player, 'opponent', 'N/A')
         position = getattr(found_player, 'position', 'N/A')
         # Create detailed embed
         embed = discord.Embed(title=f"📊 {found_player.name}", color=discord.Color.green())
@@ -383,13 +415,37 @@ class PlayerSelectDropdown(Select):
             await interaction.response.send_message("Player not found.", ephemeral=True)
             return
         
-        # Get player stats
-        actual_points = getattr(selected_player, 'points', 'N/A')
-        proj_points = getattr(selected_player, 'projected_points', 'N/A')
+        # Get player stats - use the same logic as team command
+        def get_points(player):
+            return (
+                getattr(player, 'points', None)
+                or getattr(player, 'total_points', None)
+                or getattr(player, 'score', None)
+                or 'N/A'
+            )
+        
+        def get_proj(player):
+            return (
+                getattr(player, 'projected_points', None)
+                or getattr(player, 'projected_total_points', None)
+                or getattr(player, 'proj_score', None)
+                or 'N/A'
+            )
+        
+        # Try different opponent attribute names
+        opponent = (
+            getattr(selected_player, 'opponent', None) or
+            getattr(selected_player, 'proOpponent', None) or
+            getattr(selected_player, 'nextOpponent', None) or
+            getattr(selected_player, 'opp', None) or
+            'N/A'
+        )
+        
+        actual_points = get_points(selected_player)
+        proj_points = get_proj(selected_player)
         season_total = getattr(selected_player, 'total_points', 'N/A')
         injury_status = getattr(selected_player, 'injuryStatus', 'N/A')
         nfl_team = getattr(selected_player, 'proTeam', 'N/A')
-        opponent = getattr(selected_player, 'opponent', 'N/A')
         position = getattr(selected_player, 'position', 'N/A')
         
         # Create detailed embed
@@ -405,6 +461,9 @@ class PlayerSelectDropdown(Select):
 
 if __name__ == '__main__':
     try:
+        print("Attempting to connect to Discord...")
         client.run(TOKEN)
     except Exception as e:
         print(f"Bot failed to start: {e}")
+        import traceback
+        traceback.print_exc()

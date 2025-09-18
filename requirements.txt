@@ -1,0 +1,3 @@
+discord.py
+espn-api
+python-dotenv

@@ -1382,25 +1382,16 @@ async def sleeper(interaction: discord.Interaction, position: str = None):
         except Exception as follow_error:
             print(f"Failed to send error message: {follow_error}")
 
-@client.tree.command(name="matchup", description="Detailed head-to-head matchup analysis for this week.")
+@client.tree.command(name="matchup", description="Detailed player-by-player matchup analysis for this week.")
 @app_commands.describe(team1="First team name", team2="Second team name (optional - will try to find current matchup)")
 async def matchup(interaction: discord.Interaction, team1: str, team2: str = None):
     try:
         await interaction.response.defer()
 
-        # Quick validation before ESPN API call
-        if not LEAGUE_ID or not SEASON_ID:
-            await interaction.followup.send("Bot configuration error: Missing league or season ID")
-            return
-
-        # Initialize league
-        try:
-            if SWID and ESPN_S2:
-                league = League(league_id=LEAGUE_ID, year=SEASON_ID, swid=SWID, espn_s2=ESPN_S2)
-            else:
-                league = League(league_id=LEAGUE_ID, year=SEASON_ID)
-        except Exception as api_error:
-            await interaction.followup.send(f"ESPN API error: {api_error}")
+        # Use multi-league system
+        league = get_league(user_id=interaction.user.id)
+        if not league:
+            await interaction.followup.send("❌ No league found. Use `/register_league` to add your ESPN Fantasy League first, or contact an admin if you want to use the default league.", ephemeral=True)
             return
 
         # Find first team
@@ -1412,70 +1403,30 @@ async def matchup(interaction: discord.Interaction, team1: str, team2: str = Non
         team2_obj = None
         current_week = getattr(league, 'current_week', 1)
 
-        # If team2 not specified, try to find current week opponent
+        # Find second team (improved opponent detection using scoreboard)
         if not team2:
-            print(f"DEBUG: Trying to find opponent for {team1_obj.team_name} in week {current_week}")
-
-            # Method 1: Try team schedule
+            # Try to find current week opponent via scoreboard
             try:
-                if hasattr(team1_obj, 'schedule') and team1_obj.schedule:
-                    print(f"DEBUG: Team has schedule with {len(team1_obj.schedule)} entries")
-                    if len(team1_obj.schedule) >= current_week:
+                scoreboard = league.scoreboard(week=current_week)
+                for matchup in scoreboard:
+                    if hasattr(matchup, 'home_team') and hasattr(matchup, 'away_team'):
+                        if matchup.home_team.team_id == team1_obj.team_id:
+                            team2_obj = matchup.away_team
+                            break
+                        elif matchup.away_team.team_id == team1_obj.team_id:
+                            team2_obj = matchup.home_team
+                            break
+            except Exception as e:
+                print(f"Scoreboard opponent detection failed: {e}")
+                # Fallback to schedule method
+                try:
+                    if hasattr(team1_obj, 'schedule') and team1_obj.schedule and len(team1_obj.schedule) >= current_week:
                         current_matchup = team1_obj.schedule[current_week - 1]
-                        print(f"DEBUG: Current matchup object: {current_matchup}")
+                        if hasattr(current_matchup, 'home_team') and hasattr(current_matchup, 'away_team'):
+                            team2_obj = current_matchup.away_team if current_matchup.home_team == team1_obj else current_matchup.home_team
+                except:
+                    pass
 
-                        if current_matchup:
-                            # Debug what attributes the matchup has
-                            if hasattr(current_matchup, '__dict__'):
-                                print(f"DEBUG: Matchup attributes: {list(current_matchup.__dict__.keys())}")
-
-                            if hasattr(current_matchup, 'home_team') and hasattr(current_matchup, 'away_team'):
-                                team2_obj = current_matchup.away_team if current_matchup.home_team == team1_obj else current_matchup.home_team
-                                print(f"DEBUG: Found opponent via schedule: {team2_obj.team_name if team2_obj else 'None'}")
-            except (IndexError, AttributeError) as e:
-                print(f"DEBUG: Schedule method failed: {e}")
-
-            # Method 2: Try league scoreboard/matchups for current week
-            if not team2_obj:
-                try:
-                    print("DEBUG: Trying league scoreboard method")
-                    if hasattr(league, 'scoreboard') and callable(league.scoreboard):
-                        current_scoreboard = league.scoreboard(current_week)
-                        print(f"DEBUG: Got scoreboard for week {current_week}")
-
-                        for matchup in current_scoreboard:
-                            if hasattr(matchup, 'home_team') and hasattr(matchup, 'away_team'):
-                                if matchup.home_team == team1_obj:
-                                    team2_obj = matchup.away_team
-                                    print(f"DEBUG: Found opponent via scoreboard (home): {team2_obj.team_name}")
-                                    break
-                                elif matchup.away_team == team1_obj:
-                                    team2_obj = matchup.home_team
-                                    print(f"DEBUG: Found opponent via scoreboard (away): {team2_obj.team_name}")
-                                    break
-                except Exception as e:
-                    print(f"DEBUG: Scoreboard method failed: {e}")
-
-            # Method 3: Alternative - check all other teams' schedules
-            if not team2_obj:
-                try:
-                    print("DEBUG: Trying reverse lookup method")
-                    for other_team in league.teams:
-                        if other_team == team1_obj:
-                            continue
-
-                        if hasattr(other_team, 'schedule') and other_team.schedule:
-                            if len(other_team.schedule) >= current_week:
-                                other_matchup = other_team.schedule[current_week - 1]
-                                if other_matchup and hasattr(other_matchup, 'home_team') and hasattr(other_matchup, 'away_team'):
-                                    if other_matchup.home_team == team1_obj or other_matchup.away_team == team1_obj:
-                                        team2_obj = other_team
-                                        print(f"DEBUG: Found opponent via reverse lookup: {team2_obj.team_name}")
-                                        break
-                except Exception as e:
-                    print(f"DEBUG: Reverse lookup failed: {e}")
-
-        # If still no team2, require manual input
         if not team2_obj:
             if team2:
                 team2_obj = next((t for t in league.teams if t.team_name.lower() == team2.lower()), None)
@@ -1486,149 +1437,227 @@ async def matchup(interaction: discord.Interaction, team1: str, team2: str = Non
                 await interaction.followup.send(f"Could not find current opponent for {team1}. Please specify both teams: `/matchup {team1} TeamName`")
                 return
 
-        # Get team data and projections
-        def get_team_lineup_data(team):
+        # Helper functions for data extraction
+        def get_actual_points(player, league_ref):
+            """Get actual points for current week"""
+            try:
+                current_week = getattr(league_ref, 'current_week', 1)
+                if hasattr(player, 'stats') and player.stats:
+                    week_stats = player.stats.get(current_week, {})
+                    actual_points = week_stats.get('points', None)
+                    if actual_points is not None and actual_points > 0:
+                        return actual_points
+            except:
+                pass
+            return 0
+
+        def get_weekly_projected(player, league_ref):
+            """Get weekly projected points"""
+            try:
+                current_week = getattr(league_ref, 'current_week', 1)
+                if hasattr(player, 'stats') and player.stats:
+                    week_stats = player.stats.get(current_week, {})
+                    projected = week_stats.get('projected_points', None)
+                    if projected is not None:
+                        return projected
+                # Fallback to other projection attributes
+                for attr in ['proj_points', 'projected_points']:
+                    value = getattr(player, attr, None)
+                    if value is not None:
+                        return value
+            except:
+                pass
+            return 0
+
+        def get_player_status(player):
+            """Get injury status"""
+            status_abbrev = {
+                'ACTIVE': '', 'QUESTIONABLE': 'Q', 'OUT': 'O', 'INJURY_RESERVE': 'IR', 'NORMAL': '', None: ''
+            }
+            # Don't show status for D/ST
+            pos = getattr(player, 'position', '')
+            if pos in ['D/ST', 'DST', 'DEF']:
+                return ''
+
+            status = getattr(player, 'injuryStatus', None)
+            abbrev = status_abbrev.get(status, '')
+            return f" ({abbrev})" if abbrev else ''
+
+        # Get lineup data for both teams
+        def get_lineup_with_scores(team):
             starters = [p for p in team.roster if getattr(p, 'lineupSlot', None) != "BE"]
 
-            lineup_by_pos = {}
-            total_projected = 0
+            # Group by position with proper ordering
+            position_order = ['QB', 'RB', 'WR', 'TE', 'FLEX', 'K', 'D/ST', 'DST']
+            lineup_data = []
 
-            for player in starters:
+            # Sort players by lineup slot order
+            def get_position_priority(player):
                 pos = getattr(player, 'position', 'FLEX')
-                projected = get_current_week_points(player, league)
+                return position_order.index(pos) if pos in position_order else 99
 
-                if projected != 'N/A':
-                    projected_val = float(projected)
-                    total_projected += projected_val
-                else:
-                    projected_val = 0
+            starters_sorted = sorted(starters, key=get_position_priority)
 
-                if pos not in lineup_by_pos:
-                    lineup_by_pos[pos] = []
+            for player in starters_sorted:
+                pos = getattr(player, 'position', 'FLEX')
+                actual = get_actual_points(player, league)
+                projected = get_weekly_projected(player, league)
+                status = get_player_status(player)
 
-                lineup_by_pos[pos].append({
-                    'name': player.name,
-                    'projected': projected_val,
-                    'team': getattr(player, 'proTeam', 'UNK')
+                lineup_data.append({
+                    'position': pos,
+                    'name': player.name + status,
+                    'actual': actual,
+                    'projected': projected
                 })
 
-            return lineup_by_pos, total_projected
+            return lineup_data
 
-        team1_lineup, team1_total = get_team_lineup_data(team1_obj)
-        team2_lineup, team2_total = get_team_lineup_data(team2_obj)
+        team1_lineup = get_lineup_with_scores(team1_obj)
+        team2_lineup = get_lineup_with_scores(team2_obj)
 
-        # Create matchup embed
-        embed = discord.Embed(title=f"⚔️ Week {current_week} Matchup Analysis", color=discord.Color.orange())
+        # Calculate totals
+        team1_actual_total = sum(p['actual'] for p in team1_lineup)
+        team1_proj_total = sum(p['projected'] for p in team1_lineup)
+        team2_actual_total = sum(p['actual'] for p in team2_lineup)
+        team2_proj_total = sum(p['projected'] for p in team2_lineup)
 
-        # Team headers and totals with clearer labeling
-        embed.add_field(name=f"🏈 {team1_obj.team_name}", value=f"**{team1_total:.1f} projected**", inline=True)
-        embed.add_field(name="VS", value="⚔️", inline=True)
-        embed.add_field(name=f"🏈 {team2_obj.team_name}", value=f"**{team2_total:.1f} projected**", inline=True)
-
-        # Position-by-position breakdown
-        all_positions = set(list(team1_lineup.keys()) + list(team2_lineup.keys()))
-        position_order = ['QB', 'RB', 'WR', 'TE', 'FLEX', 'K', 'D/ST', 'DST']
-
-        # Sort positions by our preferred order
-        sorted_positions = []
-        for pos in position_order:
-            if pos in all_positions:
-                sorted_positions.append(pos)
-
-        # Add any remaining positions
-        for pos in all_positions:
-            if pos not in sorted_positions:
-                sorted_positions.append(pos)
-
+        # Create simple side-by-side comparison: "QB Dak Prescott 0.0 | 0.0 Lamar Jackson QB"
         matchup_lines = []
-        matchup_lines.append(f"{'Position':<8} {team1_obj.team_name[:12]:<12} {team2_obj.team_name[:12]:<12}")
-        matchup_lines.append(f"{'-'*8} {'-'*12} {'-'*12}")
 
-        position_advantages = {'team1': 0, 'team2': 0}
+        # Ensure both lineups have same length for alignment
+        max_length = max(len(team1_lineup), len(team2_lineup))
 
-        for pos in sorted_positions:
-            team1_players = team1_lineup.get(pos, [])
-            team2_players = team2_lineup.get(pos, [])
-
-            # Sort players by projection for each team
-            team1_players_sorted = sorted(team1_players, key=lambda x: x['projected'], reverse=True)
-            team2_players_sorted = sorted(team2_players, key=lambda x: x['projected'], reverse=True)
-
-            # Calculate total for this position group
-            team1_pos_total = sum(p['projected'] for p in team1_players)
-            team2_pos_total = sum(p['projected'] for p in team2_players)
-
-            # Track advantages based on position totals
-            if team1_pos_total > team2_pos_total:
-                position_advantages['team1'] += 1
-            elif team2_pos_total > team1_pos_total:
-                position_advantages['team2'] += 1
-
-            # If multiple players at position, show the total and count
-            if len(team1_players) > 1 or len(team2_players) > 1:
-                team1_count = len(team1_players)
-                team2_count = len(team2_players)
-                pos_display = f"{pos}({max(team1_count, team2_count)})"
-
-                team1_display = f"{team1_pos_total:.1f}" if team1_pos_total > 0 else "---"
-                team2_display = f"{team2_pos_total:.1f}" if team2_pos_total > 0 else "---"
+        for i in range(max_length):
+            # Team 1 player data
+            if i < len(team1_lineup):
+                p1 = team1_lineup[i]
+                pos1 = p1['position'][:3]
+                name1 = p1['name'][:15]  # Shorten to prevent overflow
+                actual1 = f"{p1['actual']:.1f}"
             else:
-                pos_display = pos
-                team1_display = f"{team1_pos_total:.1f}" if team1_pos_total > 0 else "---"
-                team2_display = f"{team2_pos_total:.1f}" if team2_pos_total > 0 else "---"
+                pos1 = name1 = actual1 = ""
 
-            line = f"{pos_display:<8} {team1_display:<12} {team2_display:<12}"
-            matchup_lines.append(line)
+            # Team 2 player data
+            if i < len(team2_lineup):
+                p2 = team2_lineup[i]
+                pos2 = p2['position'][:3]
+                name2 = p2['name'][:15]  # Shorten to prevent overflow
+                actual2 = f"{p2['actual']:.1f}"
+            else:
+                pos2 = name2 = actual2 = ""
 
-        matchup_table = f"```\n{chr(10).join(matchup_lines)}\n```"
-        embed.add_field(name="📊 Position Breakdown (Projected Points)", value=matchup_table, inline=False)
+            # Create properly spaced format like scoreboard design
+            if pos1 or pos2:  # Only add line if at least one player exists
+                # Left side: Position Player_Name Score (total width 24: 3+1+15+1+4)
+                if pos1:
+                    left_side = f"{pos1:<3} {name1:<15} {actual1:>5}"
+                else:
+                    left_side = " " * 24
 
-        # Matchup analysis
-        analysis_lines = []
+                # Right side: Score Player_Name Position (total width 24: 5+1+15+3)
+                if pos2:
+                    right_side = f"{actual2:<5} {name2:<15} {pos2:>3}"
+                else:
+                    right_side = " " * 24
 
-        # Overall projection
-        diff = abs(team1_total - team2_total)
-        if team1_total > team2_total:
-            analysis_lines.append(f"📈 **Projected Winner**: {team1_obj.team_name} by {diff:.1f} pts")
-        elif team2_total > team1_total:
-            analysis_lines.append(f"📈 **Projected Winner**: {team2_obj.team_name} by {diff:.1f} pts")
+                # No extra padding needed - should be exactly right width
+                line = f"{left_side} | {right_side}"
+                matchup_lines.append(line)
+
+        # Add totals row with proper spacing - create divider by measuring actual content
+        if matchup_lines:
+            # Create a sample line to measure exact positioning
+            sample_left = f"{'XXX':<3} {'XXXXXXXXXXXXXXX':<15} {'99.9':>5}"
+            sample_right = f"{'99.9':<5} {'XXXXXXXXXXXXXXX':<15} {'XXX':>3}"
+            sample_line = f"{sample_left} | {sample_right}"
+
+            # Find pipe position in sample line
+            pipe_pos = sample_line.find(' | ')
+
+            # Create divider that matches exactly
+            divider_left = '-' * pipe_pos
+            divider_right = '-' * (len(sample_line) - pipe_pos - 3)  # -3 for ' | '
+            divider_line = f"{divider_left} | {divider_right}"
+            matchup_lines.append(divider_line)
+
+            # Left total: formatted exactly like player rows
+            left_total = f"{'TOT':<3} {'TOTAL':<15} {team1_actual_total:>5.1f}"
+            # Right total: formatted exactly like player rows
+            right_total = f"{team2_actual_total:<5.1f} {'TOTAL':<15} {'TOT':>3}"
+            total_line = f"{left_total} | {right_total}"
+            matchup_lines.append(total_line)
+
+        # Create embed
+        embed = discord.Embed(
+            title=f"⚔️ Player-by-Player Matchup - Week {current_week}",
+            color=0xff6b35
+        )
+
+        # Team headers
+        embed.add_field(name=f"🔵 {team1_obj.team_name}", value=f"**{team1_actual_total:.1f}** actual | **{team1_proj_total:.1f}** projected", inline=True)
+        embed.add_field(name="VS", value="⚔️", inline=True)
+        embed.add_field(name=f"🔴 {team2_obj.team_name}", value=f"**{team2_actual_total:.1f}** actual | **{team2_proj_total:.1f}** projected", inline=True)
+
+        # Player comparison table - split into chunks to avoid Discord 1024 char limit
+        full_table = chr(10).join(matchup_lines)
+
+        # Split into manageable chunks (Discord limit is 1024 chars per field)
+        chunk_size = 900  # Leave room for code block formatting
+        table_chunks = []
+
+        if len(full_table) <= chunk_size:
+            table_chunks.append(full_table)
         else:
-            analysis_lines.append("📈 **Projected**: Even matchup!")
+            # Split by lines to keep formatting intact
+            lines = matchup_lines
+            current_chunk = []
+            current_length = 0
 
-        # Position advantages
-        if position_advantages['team1'] > position_advantages['team2']:
-            analysis_lines.append(f"🎯 **Position Edge**: {team1_obj.team_name} ({position_advantages['team1']} vs {position_advantages['team2']})")
-        elif position_advantages['team2'] > position_advantages['team1']:
-            analysis_lines.append(f"🎯 **Position Edge**: {team2_obj.team_name} ({position_advantages['team2']} vs {position_advantages['team1']})")
+            for line in lines:
+                line_length = len(line) + 1  # +1 for newline
+                if current_length + line_length > chunk_size and current_chunk:
+                    table_chunks.append(chr(10).join(current_chunk))
+                    current_chunk = [line]
+                    current_length = line_length
+                else:
+                    current_chunk.append(line)
+                    current_length += line_length
+
+            if current_chunk:
+                table_chunks.append(chr(10).join(current_chunk))
+
+        # Add table chunks as separate fields with team headers
+        for i, chunk in enumerate(table_chunks):
+            if i == 0:
+                # First chunk gets team headers
+                team1_short = team1_obj.team_name[:12]
+                team2_short = team2_obj.team_name[:12]
+                field_name = f"📊 {team1_short} vs {team2_short}"
+            else:
+                field_name = f"📊 Continued ({i+1})"
+            embed.add_field(name=field_name, value=f"```\n{chunk}\n```", inline=False)
+
+        # Quick analysis
+        analysis = []
+        actual_diff = abs(team1_actual_total - team2_actual_total)
+        proj_diff = abs(team1_proj_total - team2_proj_total)
+
+        if team1_actual_total > team2_actual_total:
+            analysis.append(f"🏆 **Current Leader**: {team1_obj.team_name} by {actual_diff:.1f} pts")
+        elif team2_actual_total > team1_actual_total:
+            analysis.append(f"🏆 **Current Leader**: {team2_obj.team_name} by {actual_diff:.1f} pts")
         else:
-            analysis_lines.append("🎯 **Position Edge**: Even split")
+            analysis.append("🏆 **Current**: Tied game!")
 
-        # Key players analysis
-        all_team1_players = []
-        all_team2_players = []
-
-        for pos_players in team1_lineup.values():
-            all_team1_players.extend(pos_players)
-        for pos_players in team2_lineup.values():
-            all_team2_players.extend(pos_players)
-
-        if all_team1_players:
-            team1_star = max(all_team1_players, key=lambda x: x['projected'])
-            analysis_lines.append(f"⭐ **{team1_obj.team_name} Key Player**: {team1_star['name']} ({team1_star['projected']:.1f} pts)")
-
-        if all_team2_players:
-            team2_star = max(all_team2_players, key=lambda x: x['projected'])
-            analysis_lines.append(f"⭐ **{team2_obj.team_name} Key Player**: {team2_star['name']} ({team2_star['projected']:.1f} pts)")
-
-        # Closeness indicator
-        if diff <= 5:
-            analysis_lines.append("🔥 **Closeness**: Toss-up game! Could go either way")
-        elif diff <= 15:
-            analysis_lines.append("⚠️ **Closeness**: Competitive matchup")
+        if team1_proj_total > team2_proj_total:
+            analysis.append(f"📈 **Projected Winner**: {team1_obj.team_name} by {proj_diff:.1f} pts")
+        elif team2_proj_total > team1_proj_total:
+            analysis.append(f"📈 **Projected Winner**: {team2_obj.team_name} by {proj_diff:.1f} pts")
         else:
-            analysis_lines.append("💪 **Closeness**: Projected blowout")
+            analysis.append("📈 **Projected**: Even matchup!")
 
-        embed.add_field(name="🔍 Matchup Analysis", value="\n".join(analysis_lines), inline=False)
+        embed.add_field(name="🔍 Quick Analysis", value="\n".join(analysis), inline=False)
 
         await interaction.followup.send(embed=embed)
 

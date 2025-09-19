@@ -235,10 +235,7 @@ async def team(interaction: discord.Interaction, team_name: str):
 
         # Initialize league with timeout protection
         try:
-            if SWID and ESPN_S2:
-                league = League(league_id=LEAGUE_ID, year=SEASON_ID, swid=SWID, espn_s2=ESPN_S2)
-            else:
-                league = League(league_id=LEAGUE_ID, year=SEASON_ID)
+            league = get_league()
         except Exception as api_error:
             await interaction.followup.send(f"ESPN API error: {api_error}")
             return
@@ -264,28 +261,98 @@ async def team(interaction: discord.Interaction, team_name: str):
         def get_points(player):
             return get_current_week_points(player, league)
 
-        def get_proj(player):
-            return (
-                getattr(player, 'projected_points', None)
-                or getattr(player, 'projected_total_points', None)
-                or getattr(player, 'proj_score', None)
-                or 'N/A'
-            )
+        def get_weekly_proj(player):
+            """Get projected points for current week only"""
+            current_week = getattr(league, 'current_week', 1)
+
+            # Try to get current week projected points from stats
+            if hasattr(player, 'stats') and player.stats:
+                try:
+                    week_stats = player.stats.get(current_week, {})
+                    projected_points = week_stats.get('projected_points', None)
+                    if projected_points is not None:
+                        return projected_points
+                except:
+                    pass
+
+            # Fallback: try to get weekly projection from player attributes
+            try:
+                # Some ESPN API versions store weekly projections differently
+                if hasattr(player, 'projected_points') and hasattr(player, 'total_points'):
+                    # If total_points exists, projected_points might be weekly
+                    weekly_proj = getattr(player, 'projected_points', None)
+                    if weekly_proj and weekly_proj < 50:  # Reasonable weekly max
+                        return weekly_proj
+
+                # Try alternative attribute names for weekly projections
+                weekly_attrs = ['proj_points', 'projected_week_points', 'week_projected_points']
+                for attr in weekly_attrs:
+                    value = getattr(player, attr, None)
+                    if value is not None:
+                        return value
+
+            except:
+                pass
+
+            return 'N/A'
         def get_status(player):
+            # Don't show status for D/ST positions
+            pos = getattr(player, 'position', '')
+            if pos in ['D/ST', 'DST', 'DEF']:
+                return ''
+
             status = getattr(player, 'injuryStatus', None)
             abbrev = status_abbrev.get(status, status_abbrev.get('NORMAL', ''))
+
+            # Don't show status for Available players (A or N)
+            if abbrev in ['A', 'N']:
+                return ''
+
             return abbrev
+        def get_actual_points(player):
+            """Get actual points for current week"""
+            current_week = getattr(league, 'current_week', 1)
+            if hasattr(player, 'stats') and player.stats:
+                try:
+                    week_stats = player.stats.get(current_week, {})
+                    actual_points = week_stats.get('points', None)
+                    if actual_points is not None and actual_points > 0:
+                        return actual_points
+                    # Check applied stats for actual game performance
+                    applied_stats = week_stats.get('appliedStats', {})
+                    if applied_stats and len(applied_stats) > 0:
+                        total_points = 0
+                        for stat_id, value in applied_stats.items():
+                            if isinstance(value, (int, float)) and value > 0:
+                                total_points += value
+                        if total_points > 0:
+                            return total_points
+                except:
+                    pass
+            return 0
+
         def player_row(player):
             pos = getattr(player, 'position', 'UNK')
-            name = f"{pos} {player.name}"
-            actual = str(get_points(player))
             status = get_status(player)
-            # Format points consistently with 2 decimal places
-            if actual == 'N/A':
-                points_display = "N/A"
+            # Put status in parentheses after name
+            name_with_status = f"{pos} {player.name} ({status})" if status else f"{pos} {player.name}"
+
+            actual = get_actual_points(player)
+            projected = get_proj(player)
+
+            # Format actual points
+            if actual == 0:
+                actual_str = "0.0"
             else:
-                points_display = f"{float(actual):5.2f}"
-            return [name, status, f"{points_display} pts"]
+                actual_str = f"{float(actual):.1f}"
+
+            # Format projected points
+            if projected == 'N/A' or projected is None:
+                proj_str = "N/A"
+            else:
+                proj_str = f"{float(projected):.1f}"
+
+            return [name_with_status, f"{actual_str} pts", f"{proj_str} pts"]
         # Use lineupSlot == 'BE' for bench, all others are starters
         starters = [p for p in team.roster if getattr(p, 'lineupSlot', None) != "BE"]
         bench = [p for p in team.roster if getattr(p, 'lineupSlot', None) == "BE"]
@@ -300,50 +367,70 @@ async def team(interaction: discord.Interaction, team_name: str):
                 return 4
             return slot_order.get(slot, slot_order.get(player.position, 99))
         starters_sorted = sorted(starters, key=get_slot_sort_key)
-        # Calculate total starter points
-        total_starter_points = sum(float(get_points(p)) for p in starters_sorted if get_points(p) != 'N/A')
+
+        # Calculate total starter points (actual and projected)
+        total_actual_points = sum(get_actual_points(p) for p in starters_sorted)
+        total_projected_points = sum(float(get_weekly_proj(p)) for p in starters_sorted if get_weekly_proj(p) != 'N/A' and get_weekly_proj(p) is not None)
+
         # Create custom formatted table for perfect alignment
-        header = f"{'Player':<22} {'Status':<8} {'Projected':>9}"
-        separator = f"{'-'*22} {'-'*8} {'-'*9}"
+        header = f"{'Player':<24} {'Projected':>10}  {'Actual':>8}"
+        separator = f"{'-'*24} {'-'*10}  {'-'*8}"
 
         lines = [header, separator]
         for p in starters_sorted:
-            # Use position abbreviation instead of emoji
             pos = getattr(p, 'position', 'UNK')
-            name = f"{pos} {p.name}"
             status = get_status(p)
-            points = get_points(p)
+            # Put status in parentheses after name
+            name_with_status = f"{pos} {p.name} ({status})" if status else f"{pos} {p.name}"
 
-            if points == 'N/A':
-                points_str = "N/A pts"
+            actual = get_actual_points(p)
+            projected = get_weekly_proj(p)
+
+            # Format projected points
+            if projected == 'N/A' or projected is None:
+                proj_str = "N/A pts"
             else:
-                points_str = f"{float(points):5.2f} pts"
+                proj_str = f"{float(projected):.1f} pts"
 
-            line = f"{name:<22} {status:<8} {points_str:>9}"
+            # Format actual points
+            actual_str = f"{actual:.1f} pts" if actual > 0 else "0.0 pts"
+
+            line = f"{name_with_status:<24} {proj_str:>10}  {actual_str:>8}"
             lines.append(line)
 
-        lines.append(f"\nTotal Starter Points: {total_starter_points:.2f}")
+        # Add separator and total row
+        lines.append(separator)
+        total_proj_str = f"{total_projected_points:.1f} pts"
+        total_actual_str = f"{total_actual_points:.1f} pts"
+        total_line = f"{'TOTAL':<24} {total_proj_str:>10}  {total_actual_str:>8}"
+        lines.append(total_line)
         starters_text = f"```\n{chr(10).join(lines)}\n```"
         starters_text = starters_text if starters_sorted else "None"
         # Create custom formatted bench table for perfect alignment
         if bench:
-            bench_header = f"{'Player':<22} {'Status':<8} {'Projected':>9}"
-            bench_separator = f"{'-'*22} {'-'*8} {'-'*9}"
+            bench_header = f"{'Player':<24} {'Projected':>10}  {'Actual':>8}"
+            bench_separator = f"{'-'*24} {'-'*10}  {'-'*8}"
 
             bench_lines = [bench_header, bench_separator]
             for p in bench:
-                # Use position abbreviation instead of emoji
                 pos = getattr(p, 'position', 'UNK')
-                name = f"{pos} {p.name}"
                 status = get_status(p)
-                points = get_points(p)
+                # Put status in parentheses after name
+                name_with_status = f"{pos} {p.name} ({status})" if status else f"{pos} {p.name}"
 
-                if points == 'N/A':
-                    points_str = "N/A pts"
+                actual = get_actual_points(p)
+                projected = get_weekly_proj(p)
+
+                # Format projected points
+                if projected == 'N/A' or projected is None:
+                    proj_str = "N/A pts"
                 else:
-                    points_str = f"{float(points):5.2f} pts"
+                    proj_str = f"{float(projected):.1f} pts"
 
-                line = f"{name:<22} {status:<8} {points_str:>9}"
+                # Format actual points
+                actual_str = f"{actual:.1f} pts" if actual > 0 else "0.0 pts"
+
+                line = f"{name_with_status:<24} {proj_str:>10}  {actual_str:>8}"
                 bench_lines.append(line)
 
             bench_text = f"```\n{chr(10).join(bench_lines)}\n```"
@@ -3290,8 +3377,18 @@ class ShowAllButton(Button):
             )
         
         def get_status(player):
+            # Don't show status for D/ST positions
+            pos = getattr(player, 'position', '')
+            if pos in ['D/ST', 'DST', 'DEF']:
+                return ''
+
             status = getattr(player, 'injuryStatus', None)
             abbrev = status_abbrev.get(status, status_abbrev.get('NORMAL', ''))
+
+            # Don't show status for Available players (A or N)
+            if abbrev in ['A', 'N']:
+                return ''
+
             return abbrev
         
         

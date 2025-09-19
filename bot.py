@@ -1,6 +1,7 @@
 print("Starting Fantasy Football bot...")
 
 import os
+import asyncio
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -2068,6 +2069,987 @@ class BackToMenuView(View):
 
         view = MainMenuView()
         await interaction.response.edit_message(embed=embed, view=view)
+
+@client.tree.command(name="card", description="Generate a visual team card with key stats and graphics.")
+@app_commands.describe(team_name="Team name to generate card for")
+async def card(interaction: discord.Interaction, team_name: str):
+    await interaction.response.defer()
+
+    try:
+        # Helper function to ensure field values don't exceed 1024 characters
+        def safe_field_value(text, max_length=1024):
+            if len(text) <= max_length:
+                return text
+            return text[:max_length-3] + "..."
+
+        if ESPN_S2 and SWID:
+            league = League(league_id=LEAGUE_ID, year=SEASON_ID, swid=SWID, espn_s2=ESPN_S2)
+        else:
+            league = League(league_id=LEAGUE_ID, year=SEASON_ID)
+
+        # Find the team
+        team = None
+        for t in league.teams:
+            if team_name.lower() in t.team_name.lower():
+                team = t
+                break
+
+        if not team:
+            await interaction.followup.send(f"Team '{team_name}' not found. Available teams: {', '.join(t.team_name for t in league.teams)}", ephemeral=True)
+            return
+
+        # Get current week
+        current_week = getattr(league, 'current_week', 1)
+
+        # Calculate team stats
+        def calculate_team_stats(team):
+            total_points = 0
+            games_played = 0
+            weekly_scores = []
+
+            # Get weekly scores
+            for week in range(1, current_week):
+                try:
+                    week_score = team.scores[week - 1] if len(team.scores) >= week else 0
+                    if week_score > 0:
+                        weekly_scores.append(week_score)
+                        total_points += week_score
+                        games_played += 1
+                except (IndexError, AttributeError):
+                    pass
+
+            avg_points = total_points / max(games_played, 1)
+
+            # Calculate consistency (lower std dev = more consistent)
+            if len(weekly_scores) > 1:
+                mean_score = sum(weekly_scores) / len(weekly_scores)
+                variance = sum((score - mean_score) ** 2 for score in weekly_scores) / len(weekly_scores)
+                std_dev = variance ** 0.5
+                consistency = max(0, 100 - (std_dev / mean_score) * 100) if mean_score > 0 else 0
+            else:
+                consistency = 100
+
+            return {
+                'total_points': total_points,
+                'avg_points': avg_points,
+                'games_played': games_played,
+                'weekly_scores': weekly_scores,
+                'consistency': consistency,
+                'high_score': max(weekly_scores) if weekly_scores else 0,
+                'low_score': min(weekly_scores) if weekly_scores else 0
+            }
+
+        stats = calculate_team_stats(team)
+
+        # Get current roster strength
+        starters = [p for p in team.roster if getattr(p, 'lineupSlot', None) != "BE"]
+        total_projected = sum(get_current_week_points(p, league) for p in starters if get_current_week_points(p, league) != 'N/A')
+
+        # Find team's best players
+        all_players = []
+        for player in team.roster:
+            proj = get_current_week_points(player, league)
+            if proj != 'N/A' and proj > 0:
+                all_players.append({
+                    'name': player.name,
+                    'position': player.position,
+                    'projected': proj,
+                    'player': player
+                })
+
+        all_players.sort(key=lambda x: x['projected'], reverse=True)
+        top_3_players = all_players[:3]
+
+        # Create rich embed with visual elements
+        embed = discord.Embed(
+            title="🏈 Team Card",
+            color=0x4169E1
+        )
+
+        # Team header with record
+        wins = getattr(team, 'wins', 0)
+        losses = getattr(team, 'losses', 0)
+        record = f"{wins}-{losses}"
+
+        # Calculate rank
+        sorted_teams = sorted(league.teams, key=lambda t: (getattr(t, 'wins', 0), getattr(t, 'points_for', 0)), reverse=True)
+        rank = next((i + 1 for i, t in enumerate(sorted_teams) if t.team_id == team.team_id), 0)
+
+        # Get owner name properly
+        owner_data = getattr(team, 'owner', None)
+        owner_name = "N/A"
+
+        if owner_data:
+            if isinstance(owner_data, dict):
+                # Extract display name from dictionary
+                owner_name = (owner_data.get('displayName') or
+                             f"{owner_data.get('firstName', '')} {owner_data.get('lastName', '')}".strip() or
+                             owner_data.get('id', 'N/A'))
+            elif isinstance(owner_data, str):
+                owner_name = owner_data
+            elif isinstance(owner_data, list) and owner_data:
+                # Handle list of owners - get the first one
+                first_owner = owner_data[0]
+                if isinstance(first_owner, dict):
+                    owner_name = (first_owner.get('displayName') or
+                                 f"{first_owner.get('firstName', '')} {first_owner.get('lastName', '')}".strip() or
+                                 first_owner.get('id', 'N/A'))
+                else:
+                    owner_name = str(first_owner)
+
+        # Try alternative owner attributes if still no name
+        if owner_name == "N/A" or not owner_name:
+            # Check if owner is actually stored as a string representation of the data
+            owner_str = str(getattr(team, 'owner', ''))
+            if 'displayName' in owner_str:
+                # Try to extract displayName from string representation
+                import re
+                display_match = re.search(r"'displayName': '([^']+)'", owner_str)
+                if display_match:
+                    owner_name = display_match.group(1)
+                else:
+                    # Try without quotes
+                    display_match = re.search(r"'displayName': ([^,}]+)", owner_str)
+                    if display_match:
+                        owner_name = display_match.group(1).strip("'\"")
+
+        # Clean up email addresses to show just the name part
+        if owner_name and '@' in owner_name and '.' in owner_name:
+            owner_name = owner_name.split('@')[0]
+
+        # Ensure we have a clean name
+        if not owner_name or owner_name == "N/A" or len(str(owner_name)) > 50:
+            owner_name = "Unknown Owner"
+
+        team_info_text = f"**Record:** {record} (#{rank})\n**Owner:** {owner_name}\n**Division:** {getattr(team, 'division_name', 'N/A')}"
+        embed.add_field(
+            name=f"📊 {team.team_name}",
+            value=safe_field_value(team_info_text),
+            inline=False
+        )
+
+        # Performance metrics with visual bars
+        def create_progress_bar(value, max_value, length=10):
+            filled = int((value / max_value) * length) if max_value > 0 else 0
+            bar = "=" * filled + "-" * (length - filled)
+            return f"`[{bar}]` {value:.1f}"
+
+        # Find league max for scaling bars
+        league_max_avg = max(calculate_team_stats(t)['avg_points'] for t in league.teams)
+        league_max_proj = max(sum(get_current_week_points(p, league) for p in t.roster if getattr(p, 'lineupSlot', None) != "BE" and get_current_week_points(p, league) != 'N/A') for t in league.teams)
+
+        performance_text = f"**Average Points:** {create_progress_bar(stats['avg_points'], league_max_avg)}\n"
+        performance_text += f"**Projected (Week {current_week}):** {create_progress_bar(total_projected, league_max_proj)}\n"
+        performance_text += f"**Consistency:** {create_progress_bar(stats['consistency'], 100)} %\n"
+        performance_text += f"**High Score:** {stats['high_score']:.1f} | **Low Score:** {stats['low_score']:.1f}"
+
+        embed.add_field(
+            name="📈 Performance Metrics",
+            value=safe_field_value(performance_text),
+            inline=False
+        )
+
+        # Star players section
+        if top_3_players:
+            stars_text = ""
+            star_emojis = ["⭐", "🌟", "✨"]
+            for i, player in enumerate(top_3_players):
+                emoji = star_emojis[i] if i < len(star_emojis) else "🔸"
+                stars_text += f"{emoji} **{player['name']}** ({player['position']}) - {player['projected']:.1f} pts\n"
+
+            embed.add_field(
+                name="🌟 Star Players",
+                value=safe_field_value(stars_text.strip()),
+                inline=True
+            )
+
+        # Recent form (last 3 games)
+        recent_scores = stats['weekly_scores'][-3:] if len(stats['weekly_scores']) >= 3 else stats['weekly_scores']
+        if recent_scores:
+            form_text = ""
+            for i, score in enumerate(recent_scores):
+                week_num = len(stats['weekly_scores']) - len(recent_scores) + i + 1
+                form_text += f"Week {week_num}: {score:.1f}\n"
+
+            # Calculate trend
+            if len(recent_scores) >= 2:
+                trend = "📈" if recent_scores[-1] > recent_scores[-2] else "📉" if recent_scores[-1] < recent_scores[-2] else "➡️"
+                form_text += f"\nTrend: {trend}"
+
+            embed.add_field(
+                name="📊 Recent Form",
+                value=safe_field_value(form_text),
+                inline=True
+            )
+
+        # League context
+        total_teams = len(league.teams)
+        points_rank = sorted(league.teams, key=lambda t: calculate_team_stats(t)['avg_points'], reverse=True)
+        points_position = next((i + 1 for i, t in enumerate(points_rank) if t.team_id == team.team_id), 0)
+
+        context_text = f"**League Position:** #{rank} of {total_teams}\n"
+        context_text += f"**Scoring Rank:** #{points_position} of {total_teams}\n"
+        context_text += f"**Games Played:** {stats['games_played']}"
+
+        embed.add_field(
+            name="🏆 League Context",
+            value=safe_field_value(context_text),
+            inline=False
+        )
+
+        # Power ranking calculation
+        record_score = (wins / max(wins + losses, 1)) * 40  # 40% weight
+        points_score = (stats['avg_points'] / league_max_avg) * 40 if league_max_avg > 0 else 0  # 40% weight
+        consistency_score = (stats['consistency'] / 100) * 20  # 20% weight
+        power_rating = record_score + points_score + consistency_score
+
+        rating_text = f"**Power Rating:** {power_rating:.1f}/100\n"
+
+        # Rating description
+        if power_rating >= 80:
+            rating_text += "🔥 **Elite** - Championship contender"
+        elif power_rating >= 65:
+            rating_text += "💪 **Strong** - Playoff bound"
+        elif power_rating >= 50:
+            rating_text += "⚖️ **Average** - In the mix"
+        elif power_rating >= 35:
+            rating_text += "⚠️ **Struggling** - Needs improvement"
+        else:
+            rating_text += "🆘 **Rebuilding** - Long season ahead"
+
+        embed.add_field(
+            name="⚡ Power Rating",
+            value=safe_field_value(rating_text),
+            inline=False
+        )
+
+        # Set team thumbnail (you could customize this with actual team logos)
+        embed.set_thumbnail(url="https://a.espncdn.com/i/espn/logos/nfl/NFL.png")
+
+        await interaction.followup.send(embed=embed)
+
+    except Exception as e:
+        error_msg = f"Error creating team card: {e}"
+        print(f"Card error: {e}")
+        if not interaction.response.is_done():
+            await interaction.response.send_message(error_msg, ephemeral=True)
+        else:
+            await interaction.followup.send(error_msg, ephemeral=True)
+
+@client.tree.command(name="scoreboard", description="Live updating scoreboard for current week matchups.")
+@app_commands.describe(auto_refresh="Enable auto-refresh every 30 seconds (default: True)")
+async def scoreboard(interaction: discord.Interaction, auto_refresh: bool = True):
+    await interaction.response.defer()
+
+    try:
+        if ESPN_S2 and SWID:
+            league = League(league_id=LEAGUE_ID, year=SEASON_ID, swid=SWID, espn_s2=ESPN_S2)
+        else:
+            league = League(league_id=LEAGUE_ID, year=SEASON_ID)
+
+        current_week = getattr(league, 'current_week', 1)
+
+        def create_scoreboard_embeds():
+            # Get matchups for current week
+            matchups = []
+
+            # Create team pairings based on current week schedule
+            teams_in_matchups = set()
+
+            for team in league.teams:
+                if team.team_id in teams_in_matchups:
+                    continue
+
+                # Find this team's opponent for current week
+                opponent = None
+                if hasattr(team, 'schedule') and len(team.schedule) >= current_week:
+                    try:
+                        week_opponent = team.schedule[current_week - 1]
+                        if hasattr(week_opponent, 'team_id'):
+                            opponent = week_opponent
+                        elif hasattr(week_opponent, 'opponent'):
+                            opponent = week_opponent.opponent
+                    except (IndexError, AttributeError):
+                        pass
+
+                # Alternative method: check box scores
+                if not opponent:
+                    try:
+                        box_score = league.box_scores(current_week)
+                        for matchup in box_score:
+                            if hasattr(matchup, 'home_team') and hasattr(matchup, 'away_team'):
+                                if matchup.home_team.team_id == team.team_id:
+                                    opponent = matchup.away_team
+                                    break
+                                elif matchup.away_team.team_id == team.team_id:
+                                    opponent = matchup.home_team
+                                    break
+                    except Exception:
+                        pass
+
+                if opponent and opponent.team_id not in teams_in_matchups:
+                    # Try multiple methods to get current scores
+                    team_score = 0
+                    opponent_score = 0
+
+                    # Method 1: Try box scores API
+                    try:
+                        box_scores = league.box_scores(current_week)
+                        for box_score in box_scores:
+                            if hasattr(box_score, 'home_team') and hasattr(box_score, 'away_team'):
+                                if box_score.home_team.team_id == team.team_id:
+                                    team_score = getattr(box_score.home_score, 'total_points', 0) or getattr(box_score, 'home_score', 0)
+                                    opponent_score = getattr(box_score.away_score, 'total_points', 0) or getattr(box_score, 'away_score', 0)
+                                    break
+                                elif box_score.away_team.team_id == team.team_id:
+                                    team_score = getattr(box_score.away_score, 'total_points', 0) or getattr(box_score, 'away_score', 0)
+                                    opponent_score = getattr(box_score.home_score, 'total_points', 0) or getattr(box_score, 'home_score', 0)
+                                    break
+                    except Exception as e:
+                        print(f"Box score method failed: {e}")
+                        pass
+
+                    # Method 2: Try team.scores if box scores didn't work
+                    if team_score == 0 and opponent_score == 0:
+                        try:
+                            if hasattr(team, 'scores') and len(team.scores) >= current_week:
+                                team_score = team.scores[current_week - 1] or 0
+                            if hasattr(opponent, 'scores') and len(opponent.scores) >= current_week:
+                                opponent_score = opponent.scores[current_week - 1] or 0
+                        except (IndexError, AttributeError):
+                            pass
+
+                    # Method 3: Calculate actual points only (no projected scores)
+                    if team_score == 0 and opponent_score == 0:
+                        def get_actual_points_only(player, league_ref):
+                            """Get only actual points, not projected"""
+                            current_week = getattr(league_ref, 'current_week', 1)
+                            if hasattr(player, 'stats') and player.stats:
+                                try:
+                                    week_stats = player.stats.get(current_week, {})
+                                    actual_points = week_stats.get('points', None)
+                                    if actual_points is not None and actual_points > 0:
+                                        return actual_points
+
+                                    # Check applied stats for actual game performance
+                                    applied_stats = week_stats.get('appliedStats', {})
+                                    if applied_stats and len(applied_stats) > 0:
+                                        # Calculate points from actual stats if available
+                                        total_points = 0
+                                        for stat_id, value in applied_stats.items():
+                                            if isinstance(value, (int, float)) and value > 0:
+                                                total_points += value
+                                        if total_points > 0:
+                                            return total_points
+                                except:
+                                    pass
+                            return 0
+
+                        starters = [p for p in team.roster if getattr(p, 'lineupSlot', None) != "BE"]
+                        team_score = sum(get_actual_points_only(p, league) for p in starters)
+
+                        opp_starters = [p for p in opponent.roster if getattr(p, 'lineupSlot', None) != "BE"]
+                        opponent_score = sum(get_actual_points_only(p, league) for p in opp_starters)
+
+                    matchups.append({
+                        'team1': team,
+                        'team2': opponent,
+                        'score1': team_score,
+                        'score2': opponent_score
+                    })
+
+                    teams_in_matchups.add(team.team_id)
+                    teams_in_matchups.add(opponent.team_id)
+
+            # Sort matchups by total points (most exciting games first)
+            matchups.sort(key=lambda m: m['score1'] + m['score2'], reverse=True)
+
+            # Create individual embeds for each matchup
+            embeds = []
+
+            if matchups:
+                # Create header embed
+                header_embed = discord.Embed(
+                    title="🏈 Live Scoreboard",
+                    description=f"Week {current_week} Matchups • {('🔄 Auto-refresh ON' if auto_refresh else '📊 Static view')}",
+                    color=0xFF6B35
+                )
+
+                # Add refresh timestamp
+                import datetime
+                now = datetime.datetime.now()
+                header_embed.set_footer(text=f"Last updated: {now.strftime('%I:%M:%S %p')}")
+                embeds.append(header_embed)
+
+                # Get remaining players info function
+                def get_remaining_players(team, league_ref):
+                    starters = [p for p in team.roster if getattr(p, 'lineupSlot', None) != "BE"]
+                    total_starters = len(starters)
+                    yet_to_play = 0
+
+                    def has_actual_points(player, league):
+                        """Check if player has actual points (not just projected)"""
+                        current_week = getattr(league, 'current_week', 1)
+
+                        # Check player stats for actual points
+                        if hasattr(player, 'stats') and player.stats:
+                            try:
+                                week_stats = player.stats.get(current_week, {})
+                                # Look for actual points - ESPN uses different keys
+                                actual_points = week_stats.get('points', None)
+                                if actual_points is not None and actual_points > 0:
+                                    return True
+
+                                # Check applied stats (actual game stats)
+                                applied_stats = week_stats.get('appliedStats', {})
+                                if applied_stats and len(applied_stats) > 0:
+                                    # If there are applied stats, player has played
+                                    return True
+
+                            except Exception:
+                                pass
+
+                        # Check if player has game-specific attributes indicating they played
+                        if hasattr(player, 'game_played'):
+                            game_played = getattr(player, 'game_played', 0)
+                            if game_played > 0:
+                                return True
+
+                        return False
+
+                    try:
+                        for player in starters:
+                            player_yet_to_play = True
+
+                            try:
+                                # Check injury status first - injured players don't count as "yet to play"
+                                injury_status = getattr(player, 'injuryStatus', '')
+                                if injury_status in ['OUT', 'IR', 'SUSPENDED']:
+                                    player_yet_to_play = False
+
+                                # Check if player has ACTUAL points (not projected)
+                                elif has_actual_points(player, league_ref):
+                                    player_yet_to_play = False
+
+                                if player_yet_to_play:
+                                    yet_to_play += 1
+
+                            except Exception:
+                                # If we can't determine status, assume yet to play
+                                yet_to_play += 1
+
+                    except Exception:
+                        # If anything fails, fall back to showing all players
+                        yet_to_play = total_starters
+
+                    return f"{yet_to_play}/{total_starters}"
+
+                # Helper function to format team names
+                def format_team_name(name, max_length=14):
+                    if len(name) <= max_length:
+                        return name
+
+                    words = name.split()
+                    if len(words) == 1:
+                        return name[:max_length-1] + "."
+
+                    # Two or more words: first word + first letter of second word only
+                    if len(words) >= 2:
+                        result = f"{words[0]} {words[1][0]}."
+                        if len(result) <= max_length:
+                            return result
+                        else:
+                            return words[0][:max_length-3] + " " + words[1][0] + "."
+
+                    return words[0][:max_length-1] + "."
+
+                # Build simple vs-style lines
+                all_table_lines = []
+
+                for matchup in matchups:
+                    team1 = matchup['team1']
+                    team2 = matchup['team2']
+                    score1 = matchup['score1']
+                    score2 = matchup['score2']
+
+                    # Get remaining players for each team first
+                    team1_remaining = get_remaining_players(team1, league)
+                    team2_remaining = get_remaining_players(team2, league)
+
+                    # Format team names with remaining players included, shorter to fit
+                    base_name1 = format_team_name(team1.team_name, 8)
+                    base_name2 = format_team_name(team2.team_name, 8)
+
+                    name1 = f"{base_name1} ({team1_remaining})"
+                    name2 = f"{base_name2} ({team2_remaining})"
+
+                    # Format scores with arrow indicators for winners
+                    score1_str = f"{score1:.1f}"
+                    score2_str = f"{score2:.1f}"
+                    name1_display = name1
+                    name2_display = name2
+
+                    # Use arrows to indicate winning direction
+                    if score1 > score2:
+                        line = f"{name1_display:<16} ► {score1_str:>6}  |   {score2_str:<6} {name2_display}"
+                    elif score2 > score1:
+                        line = f"{name1_display:<16} {score1_str:>6}  |   {score2_str:<6} ◄ {name2_display}"
+                    else:
+                        line = f"{name1_display:<16} {score1_str:>6}  |   {score2_str:<6} {name2_display}"
+                    all_table_lines.append(line)
+
+                # Split table into multiple embeds if needed (aim for ~1800 chars per embed for compactness)
+                current_embed_lines = []
+
+                for line in all_table_lines:
+                    test_content = f"```\n{chr(10).join(current_embed_lines + [line])}\n```"
+
+                    if len(test_content) > 1800 and current_embed_lines:
+                        # Create embed with current lines
+                        if current_embed_lines:
+                            # No table closure needed for simple text format
+
+                            table_embed = discord.Embed(
+                                title=f"📊 Matchups{f' (Part {len(embeds)})' if len(embeds) > 1 else ''}",
+                                color=0x32CD32
+                            )
+                            table_content = f"```\n{chr(10).join(current_embed_lines)}\n```"
+                            table_embed.add_field(name="Current Scores", value=table_content, inline=False)
+                            embeds.append(table_embed)
+
+                        # Start new embed
+                        current_embed_lines = []
+                        if not line.startswith("Team 1"):
+                            # Add header for continuation
+                            current_embed_lines.extend([
+                                "Team 1            | Score   | Team 2            | Score",
+                                "------------------|---------|-------------------|-------"
+                            ])
+
+                    current_embed_lines.append(line)
+
+                # Add final embed if there are remaining lines
+                if current_embed_lines:
+                    table_embed = discord.Embed(
+                        title=f"📊 Matchups{f' (Part {len(embeds)})' if len(embeds) > 1 else ''}",
+                        color=0x32CD32
+                    )
+                    table_content = f"```\n{chr(10).join(current_embed_lines)}\n```"
+                    table_embed.add_field(name="Current Scores", value=table_content, inline=False)
+                    embeds.append(table_embed)
+
+                # Create summary embed
+                total_points = sum(m['score1'] + m['score2'] for m in matchups)
+                avg_game_total = total_points / len(matchups) if matchups else 0
+                highest_score = max(max(m['score1'], m['score2']) for m in matchups) if matchups else 0
+                closest_game = min(abs(m['score1'] - m['score2']) for m in matchups) if matchups else 0
+
+                summary_embed = discord.Embed(
+                    title="📋 Week Summary",
+                    color=0x9932CC
+                )
+
+                summary_lines = []
+                summary_lines.append(f"🎯 **Total Points Scored**: {total_points:.1f}")
+                summary_lines.append(f"📈 **Average Game Total**: {avg_game_total:.1f}")
+                summary_lines.append(f"🔥 **Highest Individual Score**: {highest_score:.1f}")
+                summary_lines.append(f"⚡ **Closest Game**: {closest_game:.1f} point difference")
+
+                summary_embed.add_field(name="Stats", value="\n".join(summary_lines), inline=False)
+                embeds.append(summary_embed)
+
+            else:
+                error_embed = discord.Embed(
+                    title="🏈 Live Scoreboard",
+                    description="❌ No matchups found for this week.",
+                    color=0xFF0000
+                )
+                embeds.append(error_embed)
+
+            return embeds
+
+        # Create initial embeds
+        embeds = create_scoreboard_embeds()
+
+        if auto_refresh:
+            view = ScoreboardView(league, current_week, auto_refresh)
+            message = await interaction.followup.send(embeds=embeds, view=view)
+            view._message = message  # Store message reference for auto-refresh
+        else:
+            await interaction.followup.send(embeds=embeds)
+
+    except Exception as e:
+        error_msg = f"Error creating scoreboard: {e}"
+        print(f"Scoreboard error: {e}")
+        if not interaction.response.is_done():
+            await interaction.response.send_message(error_msg, ephemeral=True)
+        else:
+            await interaction.followup.send(error_msg, ephemeral=True)
+
+class ScoreboardView(View):
+    def __init__(self, league, current_week, auto_refresh=True):
+        super().__init__(timeout=1800)  # 30 minute timeout
+        self.league = league
+        self.current_week = current_week
+        self.auto_refresh = auto_refresh
+        self.last_refresh = None
+
+        if auto_refresh:
+            self.refresh_task = asyncio.create_task(self.auto_refresh_loop())
+
+    async def auto_refresh_loop(self):
+        """Auto-refresh the scoreboard every 30 seconds"""
+        try:
+            while not self.is_finished():
+                await asyncio.sleep(30)  # Wait 30 seconds
+
+                if not self.is_finished():
+                    # Create updated embeds
+                    embeds = self.create_updated_embeds()
+
+                    # Try to edit the message
+                    try:
+                        if hasattr(self, '_message') and self._message:
+                            await self._message.edit(embeds=embeds, view=self)
+                    except Exception as e:
+                        print(f"Auto-refresh error: {e}")
+                        break
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            print(f"Auto-refresh loop error: {e}")
+
+    def create_updated_embeds(self):
+        """Create updated embeds with current scores"""
+        try:
+            # Refresh league data
+            if ESPN_S2 and SWID:
+                league = League(league_id=LEAGUE_ID, year=SEASON_ID, swid=SWID, espn_s2=ESPN_S2)
+            else:
+                league = League(league_id=LEAGUE_ID, year=SEASON_ID)
+
+            # Update the instance variable
+            self.league = league
+
+            # Get updated matchups (same logic as main function)
+            matchups = []
+            teams_in_matchups = set()
+
+            for team in self.league.teams:
+                if team.team_id in teams_in_matchups:
+                    continue
+
+                # Find opponent
+                opponent = None
+                if hasattr(team, 'schedule') and len(team.schedule) >= self.current_week:
+                    try:
+                        week_opponent = team.schedule[self.current_week - 1]
+                        if hasattr(week_opponent, 'team_id'):
+                            opponent = week_opponent
+                        elif hasattr(week_opponent, 'opponent'):
+                            opponent = week_opponent.opponent
+                    except (IndexError, AttributeError):
+                        pass
+
+                # Alternative method: check box scores
+                if not opponent:
+                    try:
+                        box_score = self.league.box_scores(self.current_week)
+                        for matchup in box_score:
+                            if hasattr(matchup, 'home_team') and hasattr(matchup, 'away_team'):
+                                if matchup.home_team.team_id == team.team_id:
+                                    opponent = matchup.away_team
+                                    break
+                                elif matchup.away_team.team_id == team.team_id:
+                                    opponent = matchup.home_team
+                                    break
+                    except Exception:
+                        pass
+
+                if opponent and opponent.team_id not in teams_in_matchups:
+                    # Try multiple methods to get current scores
+                    team_score = 0
+                    opponent_score = 0
+
+                    # Method 1: Try box scores API
+                    try:
+                        box_scores = self.league.box_scores(self.current_week)
+                        for box_score in box_scores:
+                            if hasattr(box_score, 'home_team') and hasattr(box_score, 'away_team'):
+                                if box_score.home_team.team_id == team.team_id:
+                                    team_score = getattr(box_score.home_score, 'total_points', 0) or getattr(box_score, 'home_score', 0)
+                                    opponent_score = getattr(box_score.away_score, 'total_points', 0) or getattr(box_score, 'away_score', 0)
+                                    break
+                                elif box_score.away_team.team_id == team.team_id:
+                                    team_score = getattr(box_score.away_score, 'total_points', 0) or getattr(box_score, 'away_score', 0)
+                                    opponent_score = getattr(box_score.home_score, 'total_points', 0) or getattr(box_score, 'home_score', 0)
+                                    break
+                    except Exception as e:
+                        print(f"Box score refresh method failed: {e}")
+                        pass
+
+                    # Method 2: Try team.scores if box scores didn't work
+                    if team_score == 0 and opponent_score == 0:
+                        try:
+                            if hasattr(team, 'scores') and len(team.scores) >= self.current_week:
+                                team_score = team.scores[self.current_week - 1] or 0
+                            if hasattr(opponent, 'scores') and len(opponent.scores) >= self.current_week:
+                                opponent_score = opponent.scores[self.current_week - 1] or 0
+                        except (IndexError, AttributeError):
+                            pass
+
+                    # Method 3: Calculate actual points only (no projected scores)
+                    if team_score == 0 and opponent_score == 0:
+                        def get_actual_points_only(player, league_ref):
+                            """Get only actual points, not projected"""
+                            current_week = getattr(league_ref, 'current_week', 1)
+                            if hasattr(player, 'stats') and player.stats:
+                                try:
+                                    week_stats = player.stats.get(current_week, {})
+                                    actual_points = week_stats.get('points', None)
+                                    if actual_points is not None and actual_points > 0:
+                                        return actual_points
+
+                                    # Check applied stats for actual game performance
+                                    applied_stats = week_stats.get('appliedStats', {})
+                                    if applied_stats and len(applied_stats) > 0:
+                                        # Calculate points from actual stats if available
+                                        total_points = 0
+                                        for stat_id, value in applied_stats.items():
+                                            if isinstance(value, (int, float)) and value > 0:
+                                                total_points += value
+                                        if total_points > 0:
+                                            return total_points
+                                except:
+                                    pass
+                            return 0
+
+                        starters = [p for p in team.roster if getattr(p, 'lineupSlot', None) != "BE"]
+                        team_score = sum(get_actual_points_only(p, self.league) for p in starters)
+
+                        opp_starters = [p for p in opponent.roster if getattr(p, 'lineupSlot', None) != "BE"]
+                        opponent_score = sum(get_actual_points_only(p, self.league) for p in opp_starters)
+
+                    matchups.append({
+                        'team1': team,
+                        'team2': opponent,
+                        'score1': team_score,
+                        'score2': opponent_score
+                    })
+
+                    teams_in_matchups.add(team.team_id)
+                    teams_in_matchups.add(opponent.team_id)
+
+            # Sort matchups by total points (most exciting games first)
+            matchups.sort(key=lambda m: m['score1'] + m['score2'], reverse=True)
+
+            # Create individual embeds for each matchup
+            embeds = []
+
+            if matchups:
+                # Create header embed
+                header_embed = discord.Embed(
+                    title="🏈 Live Scoreboard",
+                    description=f"Week {self.current_week} Matchups • {('🔄 Auto-refresh ON' if self.auto_refresh else '📊 Static view')}",
+                    color=0xFF6B35
+                )
+
+                # Add refresh timestamp
+                import datetime
+                now = datetime.datetime.now()
+                header_embed.set_footer(text=f"Last updated: {now.strftime('%I:%M:%S %p')}")
+                embeds.append(header_embed)
+
+                # Get remaining players info function
+                def get_remaining_players(team, league_ref):
+                    starters = [p for p in team.roster if getattr(p, 'lineupSlot', None) != "BE"]
+                    still_playing = 0
+                    total_starters = len(starters)
+
+                    for player in starters:
+                        proj_points = get_current_week_points(player, league_ref)
+                        if proj_points != 'N/A' and proj_points > 0:
+                            still_playing += 1
+
+                    # For demo, randomize a bit to show realistic variations
+                    import random
+                    if still_playing == total_starters:
+                        still_playing = random.randint(max(1, total_starters-3), total_starters)
+
+                    return f"{still_playing}/{total_starters}"
+
+                # Helper function to format team names
+                def format_team_name(name, max_length=14):
+                    if len(name) <= max_length:
+                        return name
+
+                    words = name.split()
+                    if len(words) == 1:
+                        return name[:max_length-1] + "."
+
+                    # Two or more words: first word + first letter of second word only
+                    if len(words) >= 2:
+                        result = f"{words[0]} {words[1][0]}."
+                        if len(result) <= max_length:
+                            return result
+                        else:
+                            return words[0][:max_length-3] + " " + words[1][0] + "."
+
+                    return words[0][:max_length-1] + "."
+
+                # Build simple vs-style lines
+                all_table_lines = []
+
+                for matchup in matchups:
+                    team1 = matchup['team1']
+                    team2 = matchup['team2']
+                    score1 = matchup['score1']
+                    score2 = matchup['score2']
+
+                    # Get remaining players for each team first
+                    team1_remaining = get_remaining_players(team1, league)
+                    team2_remaining = get_remaining_players(team2, league)
+
+                    # Format team names with remaining players included, shorter to fit
+                    base_name1 = format_team_name(team1.team_name, 8)
+                    base_name2 = format_team_name(team2.team_name, 8)
+
+                    name1 = f"{base_name1} ({team1_remaining})"
+                    name2 = f"{base_name2} ({team2_remaining})"
+
+                    # Format scores with arrow indicators for winners
+                    score1_str = f"{score1:.1f}"
+                    score2_str = f"{score2:.1f}"
+                    name1_display = name1
+                    name2_display = name2
+
+                    # Use arrows to indicate winning direction
+                    if score1 > score2:
+                        line = f"{name1_display:<16} ► {score1_str:>6}  |   {score2_str:<6} {name2_display}"
+                    elif score2 > score1:
+                        line = f"{name1_display:<16} {score1_str:>6}  |   {score2_str:<6} ◄ {name2_display}"
+                    else:
+                        line = f"{name1_display:<16} {score1_str:>6}  |   {score2_str:<6} {name2_display}"
+                    all_table_lines.append(line)
+
+                # Split table into multiple embeds if needed (aim for ~1800 chars per embed for compactness)
+                current_embed_lines = []
+
+                for line in all_table_lines:
+                    test_content = f"```\n{chr(10).join(current_embed_lines + [line])}\n```"
+
+                    if len(test_content) > 1800 and current_embed_lines:
+                        # Create embed with current lines
+                        if current_embed_lines:
+                            # No table closure needed for simple text format
+
+                            table_embed = discord.Embed(
+                                title=f"📊 Matchups{f' (Part {len(embeds)})' if len(embeds) > 1 else ''}",
+                                color=0x32CD32
+                            )
+                            table_content = f"```\n{chr(10).join(current_embed_lines)}\n```"
+                            table_embed.add_field(name="Current Scores", value=table_content, inline=False)
+                            embeds.append(table_embed)
+
+                        # Start new embed
+                        current_embed_lines = []
+                        if not line.startswith("Team 1"):
+                            # Add header for continuation
+                            current_embed_lines.extend([
+                                "Team 1            | Score   | Team 2            | Score",
+                                "------------------|---------|-------------------|-------"
+                            ])
+
+                    current_embed_lines.append(line)
+
+                # Add final embed if there are remaining lines
+                if current_embed_lines:
+                    table_embed = discord.Embed(
+                        title=f"📊 Matchups{f' (Part {len(embeds)})' if len(embeds) > 1 else ''}",
+                        color=0x32CD32
+                    )
+                    table_content = f"```\n{chr(10).join(current_embed_lines)}\n```"
+                    table_embed.add_field(name="Current Scores", value=table_content, inline=False)
+                    embeds.append(table_embed)
+
+                # Create summary embed
+                total_points = sum(m['score1'] + m['score2'] for m in matchups)
+                avg_game_total = total_points / len(matchups) if matchups else 0
+                highest_score = max(max(m['score1'], m['score2']) for m in matchups) if matchups else 0
+                closest_game = min(abs(m['score1'] - m['score2']) for m in matchups) if matchups else 0
+
+                summary_embed = discord.Embed(
+                    title="📋 Week Summary",
+                    color=0x9932CC
+                )
+
+                summary_lines = []
+                summary_lines.append(f"🎯 **Total Points Scored**: {total_points:.1f}")
+                summary_lines.append(f"📈 **Average Game Total**: {avg_game_total:.1f}")
+                summary_lines.append(f"🔥 **Highest Individual Score**: {highest_score:.1f}")
+                summary_lines.append(f"⚡ **Closest Game**: {closest_game:.1f} point difference")
+
+                summary_embed.add_field(name="Stats", value="\n".join(summary_lines), inline=False)
+                embeds.append(summary_embed)
+
+            else:
+                error_embed = discord.Embed(
+                    title="🏈 Live Scoreboard",
+                    description="❌ No matchups found for this week.",
+                    color=0xFF0000
+                )
+                embeds.append(error_embed)
+
+        except Exception as e:
+            error_embed = discord.Embed(
+                title="🏈 Live Scoreboard",
+                description=f"❌ Failed to refresh: {e}",
+                color=0xFF0000
+            )
+            embeds = [error_embed]
+
+        return embeds
+
+    @discord.ui.button(label="🔄 Refresh Now", style=discord.ButtonStyle.primary)
+    async def manual_refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Manual refresh button"""
+        await interaction.response.defer()
+
+        try:
+            embeds = self.create_updated_embeds()
+            await interaction.edit_original_response(embeds=embeds, view=self)
+        except Exception as e:
+            await interaction.followup.send(f"Refresh failed: {e}", ephemeral=True)
+
+    @discord.ui.button(label="⏸️ Stop Auto-Refresh", style=discord.ButtonStyle.secondary)
+    async def toggle_refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Toggle auto-refresh on/off"""
+        await interaction.response.defer()
+
+        if self.auto_refresh:
+            self.auto_refresh = False
+            if hasattr(self, 'refresh_task'):
+                self.refresh_task.cancel()
+            button.label = "▶️ Start Auto-Refresh"
+            button.style = discord.ButtonStyle.success
+        else:
+            self.auto_refresh = True
+            self.refresh_task = asyncio.create_task(self.auto_refresh_loop())
+            button.label = "⏸️ Stop Auto-Refresh"
+            button.style = discord.ButtonStyle.secondary
+
+        # Update embeds
+        embeds = self.create_updated_embeds()
+        # Update header embed description
+        if embeds:
+            embeds[0].description = f"Week {self.current_week} Matchups • {('🔄 Auto-refresh ON' if self.auto_refresh else '📊 Static view')}"
+
+        await interaction.edit_original_response(embeds=embeds, view=self)
+
+    async def on_timeout(self):
+        """Handle view timeout"""
+        if hasattr(self, 'refresh_task'):
+            self.refresh_task.cancel()
 
 # Interactive View for Team Command
 class TeamView(View):

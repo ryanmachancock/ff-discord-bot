@@ -2,6 +2,13 @@
 
 Integrates with ESPN API to fetch your public or private league fantasy football data:
 
+### Setup
+
+1. Update your .env file. Private league will need all fields
+2. Can run bot locally using python
+3. Add bot to your discord server by using the discord dev portal
+4. Use commands in a chat channel
+
 ### Commands
 `/team` - Get the roster for a team by name
 
@@ -18,10 +25,3 @@ Integrates with ESPN API to fetch your public or private league fantasy football
 `/stats` - Fun stats such as "Best Single Week Performance"
 
 <img width="521" height="667" alt="image" src="https://github.com/user-attachments/assets/92e6cb7e-ed93-4a7e-aa63-1a119d96b001" />
-
-### Setup
-
-1. Update your .env file. Private league will need all fields
-2. Can run bot locally using python
-3. Add bot to your discord server by using the discord dev portal
-4. Use commands in a chat channel

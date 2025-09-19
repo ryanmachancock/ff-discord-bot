@@ -3023,18 +3023,18 @@ async def scoreboard(interaction: discord.Interaction, auto_refresh: bool = True
                     team1_remaining = get_remaining_players(team1, league)
                     team2_remaining = get_remaining_players(team2, league)
 
-                    # Format team names with consistent length regardless of digit count
-                    base_name1 = format_team_name(team1.team_name, 8)
-                    base_name2 = format_team_name(team2.team_name, 8)
+                    # Format team names with balanced length for better identification while maintaining alignment
+                    base_name1 = format_team_name(team1.team_name, 9)
+                    base_name2 = format_team_name(team2.team_name, 9)
 
                     # Ensure consistent formatting by padding remaining player counts
                     # This handles both single digit (8/9) and double digit (11/11) counts
                     name1 = f"{base_name1} ({team1_remaining})"
                     name2 = f"{base_name2} ({team2_remaining})"
 
-                    # Pad names to ensure consistent alignment - longest possible is about 15 chars
-                    name1 = f"{name1:<15}"
-                    name2 = f"{name2:<15}"
+                    # Pad names to ensure consistent alignment - account for double digit player counts
+                    name1 = f"{name1:<18}"
+                    name2 = f"{name2:<18}"
 
                     formatted_matchups.append({
                         'name1': name1,
@@ -3047,8 +3047,8 @@ async def scoreboard(interaction: discord.Interaction, auto_refresh: bool = True
                     max_name_length = max(max_name_length, len(name1), len(name2))
 
                 # Use fixed spacing for consistent alignment across all leagues
-                # Based on your desired format: team names get 16 characters, scores get proper spacing
-                left_spacing = 16
+                # Account for double digit player counts: team names get 18 characters
+                left_spacing = 18
 
                 # Second pass: format with consistent spacing
                 for matchup_data in formatted_matchups:
@@ -3171,8 +3171,13 @@ class ScoreboardView(View):
                 await asyncio.sleep(30)  # Wait 30 seconds
 
                 if not self.is_finished():
-                    # Create updated embeds
-                    embeds = self.create_updated_embeds()
+                    try:
+                        # Create updated embeds with error handling
+                        embeds = self.create_updated_embeds()
+                    except Exception as e:
+                        print(f"Error updating scoreboard: {e}")
+                        # Continue the loop, skip this update
+                        continue
 
                     # Try to edit the message
                     try:
@@ -3381,18 +3386,18 @@ class ScoreboardView(View):
                     team1_remaining = get_remaining_players(team1, league)
                     team2_remaining = get_remaining_players(team2, league)
 
-                    # Format team names with consistent length regardless of digit count
-                    base_name1 = format_team_name(team1.team_name, 8)
-                    base_name2 = format_team_name(team2.team_name, 8)
+                    # Format team names with balanced length for better identification while maintaining alignment
+                    base_name1 = format_team_name(team1.team_name, 9)
+                    base_name2 = format_team_name(team2.team_name, 9)
 
                     # Ensure consistent formatting by padding remaining player counts
                     # This handles both single digit (8/9) and double digit (11/11) counts
                     name1 = f"{base_name1} ({team1_remaining})"
                     name2 = f"{base_name2} ({team2_remaining})"
 
-                    # Pad names to ensure consistent alignment - longest possible is about 15 chars
-                    name1 = f"{name1:<15}"
-                    name2 = f"{name2:<15}"
+                    # Pad names to ensure consistent alignment - account for double digit player counts
+                    name1 = f"{name1:<18}"
+                    name2 = f"{name2:<18}"
 
                     formatted_matchups.append({
                         'name1': name1,
@@ -3405,8 +3410,8 @@ class ScoreboardView(View):
                     max_name_length = max(max_name_length, len(name1), len(name2))
 
                 # Use fixed spacing for consistent alignment across all leagues
-                # Based on your desired format: team names get 16 characters, scores get proper spacing
-                left_spacing = 16
+                # Account for double digit player counts: team names get 18 characters
+                left_spacing = 18
 
                 # Second pass: format with consistent spacing
                 for matchup_data in formatted_matchups:

@@ -1,7 +1,6 @@
 print("Starting Fantasy Football bot...")
 
 import os
-import asyncio
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -54,12 +53,13 @@ SEASON_ID = int(os.getenv('ESPN_SEASON_ID'))
 SWID = os.getenv('ESPN_SWID')
 ESPN_S2 = os.getenv('ESPN_S2')
 
-# Debug environment variables
-print(f"TOKEN present: {bool(TOKEN)}")
-print(f"LEAGUE_ID: {LEAGUE_ID}")
-print(f"SEASON_ID: {SEASON_ID}")
-print(f"SWID present: {bool(SWID)}")
-print(f"ESPN_S2 present: {bool(ESPN_S2)}")
+# Validate required environment variables
+if not TOKEN:
+    raise ValueError("DISCORD_TOKEN environment variable is required")
+if not LEAGUE_ID:
+    raise ValueError("ESPN_LEAGUE_ID environment variable is required")
+if not SEASON_ID:
+    raise ValueError("ESPN_SEASON_ID environment variable is required")
 
 class MyClient(discord.Client):
     def __init__(self, *, intents: discord.Intents):
@@ -71,6 +71,25 @@ class MyClient(discord.Client):
 
 intents = discord.Intents.default()
 client = MyClient(intents=intents)
+
+def get_league():
+    """Initialize and return league instance with proper authentication"""
+    try:
+        if SWID and ESPN_S2:
+            return League(league_id=LEAGUE_ID, year=SEASON_ID, swid=SWID, espn_s2=ESPN_S2)
+        else:
+            return League(league_id=LEAGUE_ID, year=SEASON_ID)
+    except Exception as e:
+        print(f"Failed to initialize league: {e}")
+        raise
+
+def get_points(player):
+    """Get total fantasy points for a player"""
+    return getattr(player, 'total_points', 0)
+
+def get_proj(player):
+    """Get projected points for a player"""
+    return getattr(player, 'projected_total_points', 0)
 
 @client.event
 async def on_ready():
@@ -2082,10 +2101,7 @@ async def card(interaction: discord.Interaction, team_name: str):
                 return text
             return text[:max_length-3] + "..."
 
-        if ESPN_S2 and SWID:
-            league = League(league_id=LEAGUE_ID, year=SEASON_ID, swid=SWID, espn_s2=ESPN_S2)
-        else:
-            league = League(league_id=LEAGUE_ID, year=SEASON_ID)
+        league = get_league()
 
         # Find the team
         team = None
@@ -2342,10 +2358,7 @@ async def scoreboard(interaction: discord.Interaction, auto_refresh: bool = True
     await interaction.response.defer()
 
     try:
-        if ESPN_S2 and SWID:
-            league = League(league_id=LEAGUE_ID, year=SEASON_ID, swid=SWID, espn_s2=ESPN_S2)
-        else:
-            league = League(league_id=LEAGUE_ID, year=SEASON_ID)
+        league = get_league()
 
         current_week = getattr(league, 'current_week', 1)
 

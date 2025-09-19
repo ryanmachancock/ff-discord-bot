@@ -9,6 +9,224 @@ from discord.ui import View, Button, Select
 from dotenv import load_dotenv
 from espn_api.football import League
 from tabulate import tabulate
+import json
+
+class LeagueManager:
+    def __init__(self):
+        self.data_file = 'user_leagues.json'
+        self.load_data()
+
+    def load_data(self):
+        """Load user league data from JSON file"""
+        try:
+            with open(self.data_file, 'r') as f:
+                self.data = json.load(f)
+        except FileNotFoundError:
+            self.data = {"users": {}, "leagues": {}}
+            self.save_data()
+
+    def save_data(self):
+        """Save user league data to JSON file"""
+        with open(self.data_file, 'w') as f:
+            json.dump(self.data, f, indent=2)
+
+    def register_league(self, user_id, league_name, league_id, swid=None, espn_s2=None):
+        """Register a new league for a user"""
+        user_id = str(user_id)
+
+        # Test the league connection first
+        try:
+            # Use the same season as the default league
+            season_year = SEASON_ID if 'SEASON_ID' in globals() else 2024
+
+            if swid and espn_s2:
+                test_league = League(league_id=league_id, year=season_year, swid=swid, espn_s2=espn_s2)
+            else:
+                test_league = League(league_id=league_id, year=season_year)
+
+            # Try to access basic league info to verify it works
+            teams = test_league.teams
+            if not teams:
+                raise ValueError("League has no teams")
+
+            # Try to get league name, fallback to provided name
+            try:
+                league_name_from_api = test_league.name if hasattr(test_league, 'name') and test_league.name else league_name
+            except:
+                league_name_from_api = league_name
+
+        except Exception as e:
+            raise ValueError(f"Unable to connect to league: {str(e)}")
+
+        # Store league info
+        league_key = f"{league_id}_{user_id}"
+        self.data['leagues'][league_key] = {
+            'name': league_name_from_api or league_name,
+            'league_id': league_id,
+            'owner_id': user_id,
+            'swid': swid,
+            'espn_s2': espn_s2,
+            'year': season_year
+        }
+
+        # Add to user's leagues
+        if user_id not in self.data['users']:
+            self.data['users'][user_id] = {
+                'leagues': [],
+                'default_league': None
+            }
+
+        if league_key not in self.data['users'][user_id]['leagues']:
+            self.data['users'][user_id]['leagues'].append(league_key)
+
+        # Set as default if it's the user's first league
+        if not self.data['users'][user_id]['default_league']:
+            self.data['users'][user_id]['default_league'] = league_key
+
+        self.save_data()
+        return league_key
+
+    def get_user_leagues(self, user_id):
+        """Get all leagues for a user"""
+        user_id = str(user_id)
+        if user_id not in self.data['users']:
+            return []
+
+        leagues = []
+        for league_key in self.data['users'][user_id]['leagues']:
+            if league_key in self.data['leagues']:
+                leagues.append(self.data['leagues'][league_key])
+        return leagues
+
+    def get_league_connection(self, user_id, league_key=None):
+        """Get a League object for the user's default or specified league"""
+        user_id = str(user_id)
+
+        if not league_key:
+            # Use default league
+            if user_id not in self.data['users'] or not self.data['users'][user_id]['default_league']:
+                return None
+            league_key = self.data['users'][user_id]['default_league']
+
+        if league_key not in self.data['leagues']:
+            return None
+
+        league_info = self.data['leagues'][league_key]
+
+        try:
+            if league_info['swid'] and league_info['espn_s2']:
+                return League(
+                    league_id=league_info['league_id'],
+                    year=league_info['year'],
+                    swid=league_info['swid'],
+                    espn_s2=league_info['espn_s2']
+                )
+            else:
+                return League(
+                    league_id=league_info['league_id'],
+                    year=league_info['year']
+                )
+        except Exception:
+            return None
+
+    def set_default_league(self, user_id, league_key):
+        """Set a user's default league"""
+        user_id = str(user_id)
+        if (user_id in self.data['users'] and
+            league_key in self.data['users'][user_id]['leagues'] and
+            league_key in self.data['leagues']):
+            self.data['users'][user_id]['default_league'] = league_key
+            self.save_data()
+            return True
+        return False
+
+    def remove_league(self, user_id, league_key):
+        """Remove a league from a user's list"""
+        user_id = str(user_id)
+        if (user_id in self.data['users'] and
+            league_key in self.data['users'][user_id]['leagues']):
+            self.data['users'][user_id]['leagues'].remove(league_key)
+
+            # If this was the default league, clear it
+            if self.data['users'][user_id]['default_league'] == league_key:
+                remaining_leagues = self.data['users'][user_id]['leagues']
+                self.data['users'][user_id]['default_league'] = remaining_leagues[0] if remaining_leagues else None
+
+            # Remove from leagues dict if user was the owner
+            if league_key in self.data['leagues'] and self.data['leagues'][league_key]['owner_id'] == user_id:
+                del self.data['leagues'][league_key]
+
+            self.save_data()
+            return True
+        return False
+
+    def get_all_leagues(self):
+        """Get all leagues available to everyone"""
+        leagues = []
+        for league_key, league_info in self.data['leagues'].items():
+            leagues.append({
+                'key': league_key,
+                'name': league_info['name'],
+                'league_id': league_info['league_id'],
+                'owner_id': league_info['owner_id'],
+                'year': league_info['year']
+            })
+        return leagues
+
+    def get_league_by_key(self, league_key):
+        """Get a League object by league key"""
+        if league_key not in self.data['leagues']:
+            return None
+
+        league_info = self.data['leagues'][league_key]
+
+        try:
+            if league_info['swid'] and league_info['espn_s2']:
+                return League(
+                    league_id=league_info['league_id'],
+                    year=league_info['year'],
+                    swid=league_info['swid'],
+                    espn_s2=league_info['espn_s2']
+                )
+            else:
+                return League(
+                    league_id=league_info['league_id'],
+                    year=league_info['year']
+                )
+        except Exception:
+            return None
+
+    def find_leagues_by_name(self, league_name):
+        """Find leagues that match a name pattern"""
+        matches = []
+        search_name = league_name.lower().strip()
+
+        for league_key, league_info in self.data['leagues'].items():
+            league_actual_name = league_info['name'].lower().strip()
+
+            # Exact match first
+            if search_name == league_actual_name:
+                matches.insert(0, {
+                    'key': league_key,
+                    'name': league_info['name'],
+                    'league_id': league_info['league_id'],
+                    'owner_id': league_info['owner_id'],
+                    'year': league_info['year']
+                })
+            # Partial match
+            elif search_name in league_actual_name or league_actual_name in search_name:
+                matches.append({
+                    'key': league_key,
+                    'name': league_info['name'],
+                    'league_id': league_info['league_id'],
+                    'owner_id': league_info['owner_id'],
+                    'year': league_info['year']
+                })
+
+        return matches
+
+# Initialize league manager
+league_manager = LeagueManager()
 
 def get_current_week_points(player, league):
     """Get current week projected/actual points for a player"""
@@ -83,10 +301,17 @@ class MyClient(discord.Client):
 intents = discord.Intents.default()
 client = MyClient(intents=intents)
 
-def get_league(timeout_retries=API_RETRY_ATTEMPTS):
+def get_league(user_id=None, league_key=None, timeout_retries=API_RETRY_ATTEMPTS):
     """Initialize and return league instance with proper authentication and timeout handling"""
     import time
 
+    # If user_id is provided, try to get their league
+    if user_id:
+        user_league = league_manager.get_league_connection(user_id, league_key)
+        if user_league:
+            return user_league
+
+    # Fallback to original default league
     for attempt in range(timeout_retries):
         try:
             if SWID and ESPN_S2:
@@ -235,7 +460,10 @@ async def team(interaction: discord.Interaction, team_name: str):
 
         # Initialize league with timeout protection
         try:
-            league = get_league()
+            league = get_league(user_id=interaction.user.id)
+            if not league:
+                await interaction.followup.send("❌ No league found. Use `/register_league` to add your ESPN Fantasy League first, or contact an admin if you want to use the default league.", ephemeral=True)
+                return
         except Exception as api_error:
             await interaction.followup.send(f"ESPN API error: {api_error}")
             return
@@ -652,17 +880,12 @@ async def standings(interaction: discord.Interaction):
     try:
         await interaction.response.defer()
 
-        # Quick validation before ESPN API call
-        if not LEAGUE_ID or not SEASON_ID:
-            await interaction.followup.send("Bot configuration error: Missing league or season ID")
-            return
-
         # Initialize league
         try:
-            if SWID and ESPN_S2:
-                league = League(league_id=LEAGUE_ID, year=SEASON_ID, swid=SWID, espn_s2=ESPN_S2)
-            else:
-                league = League(league_id=LEAGUE_ID, year=SEASON_ID)
+            league = get_league(user_id=interaction.user.id)
+            if not league:
+                await interaction.followup.send("❌ No league found. Use `/register_league` to add your ESPN Fantasy League first, or contact an admin if you want to use the default league.", ephemeral=True)
+                return
         except Exception as api_error:
             await interaction.followup.send(f"ESPN API error: {api_error}")
             return
@@ -2562,7 +2785,10 @@ async def scoreboard(interaction: discord.Interaction, auto_refresh: bool = True
     await interaction.response.defer()
 
     try:
-        league = get_league()
+        league = get_league(user_id=interaction.user.id)
+        if not league:
+            await interaction.followup.send("❌ No league found. Use `/register_league` to add your ESPN Fantasy League first, or contact an admin if you want to use the default league.", ephemeral=True)
+            return
 
         current_week = getattr(league, 'current_week', 1)
 
@@ -2783,6 +3009,10 @@ async def scoreboard(interaction: discord.Interaction, auto_refresh: bool = True
                 # Build simple vs-style lines
                 all_table_lines = []
 
+                # First pass: calculate the longest team name to determine optimal spacing
+                max_name_length = 0
+                formatted_matchups = []
+
                 for matchup in matchups:
                     team1 = matchup['team1']
                     team2 = matchup['team2']
@@ -2793,26 +3023,46 @@ async def scoreboard(interaction: discord.Interaction, auto_refresh: bool = True
                     team1_remaining = get_remaining_players(team1, league)
                     team2_remaining = get_remaining_players(team2, league)
 
-                    # Format team names with remaining players included, shorter to fit
+                    # Format team names with consistent length regardless of digit count
                     base_name1 = format_team_name(team1.team_name, 8)
                     base_name2 = format_team_name(team2.team_name, 8)
 
+                    # Ensure consistent formatting by padding remaining player counts
+                    # This handles both single digit (8/9) and double digit (11/11) counts
                     name1 = f"{base_name1} ({team1_remaining})"
                     name2 = f"{base_name2} ({team2_remaining})"
 
-                    # Format scores with arrow indicators for winners
+                    # Pad names to ensure consistent alignment - longest possible is about 15 chars
+                    name1 = f"{name1:<15}"
+                    name2 = f"{name2:<15}"
+
+                    formatted_matchups.append({
+                        'name1': name1,
+                        'name2': name2,
+                        'score1': score1,
+                        'score2': score2
+                    })
+
+                    # Track max length for dynamic spacing
+                    max_name_length = max(max_name_length, len(name1), len(name2))
+
+                # Use fixed spacing for consistent alignment across all leagues
+                # Based on your desired format: team names get 16 characters, scores get proper spacing
+                left_spacing = 16
+
+                # Second pass: format with consistent spacing
+                for matchup_data in formatted_matchups:
+                    name1 = matchup_data['name1']
+                    name2 = matchup_data['name2']
+                    score1 = matchup_data['score1']
+                    score2 = matchup_data['score2']
+
+                    # Format scores consistently
                     score1_str = f"{score1:.1f}"
                     score2_str = f"{score2:.1f}"
-                    name1_display = name1
-                    name2_display = name2
 
-                    # Use arrows to indicate winning direction
-                    if score1 > score2:
-                        line = f"{name1_display:<16} ► {score1_str:>6}  |   {score2_str:<6} {name2_display}"
-                    elif score2 > score1:
-                        line = f"{name1_display:<16} {score1_str:>6}  |   {score2_str:<6} ◄ {name2_display}"
-                    else:
-                        line = f"{name1_display:<16} {score1_str:>6}  |   {score2_str:<6} {name2_display}"
+                    # Clean table format without arrows for perfect alignment
+                    line = f"{name1:<{left_spacing}} {score1_str:>6}  |   {score2_str:<6} {name2}"
                     all_table_lines.append(line)
 
                 # Split table into multiple embeds if needed
@@ -3117,6 +3367,10 @@ class ScoreboardView(View):
                 # Build simple vs-style lines
                 all_table_lines = []
 
+                # First pass: calculate the longest team name to determine optimal spacing
+                max_name_length = 0
+                formatted_matchups = []
+
                 for matchup in matchups:
                     team1 = matchup['team1']
                     team2 = matchup['team2']
@@ -3127,26 +3381,46 @@ class ScoreboardView(View):
                     team1_remaining = get_remaining_players(team1, league)
                     team2_remaining = get_remaining_players(team2, league)
 
-                    # Format team names with remaining players included, shorter to fit
+                    # Format team names with consistent length regardless of digit count
                     base_name1 = format_team_name(team1.team_name, 8)
                     base_name2 = format_team_name(team2.team_name, 8)
 
+                    # Ensure consistent formatting by padding remaining player counts
+                    # This handles both single digit (8/9) and double digit (11/11) counts
                     name1 = f"{base_name1} ({team1_remaining})"
                     name2 = f"{base_name2} ({team2_remaining})"
 
-                    # Format scores with arrow indicators for winners
+                    # Pad names to ensure consistent alignment - longest possible is about 15 chars
+                    name1 = f"{name1:<15}"
+                    name2 = f"{name2:<15}"
+
+                    formatted_matchups.append({
+                        'name1': name1,
+                        'name2': name2,
+                        'score1': score1,
+                        'score2': score2
+                    })
+
+                    # Track max length for dynamic spacing
+                    max_name_length = max(max_name_length, len(name1), len(name2))
+
+                # Use fixed spacing for consistent alignment across all leagues
+                # Based on your desired format: team names get 16 characters, scores get proper spacing
+                left_spacing = 16
+
+                # Second pass: format with consistent spacing
+                for matchup_data in formatted_matchups:
+                    name1 = matchup_data['name1']
+                    name2 = matchup_data['name2']
+                    score1 = matchup_data['score1']
+                    score2 = matchup_data['score2']
+
+                    # Format scores consistently
                     score1_str = f"{score1:.1f}"
                     score2_str = f"{score2:.1f}"
-                    name1_display = name1
-                    name2_display = name2
 
-                    # Use arrows to indicate winning direction
-                    if score1 > score2:
-                        line = f"{name1_display:<16} ► {score1_str:>6}  |   {score2_str:<6} {name2_display}"
-                    elif score2 > score1:
-                        line = f"{name1_display:<16} {score1_str:>6}  |   {score2_str:<6} ◄ {name2_display}"
-                    else:
-                        line = f"{name1_display:<16} {score1_str:>6}  |   {score2_str:<6} {name2_display}"
+                    # Clean table format without arrows for perfect alignment
+                    line = f"{name1:<{left_spacing}} {score1_str:>6}  |   {score2_str:<6} {name2}"
                     all_table_lines.append(line)
 
                 # Split table into multiple embeds if needed
@@ -3500,6 +3774,457 @@ class PlayerSelectDropdown(Select):
         embed.add_field(name="Opponent", value=opponent, inline=True)
         
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@client.tree.command(name="register_league", description="Register your ESPN Fantasy League with the bot.")
+@app_commands.describe(
+    league_id="Your ESPN League ID (found in the URL)",
+    league_name="A name for your league",
+    swid="Your SWID cookie (optional, for private leagues)",
+    espn_s2="Your ESPN_S2 cookie (optional, for private leagues)"
+)
+async def register_league(interaction: discord.Interaction, league_id: str, league_name: str, swid: str = None, espn_s2: str = None):
+    """Register a user's ESPN Fantasy League"""
+    try:
+        await interaction.response.defer(ephemeral=True)
+
+        # Validate league_id is numeric
+        try:
+            league_id_int = int(league_id)
+        except ValueError:
+            await interaction.followup.send("❌ League ID must be a number.", ephemeral=True)
+            return
+
+        # Register the league
+        try:
+            league_key = league_manager.register_league(
+                user_id=interaction.user.id,
+                league_name=league_name,
+                league_id=league_id_int,
+                swid=swid,
+                espn_s2=espn_s2
+            )
+
+            embed = discord.Embed(
+                title="✅ League Registered!",
+                description=f"Successfully registered **{league_name}**",
+                color=0x00ff00
+            )
+            embed.add_field(name="League ID", value=league_id, inline=True)
+            embed.add_field(name="Status", value="Set as default league", inline=True)
+            embed.add_field(name="Next Steps", value="Use `/my_leagues` to view your leagues or `/switch_league` to change default", inline=False)
+
+            await interaction.followup.send(embed=embed, ephemeral=True)
+
+        except ValueError as e:
+            await interaction.followup.send(f"❌ Registration failed: {str(e)}", ephemeral=True)
+
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error registering league: {str(e)}", ephemeral=True)
+
+@client.tree.command(name="my_leagues", description="View your registered leagues.")
+async def my_leagues(interaction: discord.Interaction):
+    """Display user's registered leagues"""
+    try:
+        await interaction.response.defer(ephemeral=True)
+
+        user_leagues = league_manager.get_user_leagues(interaction.user.id)
+
+        if not user_leagues:
+            embed = discord.Embed(
+                title="📋 My Leagues",
+                description="You haven't registered any leagues yet.\n\nUse `/register_league` to add your ESPN Fantasy League!",
+                color=0xffa500
+            )
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            return
+
+        embed = discord.Embed(
+            title="📋 My Leagues",
+            color=0x0099ff
+        )
+
+        # Get user's default league
+        user_data = league_manager.data['users'].get(str(interaction.user.id), {})
+        default_league_key = user_data.get('default_league')
+
+        for i, league_info in enumerate(user_leagues, 1):
+            league_key = f"{league_info['league_id']}_{league_info['owner_id']}"
+            is_default = "🌟 **DEFAULT**" if league_key == default_league_key else ""
+
+            field_name = f"{i}. {league_info['name']} {is_default}"
+            field_value = f"League ID: `{league_info['league_id']}`\nYear: {league_info['year']}"
+
+            if league_info['swid'] and league_info['espn_s2']:
+                field_value += "\n🔒 Private League"
+            else:
+                field_value += "\n🌐 Public League"
+
+            embed.add_field(name=field_name, value=field_value, inline=False)
+
+        embed.add_field(
+            name="💡 Tips",
+            value="• Use `/switch_league` to change your default league\n• Use `/remove_league` to remove a league\n• All commands will use your default league",
+            inline=False
+        )
+
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error fetching leagues: {str(e)}", ephemeral=True)
+
+@client.tree.command(name="switch_league", description="Switch your default league.")
+@app_commands.describe(league_name="Name of the league to switch to")
+async def switch_league(interaction: discord.Interaction, league_name: str):
+    """Switch user's default league"""
+    try:
+        await interaction.response.defer(ephemeral=True)
+
+        user_leagues = league_manager.get_user_leagues(interaction.user.id)
+
+        if not user_leagues:
+            await interaction.followup.send("❌ You haven't registered any leagues yet. Use `/register_league` first.", ephemeral=True)
+            return
+
+        # Find the league by name
+        target_league = None
+        target_league_key = None
+        for league_info in user_leagues:
+            if league_info['name'].lower() == league_name.lower():
+                target_league = league_info
+                target_league_key = f"{league_info['league_id']}_{league_info['owner_id']}"
+                break
+
+        if not target_league:
+            available_leagues = ", ".join([league['name'] for league in user_leagues])
+            await interaction.followup.send(f"❌ League '{league_name}' not found.\n\nAvailable leagues: {available_leagues}", ephemeral=True)
+            return
+
+        # Switch to the league
+        success = league_manager.set_default_league(interaction.user.id, target_league_key)
+
+        if success:
+            embed = discord.Embed(
+                title="🔄 League Switched!",
+                description=f"Successfully switched to **{target_league['name']}**",
+                color=0x00ff00
+            )
+            embed.add_field(name="League ID", value=target_league['league_id'], inline=True)
+            embed.add_field(name="Status", value="Now your default league", inline=True)
+
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        else:
+            await interaction.followup.send("❌ Failed to switch league.", ephemeral=True)
+
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error switching league: {str(e)}", ephemeral=True)
+
+@client.tree.command(name="remove_league", description="Remove a league from your registered leagues.")
+@app_commands.describe(league_name="Name of the league to remove")
+async def remove_league(interaction: discord.Interaction, league_name: str):
+    """Remove a league from user's registered leagues"""
+    try:
+        await interaction.response.defer(ephemeral=True)
+
+        user_leagues = league_manager.get_user_leagues(interaction.user.id)
+
+        if not user_leagues:
+            await interaction.followup.send("❌ You haven't registered any leagues yet.", ephemeral=True)
+            return
+
+        # Find the league by name
+        target_league = None
+        target_league_key = None
+        for league_info in user_leagues:
+            if league_info['name'].lower() == league_name.lower():
+                target_league = league_info
+                target_league_key = f"{league_info['league_id']}_{league_info['owner_id']}"
+                break
+
+        if not target_league:
+            available_leagues = ", ".join([league['name'] for league in user_leagues])
+            await interaction.followup.send(f"❌ League '{league_name}' not found.\n\nAvailable leagues: {available_leagues}", ephemeral=True)
+            return
+
+        # Remove the league
+        success = league_manager.remove_league(interaction.user.id, target_league_key)
+
+        if success:
+            embed = discord.Embed(
+                title="🗑️ League Removed!",
+                description=f"Successfully removed **{target_league['name']}**",
+                color=0xff6b6b
+            )
+
+            remaining_leagues = league_manager.get_user_leagues(interaction.user.id)
+            if remaining_leagues:
+                embed.add_field(name="Default League", value=f"Now using: **{remaining_leagues[0]['name']}**", inline=False)
+            else:
+                embed.add_field(name="No Leagues", value="You have no registered leagues. Use `/register_league` to add one.", inline=False)
+
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        else:
+            await interaction.followup.send("❌ Failed to remove league.", ephemeral=True)
+
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error removing league: {str(e)}", ephemeral=True)
+
+@client.tree.command(name="league_status", description="Show your current default league and bot status.")
+async def league_status(interaction: discord.Interaction):
+    """Show current league status for the user"""
+    try:
+        await interaction.response.defer(ephemeral=True)
+
+        # Get user's league info
+        user_leagues = league_manager.get_user_leagues(interaction.user.id)
+        user_data = league_manager.data['users'].get(str(interaction.user.id), {})
+        default_league_key = user_data.get('default_league')
+
+        embed = discord.Embed(
+            title="🏈 League Status",
+            color=0x0099ff
+        )
+
+        if not user_leagues:
+            embed.description = "❌ **No leagues registered**\n\nUse `/register_league` to add your ESPN Fantasy League!"
+            embed.add_field(
+                name="📋 Available Commands",
+                value="• `/register_league` - Add your league\n• `/my_leagues` - View your leagues\n• `/help` - Get help",
+                inline=False
+            )
+        else:
+            # Find default league info
+            default_league_info = None
+            if default_league_key:
+                for league_info in user_leagues:
+                    league_key = f"{league_info['league_id']}_{league_info['owner_id']}"
+                    if league_key == default_league_key:
+                        default_league_info = league_info
+                        break
+
+            if default_league_info:
+                embed.description = f"✅ **Active League:** {default_league_info['name']}"
+                embed.add_field(name="League ID", value=default_league_info['league_id'], inline=True)
+                embed.add_field(name="Year", value=default_league_info['year'], inline=True)
+
+                privacy_status = "🔒 Private" if default_league_info['swid'] and default_league_info['espn_s2'] else "🌐 Public"
+                embed.add_field(name="Privacy", value=privacy_status, inline=True)
+
+                # Test league connection
+                try:
+                    test_league = league_manager.get_league_connection(interaction.user.id)
+                    if test_league:
+                        embed.add_field(name="Connection", value="✅ Connected", inline=True)
+                        embed.add_field(name="Teams", value=f"{len(test_league.teams)} teams", inline=True)
+                        current_week = getattr(test_league, 'current_week', 'N/A')
+                        embed.add_field(name="Current Week", value=current_week, inline=True)
+                    else:
+                        embed.add_field(name="Connection", value="❌ Failed to connect", inline=True)
+                except Exception:
+                    embed.add_field(name="Connection", value="❌ Connection error", inline=True)
+
+                embed.add_field(
+                    name="📋 Quick Commands",
+                    value="• `/team <name>` - View team roster\n• `/standings` - League standings\n• `/switch_league` - Change active league",
+                    inline=False
+                )
+            else:
+                embed.description = "⚠️ **Default league not found**"
+
+            embed.add_field(
+                name="📊 Your Leagues",
+                value=f"Total registered: **{len(user_leagues)}**\nUse `/my_leagues` to see all",
+                inline=False
+            )
+
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error checking league status: {str(e)}", ephemeral=True)
+
+@client.tree.command(name="all_leagues", description="View all available leagues in the server.")
+async def all_leagues(interaction: discord.Interaction):
+    """Display all leagues available to everyone"""
+    try:
+        await interaction.response.defer()
+
+        all_leagues = league_manager.get_all_leagues()
+
+        if not all_leagues:
+            embed = discord.Embed(
+                title="📋 All Available Leagues",
+                description="No leagues have been registered yet.\n\nAsk users to register their leagues with `/register_league`!",
+                color=0xffa500
+            )
+            await interaction.followup.send(embed=embed)
+            return
+
+        embed = discord.Embed(
+            title="📋 All Available Leagues",
+            description=f"These leagues can be used in commands by anyone in the server:",
+            color=0x0099ff
+        )
+
+        for i, league_info in enumerate(all_leagues, 1):
+            # Get owner's username if possible
+            try:
+                owner = interaction.guild.get_member(int(league_info['owner_id']))
+                owner_name = owner.display_name if owner else f"User {league_info['owner_id']}"
+            except:
+                owner_name = f"User {league_info['owner_id']}"
+
+            field_name = f"{i}. {league_info['name']}"
+            field_value = f"League ID: `{league_info['league_id']}`\nYear: {league_info['year']}\nRegistered by: {owner_name}"
+
+            embed.add_field(name=field_name, value=field_value, inline=False)
+
+        embed.add_field(
+            name="💡 How to Use",
+            value="• Use league names in commands like `/compare_cross_league`\n• Everyone can access these leagues for comparisons\n• Private league credentials are securely stored",
+            inline=False
+        )
+
+        await interaction.followup.send(embed=embed)
+
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error fetching leagues: {str(e)}")
+
+@client.tree.command(name="compare_cross_league", description="Compare teams from different leagues.")
+@app_commands.describe(
+    team1="First team name",
+    league1="League name for first team (optional, uses your default)",
+    team2="Second team name",
+    league2="League name for second team (optional, uses your default)"
+)
+async def compare_cross_league(interaction: discord.Interaction, team1: str, team2: str, league1: str = None, league2: str = None):
+    """Compare teams from potentially different leagues"""
+    try:
+        await interaction.response.defer()
+
+        # Get leagues for comparison
+        if league1:
+            # Find league by name
+            league1_matches = league_manager.find_leagues_by_name(league1)
+            if not league1_matches:
+                all_leagues = league_manager.get_all_leagues()
+                available_names = [l['name'] for l in all_leagues]
+                await interaction.followup.send(f"❌ League '{league1}' not found.\n\nAvailable leagues: {', '.join(available_names)}")
+                return
+            league1_obj = league_manager.get_league_by_key(league1_matches[0]['key'])
+            if not league1_obj:
+                await interaction.followup.send(f"❌ Failed to connect to league '{league1_matches[0]['name']}'.")
+                return
+            league1_name = league1_matches[0]['name']
+        else:
+            # Use user's default league
+            league1_obj = get_league(user_id=interaction.user.id)
+            if not league1_obj:
+                await interaction.followup.send("❌ No default league found. Register a league or specify league1 parameter.")
+                return
+            # Get league name
+            user_leagues = league_manager.get_user_leagues(interaction.user.id)
+            user_data = league_manager.data['users'].get(str(interaction.user.id), {})
+            default_league_key = user_data.get('default_league')
+            if default_league_key and default_league_key in league_manager.data['leagues']:
+                league1_name = league_manager.data['leagues'][default_league_key]['name']
+            else:
+                league1_name = "Your League"
+
+        if league2:
+            # Find league by name
+            league2_matches = league_manager.find_leagues_by_name(league2)
+            if not league2_matches:
+                await interaction.followup.send(f"❌ League '{league2}' not found. Use `/all_leagues` to see available leagues.")
+                return
+            league2_obj = league_manager.get_league_by_key(league2_matches[0]['key'])
+            league2_name = league2_matches[0]['name']
+        else:
+            # Use user's default league (same as league1 if not specified)
+            league2_obj = league1_obj
+            league2_name = league1_name
+
+        if not league1_obj or not league2_obj:
+            await interaction.followup.send("❌ Failed to connect to one or both leagues.")
+            return
+
+        # Find teams
+        team1_obj = next((t for t in league1_obj.teams if t.team_name.lower() == team1.lower()), None)
+        team2_obj = next((t for t in league2_obj.teams if t.team_name.lower() == team2.lower()), None)
+
+        if not team1_obj:
+            await interaction.followup.send(f"❌ Team '{team1}' not found in {league1_name}.")
+            return
+        if not team2_obj:
+            await interaction.followup.send(f"❌ Team '{team2}' not found in {league2_name}.")
+            return
+
+        # Create comparison embed
+        embed = discord.Embed(
+            title="⚔️ Cross-League Team Comparison",
+            color=0xff6b35
+        )
+
+        # Team 1 info
+        team1_record = f"{team1_obj.wins}-{team1_obj.losses}"
+        team1_points = team1_obj.points_for
+        embed.add_field(
+            name=f"🔵 {team1_obj.team_name}",
+            value=f"**League:** {league1_name}\n**Record:** {team1_record}\n**Points For:** {team1_points:.1f}",
+            inline=True
+        )
+
+        # Team 2 info
+        team2_record = f"{team2_obj.wins}-{team2_obj.losses}"
+        team2_points = team2_obj.points_for
+        embed.add_field(
+            name=f"🔴 {team2_obj.team_name}",
+            value=f"**League:** {league2_name}\n**Record:** {team2_record}\n**Points For:** {team2_points:.1f}",
+            inline=True
+        )
+
+        # Comparison stats
+        comparison_text = []
+        if team1_points > team2_points:
+            comparison_text.append(f"🔵 {team1_obj.team_name} leads in total points (+{team1_points - team2_points:.1f})")
+        elif team2_points > team1_points:
+            comparison_text.append(f"🔴 {team2_obj.team_name} leads in total points (+{team2_points - team1_points:.1f})")
+        else:
+            comparison_text.append("🟡 Teams tied in total points")
+
+        # Win percentage comparison
+        team1_win_pct = team1_obj.wins / (team1_obj.wins + team1_obj.losses) if (team1_obj.wins + team1_obj.losses) > 0 else 0
+        team2_win_pct = team2_obj.wins / (team2_obj.wins + team2_obj.losses) if (team2_obj.wins + team2_obj.losses) > 0 else 0
+
+        if team1_win_pct > team2_win_pct:
+            comparison_text.append(f"🔵 {team1_obj.team_name} has better win rate ({team1_win_pct:.1%} vs {team2_win_pct:.1%})")
+        elif team2_win_pct > team1_win_pct:
+            comparison_text.append(f"🔴 {team2_obj.team_name} has better win rate ({team2_win_pct:.1%} vs {team1_win_pct:.1%})")
+        else:
+            comparison_text.append(f"🟡 Teams have same win rate ({team1_win_pct:.1%})")
+
+        # Points per game
+        team1_ppg = team1_points / max(team1_obj.wins + team1_obj.losses, 1)
+        team2_ppg = team2_points / max(team2_obj.wins + team2_obj.losses, 1)
+
+        comparison_text.append(f"📊 Points per game: {team1_obj.team_name} ({team1_ppg:.1f}) vs {team2_obj.team_name} ({team2_ppg:.1f})")
+
+        embed.add_field(
+            name="📈 Comparison",
+            value="\n".join(comparison_text),
+            inline=False
+        )
+
+        # Note about cross-league comparison
+        if league1_name != league2_name:
+            embed.add_field(
+                name="ℹ️ Note",
+                value="This is a cross-league comparison. Different leagues may have different scoring systems, rules, and competition levels.",
+                inline=False
+            )
+
+        await interaction.followup.send(embed=embed)
+
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error comparing teams: {str(e)}")
 
 if __name__ == '__main__':
     try:

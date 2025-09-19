@@ -22,3 +22,6 @@ Integrates with ESPN API to fetch your public or private league fantasy football
 ### Setup
 
 1. Update your .env file. Private league will need all fields
+2. Can run bot locally using python
+3. Add bot to your discord server by using the discord dev portal
+4. Use commands in a chat channel

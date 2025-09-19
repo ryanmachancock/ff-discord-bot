@@ -53,6 +53,16 @@ SEASON_ID = int(os.getenv('ESPN_SEASON_ID'))
 SWID = os.getenv('ESPN_SWID')
 ESPN_S2 = os.getenv('ESPN_S2')
 
+# Discord and API Constants
+DISCORD_EMBED_FIELD_LIMIT = 25  # Discord's limit for embed fields
+DISCORD_EMBED_CHAR_LIMIT = 1024  # Discord's character limit per embed field
+DISCORD_MESSAGE_CHAR_LIMIT = 2000  # Discord's character limit per message
+SCOREBOARD_CHAR_LIMIT = 1800  # Character limit for scoreboard embeds
+AUTO_REFRESH_INTERVAL = 30  # Seconds between auto-refresh updates
+MAX_PLAYERS_DISPLAY = 20  # Maximum players to show in lists
+API_RETRY_ATTEMPTS = 3  # Number of retry attempts for API calls
+API_RETRY_DELAY = 2  # Seconds to wait between API retry attempts
+
 # Validate required environment variables
 if not TOKEN:
     raise ValueError("DISCORD_TOKEN environment variable is required")
@@ -72,16 +82,29 @@ class MyClient(discord.Client):
 intents = discord.Intents.default()
 client = MyClient(intents=intents)
 
-def get_league():
-    """Initialize and return league instance with proper authentication"""
-    try:
-        if SWID and ESPN_S2:
-            return League(league_id=LEAGUE_ID, year=SEASON_ID, swid=SWID, espn_s2=ESPN_S2)
-        else:
-            return League(league_id=LEAGUE_ID, year=SEASON_ID)
-    except Exception as e:
-        print(f"Failed to initialize league: {e}")
-        raise
+def get_league(timeout_retries=API_RETRY_ATTEMPTS):
+    """Initialize and return league instance with proper authentication and timeout handling"""
+    import time
+
+    for attempt in range(timeout_retries):
+        try:
+            if SWID and ESPN_S2:
+                league = League(league_id=LEAGUE_ID, year=SEASON_ID, swid=SWID, espn_s2=ESPN_S2)
+            else:
+                league = League(league_id=LEAGUE_ID, year=SEASON_ID)
+
+            # Test the connection with a simple call
+            _ = league.teams  # This will trigger an API call
+            return league
+
+        except Exception as e:
+            if attempt < timeout_retries - 1:
+                print(f"League initialization attempt {attempt + 1} failed: {e}. Retrying in {API_RETRY_DELAY} seconds...")
+                time.sleep(API_RETRY_DELAY)
+                continue
+            else:
+                print(f"Failed to initialize league after {timeout_retries} attempts: {e}")
+                raise ConnectionError(f"Unable to connect to ESPN Fantasy API: {e}")
 
 def get_points(player):
     """Get total fantasy points for a player"""
@@ -90,6 +113,99 @@ def get_points(player):
 def get_proj(player):
     """Get projected points for a player"""
     return getattr(player, 'projected_total_points', 0)
+
+def validate_team_name(team_name, league_teams):
+    """Validate and normalize team name input"""
+    if not team_name or not isinstance(team_name, str):
+        return None
+
+    # Remove extra whitespace and convert to lowercase for comparison
+    normalized_input = team_name.strip().lower()
+
+    # Try exact match first
+    for team in league_teams:
+        if team.team_name.lower() == normalized_input:
+            return team
+
+    # Try partial match
+    for team in league_teams:
+        if normalized_input in team.team_name.lower():
+            return team
+
+    return None
+
+def validate_player_name(player_name):
+    """Validate and sanitize player name input"""
+    if not player_name or not isinstance(player_name, str):
+        return None
+
+    # Remove extra whitespace and limit length
+    sanitized = player_name.strip()[:50]  # Reasonable limit for player names
+
+    # Basic sanitization - remove potentially harmful characters
+    allowed_chars = set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 \'.-')
+    sanitized = ''.join(c for c in sanitized if c in allowed_chars)
+
+    return sanitized if sanitized else None
+
+# Simple cache for league data to avoid repeated API calls
+_league_cache = {}
+
+def get_cached_league_data(cache_key, fetch_function, cache_duration_seconds=300):
+    """Cache league data to avoid repeated API calls within 5 minutes"""
+    import time
+
+    current_time = time.time()
+
+    if cache_key in _league_cache:
+        cached_data, timestamp = _league_cache[cache_key]
+        if current_time - timestamp < cache_duration_seconds:
+            return cached_data
+
+    # Fetch fresh data
+    data = fetch_function()
+    _league_cache[cache_key] = (data, current_time)
+    return data
+
+def safe_field_value(text, max_length=DISCORD_EMBED_CHAR_LIMIT):
+    """Safely truncate text to fit Discord embed field limits"""
+    if len(text) <= max_length:
+        return text
+
+    # Truncate and add ellipsis
+    return text[:max_length-3] + "..."
+
+async def handle_command_error(interaction, error, command_name="command"):
+    """Consistent error handling for Discord commands"""
+    error_message = f"❌ Error executing {command_name}: {str(error)[:100]}"
+
+    if isinstance(error, ConnectionError):
+        error_message = "🌐 Unable to connect to ESPN Fantasy API. Please try again later."
+    elif isinstance(error, ValueError):
+        error_message = f"⚠️ Invalid input: {str(error)[:100]}"
+    elif "timeout" in str(error).lower():
+        error_message = "⏱️ Request timed out. ESPN servers may be slow. Please try again."
+
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.send_message(error_message, ephemeral=True)
+        else:
+            await interaction.followup.send(error_message, ephemeral=True)
+    except Exception:
+        # Fallback if Discord interaction fails
+        print(f"Failed to send error message: {error_message}")
+
+def command_error_handler(func):
+    """Decorator for consistent command error handling"""
+    async def wrapper(interaction, *args, **kwargs):
+        try:
+            return await func(interaction, *args, **kwargs)
+        except Exception as e:
+            await handle_command_error(interaction, e, func.__name__)
+
+    wrapper.__name__ = func.__name__
+    wrapper.__doc__ = func.__doc__
+    return wrapper
 
 @client.event
 async def on_ready():
@@ -2611,13 +2727,13 @@ async def scoreboard(interaction: discord.Interaction, auto_refresh: bool = True
                         line = f"{name1_display:<16} {score1_str:>6}  |   {score2_str:<6} {name2_display}"
                     all_table_lines.append(line)
 
-                # Split table into multiple embeds if needed (aim for ~1800 chars per embed for compactness)
+                # Split table into multiple embeds if needed
                 current_embed_lines = []
 
                 for line in all_table_lines:
                     test_content = f"```\n{chr(10).join(current_embed_lines + [line])}\n```"
 
-                    if len(test_content) > 1800 and current_embed_lines:
+                    if len(test_content) > SCOREBOARD_CHAR_LIMIT and current_embed_lines:
                         # Create embed with current lines
                         if current_embed_lines:
                             # No table closure needed for simple text format
@@ -2945,13 +3061,13 @@ class ScoreboardView(View):
                         line = f"{name1_display:<16} {score1_str:>6}  |   {score2_str:<6} {name2_display}"
                     all_table_lines.append(line)
 
-                # Split table into multiple embeds if needed (aim for ~1800 chars per embed for compactness)
+                # Split table into multiple embeds if needed
                 current_embed_lines = []
 
                 for line in all_table_lines:
                     test_content = f"```\n{chr(10).join(current_embed_lines + [line])}\n```"
 
-                    if len(test_content) > 1800 and current_embed_lines:
+                    if len(test_content) > SCOREBOARD_CHAR_LIMIT and current_embed_lines:
                         # Create embed with current lines
                         if current_embed_lines:
                             # No table closure needed for simple text format

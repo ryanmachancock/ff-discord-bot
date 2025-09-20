@@ -520,7 +520,33 @@ async def on_ready():
 
 @client.tree.command(name="ping", description="Check if the bot is alive.")
 async def ping(interaction: discord.Interaction):
-    await interaction.response.send_message('Pong!')
+    import time
+    start_time = time.time()
+
+    embed = discord.Embed(
+        title="🏓 Pong!",
+        description="**Bot is online and responding**",
+        color=0x00ff00
+    )
+
+    # Calculate response time
+    response_time = round((time.time() - start_time) * 1000, 2)
+
+    embed.add_field(
+        name="⚡ Response Time",
+        value=f"**{response_time}ms**",
+        inline=True
+    )
+
+    embed.add_field(
+        name="🏈 Status",
+        value="**Ready for Fantasy Football!**",
+        inline=True
+    )
+
+    embed.set_footer(text="💡 Try /help for available commands")
+
+    await interaction.response.send_message(embed=embed)
 
 
 @client.tree.command(name="team", description="Get the roster for a team by name.")
@@ -819,19 +845,89 @@ async def player(interaction: discord.Interaction, player_name: str):
         injury_status = getattr(found_player, 'injuryStatus', 'N/A')
         nfl_team = getattr(found_player, 'proTeam', 'N/A')
         position = getattr(found_player, 'position', 'N/A')
-        # Create detailed embed
-        embed = discord.Embed(title=f"📊 {found_player.name}", color=discord.Color.green())
-        embed.add_field(name="Position", value=f"{position} - {nfl_team}", inline=True)
-        # Format points for display
+        # Create detailed embed with improved formatting
+        league_name = get_league_name(user_id=interaction.user.id)
+        current_week = getattr(league, 'current_week', 'Unknown')
+
+        embed = discord.Embed(
+            title=f"🏈 {found_player.name}",
+            description=f"**{league_name} - Week {current_week}**",
+            color=0x0099ff
+        )
+
+        # Position and Team info
+        embed.add_field(
+            name="🎯 Position",
+            value=f"**{position}**",
+            inline=True
+        )
+        embed.add_field(
+            name="🏆 NFL Team",
+            value=f"**{nfl_team}**",
+            inline=True
+        )
+        embed.add_field(
+            name="⚔️ Opponent",
+            value=f"**{opponent}**",
+            inline=True
+        )
+
+        # Performance stats
         if actual_points == 'N/A':
-            points_formatted = "N/A"
+            actual_formatted = "**N/A**"
         else:
-            points_formatted = f"{float(actual_points):.2f}"
-        embed.add_field(name="Projected", value=f"{points_formatted} pts", inline=True)
-        embed.add_field(name="Season Total", value=f"{season_total} pts", inline=True)
-        embed.add_field(name="Injury Status", value=injury_status, inline=True)
-        embed.add_field(name="Team", value=player_team.team_name, inline=True)
-        embed.add_field(name="Opponent", value=opponent, inline=True)
+            actual_formatted = f"**{float(actual_points):.1f}** pts"
+
+        if proj_points == 'N/A':
+            proj_formatted = "**N/A**"
+        else:
+            proj_formatted = f"**{float(proj_points):.1f}** pts"
+
+        embed.add_field(
+            name="📊 Week Points",
+            value=actual_formatted,
+            inline=True
+        )
+        embed.add_field(
+            name="🎲 Projected",
+            value=proj_formatted,
+            inline=True
+        )
+        embed.add_field(
+            name="🏁 Season Total",
+            value=f"**{season_total}** pts" if season_total != 'N/A' else "**N/A**",
+            inline=True
+        )
+
+        # Add spacing
+        embed.add_field(name="\u200b", value="\u200b", inline=False)
+
+        # Team and status info
+        embed.add_field(
+            name="🏈 Fantasy Team",
+            value=f"**{player_team.team_name}**",
+            inline=True
+        )
+
+        # Format injury status with proper emoji
+        status_emoji = {
+            'ACTIVE': '✅', 'QUESTIONABLE': '⚠️', 'OUT': '❌',
+            'INJURY_RESERVE': '🏥', 'DOUBTFUL': '🔶', 'N/A': '🟢'
+        }
+        status_display = status_emoji.get(injury_status, '🟢')
+        status_text = injury_status if injury_status != 'N/A' else 'Healthy'
+
+        embed.add_field(
+            name="🩺 Status",
+            value=f"{status_display} **{status_text}**",
+            inline=True
+        )
+
+        # Add empty field for layout
+        embed.add_field(name="\u200b", value="\u200b", inline=True)
+
+        embed.set_footer(text="💡 Try /team to see full roster breakdown")
+
         await interaction.followup.send(embed=embed)
     except Exception as e:
         await interaction.followup.send(f"Error fetching player: {e}")
@@ -3255,12 +3351,21 @@ async def scoreboard(interaction: discord.Interaction, auto_refresh: bool = True
                     score1 = matchup_data['score1']
                     score2 = matchup_data['score2']
 
-                    # Format scores consistently
+                    # Format scores consistently and determine winner
                     score1_str = f"{score1:.1f}"
                     score2_str = f"{score2:.1f}"
 
-                    # Clean table format without arrows for perfect alignment
-                    line = f"{name1:<{left_spacing}} {score1_str:>6}  |   {score2_str:<6} {name2}"
+                    # Add winner triangles while maintaining alignment
+                    if score1 > score2:
+                        # Team 1 winning
+                        line = f"{name1:<{left_spacing}} {score1_str:>6} ▶ |   {score2_str:<6} {name2}"
+                    elif score2 > score1:
+                        # Team 2 winning
+                        line = f"{name1:<{left_spacing}} {score1_str:>6}   | ◀ {score2_str:<6} {name2}"
+                    else:
+                        # Tied
+                        line = f"{name1:<{left_spacing}} {score1_str:>6}  |   {score2_str:<6} {name2}"
+
                     all_table_lines.append(line)
 
                 # Split table into multiple embeds if needed
@@ -3639,12 +3744,21 @@ class ScoreboardView(View):
                     score1 = matchup_data['score1']
                     score2 = matchup_data['score2']
 
-                    # Format scores consistently
+                    # Format scores consistently and determine winner
                     score1_str = f"{score1:.1f}"
                     score2_str = f"{score2:.1f}"
 
-                    # Clean table format without arrows for perfect alignment
-                    line = f"{name1:<{left_spacing}} {score1_str:>6}  |   {score2_str:<6} {name2}"
+                    # Add winner triangles while maintaining alignment
+                    if score1 > score2:
+                        # Team 1 winning
+                        line = f"{name1:<{left_spacing}} {score1_str:>6} ▶ |   {score2_str:<6} {name2}"
+                    elif score2 > score1:
+                        # Team 2 winning
+                        line = f"{name1:<{left_spacing}} {score1_str:>6}   | ◀ {score2_str:<6} {name2}"
+                    else:
+                        # Tied
+                        line = f"{name1:<{left_spacing}} {score1_str:>6}  |   {score2_str:<6} {name2}"
+
                     all_table_lines.append(line)
 
                 # Split table into multiple embeds if needed
@@ -4065,7 +4179,8 @@ async def my_leagues(interaction: discord.Interaction):
             return
 
         embed = discord.Embed(
-            title="📋 My Leagues",
+            title="🏈 My Fantasy Leagues",
+            description=f"**{len(user_leagues)} League{'s' if len(user_leagues) != 1 else ''} Registered**",
             color=0x0099ff
         )
 
@@ -4075,17 +4190,29 @@ async def my_leagues(interaction: discord.Interaction):
 
         for i, league_info in enumerate(user_leagues, 1):
             league_key = f"{league_info['league_id']}_{league_info['owner_id']}"
-            is_default = "🌟 **DEFAULT**" if league_key == default_league_key else ""
+            is_default = league_key == default_league_key
 
-            field_name = f"{i}. {league_info['name']} {is_default}"
-            field_value = f"League ID: `{league_info['league_id']}`\nYear: {league_info['year']}"
-
-            if league_info['swid'] and league_info['espn_s2']:
-                field_value += "\n🔒 Private League"
+            # League name with default indicator
+            if is_default:
+                league_name = f"🌟 **{league_info['name']}**"
+                name_suffix = " (Default)"
             else:
-                field_value += "\n🌐 Public League"
+                league_name = f"**{league_info['name']}**"
+                name_suffix = ""
 
-            embed.add_field(name=field_name, value=field_value, inline=False)
+            # Privacy indicator with better formatting
+            privacy_status = "🔒 Private" if league_info['swid'] and league_info['espn_s2'] else "🌐 Public"
+
+            field_value = f"{league_name}\n"
+            field_value += f"🆔 **League ID:** `{league_info['league_id']}`\n"
+            field_value += f"📅 **Year:** {league_info['year']}\n"
+            field_value += f"{privacy_status}"
+
+            embed.add_field(
+                name=f"{i}. League Details{name_suffix}",
+                value=field_value,
+                inline=len(user_leagues) <= 2  # Use inline for 1-2 leagues, full width for more
+            )
 
         embed.add_field(
             name="💡 Tips",
@@ -4287,8 +4414,8 @@ async def all_leagues(interaction: discord.Interaction):
             return
 
         embed = discord.Embed(
-            title="📋 All Available Leagues",
-            description=f"These leagues can be used in commands by anyone in the server:",
+            title="🌐 All Available Leagues",
+            description=f"**{len(all_leagues)} League{'s' if len(all_leagues) != 1 else ''} Available** for cross-league commands",
             color=0x0099ff
         )
 
@@ -4302,14 +4429,23 @@ async def all_leagues(interaction: discord.Interaction):
             except:
                 pass
 
-            field_name = f"{i}. {league_info['name']}"
-            field_value = f"League ID: `{league_info['league_id']}`\nYear: {league_info['year']}"
+            # Privacy indicator
+            privacy_status = "🔒 Private" if league_info.get('swid') and league_info.get('espn_s2') else "🌐 Public"
+
+            field_value = f"🏈 **{league_info['name']}**\n"
+            field_value += f"🆔 **League ID:** `{league_info['league_id']}`\n"
+            field_value += f"📅 **Year:** {league_info['year']}\n"
+            field_value += f"{privacy_status}"
 
             # Only show "Registered by" if we have a meaningful name
             if owner_name:
-                field_value += f"\nRegistered by: {owner_name}"
+                field_value += f"\n👤 **Registered by:** {owner_name}"
 
-            embed.add_field(name=field_name, value=field_value, inline=False)
+            embed.add_field(
+                name=f"{i}. League Details",
+                value=field_value,
+                inline=len(all_leagues) <= 2  # Use inline for 1-2 leagues, full width for more
+            )
 
         embed.add_field(
             name="💡 How to Use",
@@ -4749,7 +4885,23 @@ async def league_info(interaction: discord.Interaction):
 
             # Trade settings
             if hasattr(settings, 'trade_deadline'):
-                league_rules.append(f"🔄 **Trade Deadline:** Week {settings.trade_deadline}")
+                # Convert timestamp to week number if needed
+                trade_deadline = settings.trade_deadline
+                if isinstance(trade_deadline, (int, float)) and trade_deadline > 1000000000:
+                    # This is a timestamp, convert to a readable format
+                    import datetime
+                    try:
+                        date = datetime.datetime.fromtimestamp(trade_deadline / 1000)
+                        trade_deadline_str = f"{date.strftime('%b %d, %Y')}"
+                    except:
+                        trade_deadline_str = "Unknown"
+                elif isinstance(trade_deadline, (int, float)) and trade_deadline < 20:
+                    # This is likely a week number
+                    trade_deadline_str = f"Week {int(trade_deadline)}"
+                else:
+                    trade_deadline_str = str(trade_deadline)
+
+                league_rules.append(f"🔄 **Trade Deadline:** {trade_deadline_str}")
 
             # Waiver settings
             if hasattr(settings, 'waiver_order_type'):

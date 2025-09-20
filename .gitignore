@@ -24,6 +24,7 @@ wheels/
 *.egg
 logs/
 *.log
+*.json
 
 # Virtual environments
 venv/

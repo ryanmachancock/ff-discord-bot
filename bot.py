@@ -1378,22 +1378,14 @@ Note: Requires additional matchup history data
 @client.tree.command(name="sleeper", description="Find undervalued sleeper picks with high upside potential.")
 @app_commands.describe(position="Filter by position (QB, RB, WR, TE, K, D/ST) - leave empty for all positions")
 async def sleeper(interaction: discord.Interaction, position: str = None):
+    # Use safe defer first
+    if not await safe_defer(interaction):
+        return
+
     try:
-        await interaction.response.defer()
-
-        # Quick validation before ESPN API call
-        if not LEAGUE_ID or not SEASON_ID:
-            await interaction.followup.send("Bot configuration error: Missing league or season ID")
-            return
-
-        # Initialize league
-        try:
-            if SWID and ESPN_S2:
-                league = League(league_id=LEAGUE_ID, year=SEASON_ID, swid=SWID, espn_s2=ESPN_S2)
-            else:
-                league = League(league_id=LEAGUE_ID, year=SEASON_ID)
-        except Exception as api_error:
-            await interaction.followup.send(f"ESPN API error: {api_error}")
+        league = get_league(user_id=interaction.user.id)
+        if not league:
+            await safe_interaction_response(interaction, "❌ No league found. Use `/register_league` to add your ESPN Fantasy League first, or contact an admin if you want to use the default league.", ephemeral=True)
             return
 
         # Get all rostered players
@@ -1553,15 +1545,9 @@ async def sleeper(interaction: discord.Interaction, position: str = None):
         await interaction.followup.send(embed=embed)
 
     except Exception as e:
-        error_msg = f"Error finding sleepers: {e}"
+        error_msg = f"❌ Error finding sleepers: {e}"
         print(f"Sleeper command error: {e}")
-        try:
-            if interaction.response.is_done():
-                await interaction.followup.send(error_msg)
-            else:
-                await interaction.response.send_message(error_msg)
-        except Exception as follow_error:
-            print(f"Failed to send error message: {follow_error}")
+        await safe_interaction_response(interaction, error_msg, ephemeral=True)
 
 @client.tree.command(name="matchup", description="Detailed player-by-player matchup analysis for this week.")
 @app_commands.describe(team1="First team name", team2="Second team name (optional - will try to find current matchup)")
@@ -2806,7 +2792,9 @@ class BackToMenuView(View):
 @client.tree.command(name="card", description="Generate a visual team card with key stats and graphics.")
 @app_commands.describe(team_name="Team name to generate card for")
 async def card(interaction: discord.Interaction, team_name: str):
-    await interaction.response.defer()
+    # Use safe defer first
+    if not await safe_defer(interaction):
+        return
 
     try:
         # Helper function to ensure field values don't exceed 1024 characters
@@ -2815,7 +2803,10 @@ async def card(interaction: discord.Interaction, team_name: str):
                 return text
             return text[:max_length-3] + "..."
 
-        league = get_league()
+        league = get_league(user_id=interaction.user.id)
+        if not league:
+            await safe_interaction_response(interaction, "❌ No league found. Use `/register_league` to add your ESPN Fantasy League first, or contact an admin if you want to use the default league.", ephemeral=True)
+            return
 
         # Find the team
         team = None
@@ -2825,7 +2816,7 @@ async def card(interaction: discord.Interaction, team_name: str):
                 break
 
         if not team:
-            await interaction.followup.send(f"Team '{team_name}' not found. Available teams: {', '.join(t.team_name for t in league.teams)}", ephemeral=True)
+            await safe_interaction_response(interaction, f"Team '{team_name}' not found. Available teams: {', '.join(t.team_name for t in league.teams)}", ephemeral=True)
             return
 
         # Get current week
@@ -3059,12 +3050,9 @@ async def card(interaction: discord.Interaction, team_name: str):
         await interaction.followup.send(embed=embed)
 
     except Exception as e:
-        error_msg = f"Error creating team card: {e}"
+        error_msg = f"❌ Error creating team card: {e}"
         print(f"Card error: {e}")
-        if not interaction.response.is_done():
-            await interaction.response.send_message(error_msg, ephemeral=True)
-        else:
-            await interaction.followup.send(error_msg, ephemeral=True)
+        await safe_interaction_response(interaction, error_msg, ephemeral=True)
 
 @client.tree.command(name="scoreboard", description="Live updating scoreboard for current week matchups.")
 @app_commands.describe(auto_refresh="Enable auto-refresh every 30 seconds (default: True)")
@@ -4963,6 +4951,160 @@ async def league_info(interaction: discord.Interaction):
         error_msg = f"❌ Error getting league info: {str(e)}"
         print(f"League info error: {e}")
         await safe_interaction_response(interaction, error_msg, ephemeral=True)
+
+@client.tree.command(name="welcome", description="Get started guide for using the Fantasy Football bot.")
+async def welcome(interaction: discord.Interaction):
+    """Comprehensive welcome and setup guide"""
+    embed = discord.Embed(
+        title="🏈 Welcome to Fantasy Football Bot!",
+        description="**Your complete guide to dominating fantasy football with data-driven insights**",
+        color=0xFF6B35
+    )
+
+    # Quick Start Section
+    embed.add_field(
+        name="🚀 Quick Start (New Users)",
+        value="**1.** Run `/register_league` with your ESPN League ID\n"
+              "**2.** Try `/scoreboard` to see live scores\n"
+              "**3.** Use `/menu` to explore all features\n"
+              "**4.** Check out `/league_info` for your league details",
+        inline=False
+    )
+
+    # Add spacing
+    embed.add_field(name="\u200b", value="\u200b", inline=False)
+
+    # Finding League ID
+    embed.add_field(
+        name="🔍 How to Find Your ESPN League ID",
+        value="**1.** Go to your ESPN Fantasy Football league\n"
+              "**2.** Look at the URL: `fantasy.espn.com/football/league?leagueId=XXXXXX`\n"
+              "**3.** Copy the numbers after `leagueId=`\n"
+              "**4.** That's your League ID!",
+        inline=True
+    )
+
+    # Private Leagues
+    embed.add_field(
+        name="🔒 Private Leagues",
+        value="**Need SWID & ESPN_S2 cookies:**\n"
+              "• Log into ESPN in your browser\n"
+              "• Open Developer Tools (F12)\n"
+              "• Go to Application → Cookies\n"
+              "• Find `SWID` and `espn_s2` values\n"
+              "• Use them in `/register_league`",
+        inline=True
+    )
+
+    # Add spacing
+    embed.add_field(name="\u200b", value="\u200b", inline=False)
+
+    # Popular Commands
+    embed.add_field(
+        name="⭐ Most Popular Commands",
+        value="🏆 `/scoreboard` - Live weekly scores\n"
+              "📊 `/standings` - League standings\n"
+              "👥 `/team [name]` - Team roster & stats\n"
+              "🔍 `/player [name]` - Player details\n"
+              "⚔️ `/compare [team1] [team2]` - Team comparison\n"
+              "📈 `/stats` - League analytics",
+        inline=True
+    )
+
+    # Advanced Features
+    embed.add_field(
+        name="🎯 Advanced Features",
+        value="🔄 `/trade` - Trade analyzer\n"
+              "💎 `/sleeper` - Sleeper pick finder\n"
+              "📋 `/waiver` - Waiver wire analysis\n"
+              "🆚 `/matchup` - Weekly matchup preview\n"
+              "📱 `/card` - Visual team cards\n"
+              "🌐 `/compare_cross_league` - Cross-league comparison",
+        inline=True
+    )
+
+    # Add spacing
+    embed.add_field(name="\u200b", value="\u200b", inline=False)
+
+    # Multiple Leagues
+    embed.add_field(
+        name="🔗 Multiple Leagues",
+        value="• Register multiple leagues with `/register_league`\n"
+              "• View all your leagues: `/my_leagues`\n"
+              "• Switch active league: `/switch_league`\n"
+              "• Remove leagues: `/remove_league`\n"
+              "• Check current status: `/league_status`",
+        inline=False
+    )
+
+    # Support
+    embed.add_field(
+        name="❓ Need Help?",
+        value="• Use `/menu` for interactive command explorer\n"
+              "• Run `/help` for quick command reference\n"
+              "• All commands work with your registered league automatically\n"
+              "• Bot updates live scores every 30 seconds during games",
+        inline=False
+    )
+
+    embed.set_footer(text="💡 Pro tip: Pin this message for easy reference! Use /menu to explore all features.")
+
+    await interaction.response.send_message(embed=embed)
+
+@client.tree.command(name="help", description="Quick command reference and help.")
+async def help_command(interaction: discord.Interaction):
+    """Quick help and command reference"""
+    embed = discord.Embed(
+        title="🆘 Fantasy Football Bot Help",
+        description="**Quick command reference - Use `/welcome` for the full setup guide**",
+        color=0x0099ff
+    )
+
+    # Getting Started
+    embed.add_field(
+        name="🏁 Getting Started",
+        value="**New users:** Run `/welcome` for complete setup guide\n"
+              "**Register league:** `/register_league [league_id] [name]`\n"
+              "**Need help finding League ID?** Check `/welcome`",
+        inline=False
+    )
+
+    # Core Commands
+    embed.add_field(
+        name="📊 Core Commands",
+        value="`/scoreboard` - Live scores & matchups\n"
+              "`/standings` - League standings\n"
+              "`/team [name]` - Team roster\n"
+              "`/player [name]` - Player stats\n"
+              "`/league_info` - League settings",
+        inline=True
+    )
+
+    # Analysis Tools
+    embed.add_field(
+        name="🔍 Analysis Tools",
+        value="`/compare [team1] [team2]` - Compare teams\n"
+              "`/stats` - League analytics\n"
+              "`/matchup` - Weekly preview\n"
+              "`/trade` - Trade analyzer\n"
+              "`/waiver` - Waiver recommendations",
+        inline=True
+    )
+
+    # League Management
+    embed.add_field(
+        name="⚙️ League Management",
+        value="`/my_leagues` - Your registered leagues\n"
+              "`/switch_league [name]` - Change active league\n"
+              "`/league_status` - Current settings\n"
+              "`/all_leagues` - Available leagues\n"
+              "`/menu` - Interactive command explorer",
+        inline=False
+    )
+
+    embed.set_footer(text="💡 Use /welcome for detailed setup instructions and finding your ESPN League ID")
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 if __name__ == '__main__':
     import time

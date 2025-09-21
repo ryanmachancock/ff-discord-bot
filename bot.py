@@ -3175,11 +3175,38 @@ async def scoreboard(interaction: discord.Interaction, auto_refresh: bool = True
                         opp_starters = [p for p in opponent.roster if getattr(p, 'lineupSlot', None) != "BE"]
                         opponent_score = sum(get_actual_points_only(p, league) for p in opp_starters)
 
+                    # Calculate projected scores for both teams
+                    def get_weekly_projected_points(player, league_ref):
+                        """Get weekly projected points for a player"""
+                        current_week = getattr(league_ref, 'current_week', 1)
+                        if hasattr(player, 'stats') and player.stats:
+                            try:
+                                week_stats = player.stats.get(current_week, {})
+                                projected = week_stats.get('projected_points', None)
+                                if projected is not None:
+                                    return projected
+                            except:
+                                pass
+                        # Fallback to other projection attributes
+                        for attr in ['proj_points', 'projected_points']:
+                            value = getattr(player, attr, None)
+                            if value is not None:
+                                return value
+                        return 0
+
+                    starters = [p for p in team.roster if getattr(p, 'lineupSlot', None) != "BE"]
+                    team_projected = sum(get_weekly_projected_points(p, league) for p in starters)
+
+                    opp_starters = [p for p in opponent.roster if getattr(p, 'lineupSlot', None) != "BE"]
+                    opponent_projected = sum(get_weekly_projected_points(p, league) for p in opp_starters)
+
                     matchups.append({
                         'team1': team,
                         'team2': opponent,
                         'score1': team_score,
-                        'score2': opponent_score
+                        'score2': opponent_score,
+                        'proj1': team_projected,
+                        'proj2': opponent_projected
                     })
 
                     teams_in_matchups.add(team.team_id)
@@ -3192,19 +3219,25 @@ async def scoreboard(interaction: discord.Interaction, auto_refresh: bool = True
             embeds = []
 
             if matchups:
-                # Create header embed
+                # Create single consolidated embed that maximizes horizontal space
                 league_name = get_league_name(user_id=interaction.user.id)
-                header_embed = discord.Embed(
-                    title=f"🏈 {league_name} Live Scoreboard",
-                    description=f"Week {current_week} Matchups • {('🔄 Auto-refresh ON' if auto_refresh else '📊 Static view')}",
+
+                # Calculate summary stats first
+                total_points = sum(m['score1'] + m['score2'] for m in matchups)
+                avg_game_total = total_points / len(matchups) if matchups else 0
+                highest_score = max(max(m['score1'], m['score2']) for m in matchups) if matchups else 0
+                closest_game = min(abs(m['score1'] - m['score2']) for m in matchups) if matchups else 0
+
+                main_embed = discord.Embed(
+                    title=f"🏈 {league_name} - Week {current_week}",
+                    description=f"🔄 Auto-refresh {'ON' if auto_refresh else 'OFF'} • 🎯 Total: {total_points:.1f} • 📈 Avg: {avg_game_total:.1f} • 🔥 High: {highest_score:.1f}",
                     color=0xFF6B35
                 )
 
                 # Add refresh timestamp
                 import datetime
                 now = datetime.datetime.now()
-                header_embed.set_footer(text=f"Last updated: {now.strftime('%I:%M:%S %p')}")
-                embeds.append(header_embed)
+                main_embed.set_footer(text=f"Last updated: {now.strftime('%I:%M:%S %p')}")
 
                 # Get remaining players info function
                 def get_remaining_players(team, league_ref):
@@ -3270,23 +3303,23 @@ async def scoreboard(interaction: discord.Interaction, auto_refresh: bool = True
                     return f"{yet_to_play}/{total_starters}"
 
                 # Helper function to format team names
-                def format_team_name(name, max_length=14):
-                    if len(name) <= max_length:
-                        return name
-
+                def format_team_name(name, max_length=7):
                     words = name.split()
+
                     if len(words) == 1:
-                        return name[:max_length-1] + "."
-
-                    # Two or more words: first word + first letter of second word only
-                    if len(words) >= 2:
-                        result = f"{words[0]} {words[1][0]}."
-                        if len(result) <= max_length:
-                            return result
+                        # Single word: pad with spaces to match multi-word format length
+                        if len(name) <= max_length:
+                            return name + "  "  # Add 2 spaces to match " X." format
                         else:
-                            return words[0][:max_length-3] + " " + words[1][0] + "."
+                            return name[:max_length-2] + "  "
 
-                    return words[0][:max_length-1] + "."
+                    # Two or more words: first word + first letter of second word + period
+                    result = f"{words[0]} {words[1][0]}."
+                    if len(result) <= max_length:
+                        return result
+                    else:
+                        # Truncate first word if needed to fit format
+                        return words[0][:max_length-3] + " " + words[1][0] + "."
 
                 # Build simple vs-style lines
                 all_table_lines = []
@@ -3300,37 +3333,41 @@ async def scoreboard(interaction: discord.Interaction, auto_refresh: bool = True
                     team2 = matchup['team2']
                     score1 = matchup['score1']
                     score2 = matchup['score2']
+                    proj1 = matchup['proj1']
+                    proj2 = matchup['proj2']
 
                     # Get remaining players for each team first
                     team1_remaining = get_remaining_players(team1, league)
                     team2_remaining = get_remaining_players(team2, league)
 
-                    # Format team names with balanced length for better identification while maintaining alignment
-                    base_name1 = format_team_name(team1.team_name, 9)
-                    base_name2 = format_team_name(team2.team_name, 9)
+                    # Format team names with shorter length to prevent overflow
+                    base_name1 = format_team_name(team1.team_name, 7)
+                    base_name2 = format_team_name(team2.team_name, 7)
 
                     # Ensure consistent formatting by padding remaining player counts
                     # This handles both single digit (8/9) and double digit (11/11) counts
                     name1 = f"{base_name1} ({team1_remaining})"
                     name2 = f"{base_name2} ({team2_remaining})"
 
-                    # Pad names to ensure consistent alignment - account for double digit player counts
-                    name1 = f"{name1:<18}"
-                    name2 = f"{name2:<18}"
+                    # Pad names to ensure consistent alignment - reduced to prevent overflow
+                    name1 = f"{name1:<14}"
+                    name2 = f"{name2:<14}"
 
                     formatted_matchups.append({
                         'name1': name1,
                         'name2': name2,
                         'score1': score1,
-                        'score2': score2
+                        'score2': score2,
+                        'proj1': proj1,
+                        'proj2': proj2
                     })
 
                     # Track max length for dynamic spacing
                     max_name_length = max(max_name_length, len(name1), len(name2))
 
                 # Use fixed spacing for consistent alignment across all leagues
-                # Account for double digit player counts: team names get 18 characters
-                left_spacing = 18
+                # Account for double digit player counts: team names get 14 characters
+                left_spacing = 14
 
                 # Second pass: format with consistent spacing
                 for matchup_data in formatted_matchups:
@@ -3338,23 +3375,36 @@ async def scoreboard(interaction: discord.Interaction, auto_refresh: bool = True
                     name2 = matchup_data['name2']
                     score1 = matchup_data['score1']
                     score2 = matchup_data['score2']
+                    # Handle missing projected scores gracefully
+                    proj1 = matchup_data.get('proj1', 0)
+                    proj2 = matchup_data.get('proj2', 0)
 
-                    # Format scores consistently and determine winner
-                    score1_str = f"{score1:.1f}"
-                    score2_str = f"{score2:.1f}"
+                    # Format scores with better spacing and readability
+                    score1_str = f"{score1:>4.1f}|{proj1:<5.1f}"
+                    score2_str = f"{score2:>4.1f}|{proj2:<5.1f}"
 
-                    # Add winner triangles while maintaining alignment
+                    # Add winner arrows pointing toward the winning team - compact format
+                    score1_compact = f"{score1:>4.1f}|{proj1:<5.1f}"
+                    score2_compact = f"{score2:>4.1f}|{proj2:<5.1f}"
+
                     if score1 > score2:
-                        # Team 1 winning
-                        line = f"{name1:<{left_spacing}} {score1_str:>6} ▶ |   {score2_str:<6} {name2}"
+                        # Team 1 winning - arrow points left toward winning team
+                        line = f"{name1:<{left_spacing}} {score1_compact:<11} ◀ {score2_compact:<11} {name2}"
                     elif score2 > score1:
-                        # Team 2 winning
-                        line = f"{name1:<{left_spacing}} {score1_str:>6}   | ◀ {score2_str:<6} {name2}"
+                        # Team 2 winning - arrow points right toward winning team
+                        line = f"{name1:<{left_spacing}} {score1_compact:<11} ▶ {score2_compact:<11} {name2}"
                     else:
                         # Tied
-                        line = f"{name1:<{left_spacing}} {score1_str:>6}  |   {score2_str:<6} {name2}"
+                        line = f"{name1:<{left_spacing}} {score1_compact:<11} = {score2_compact:<11} {name2}"
 
                     all_table_lines.append(line)
+
+                # Add header to explain format with proper alignment
+                if all_table_lines:
+                    header_line = f"{'Team (Rem.)':<{left_spacing}} {'Act|Proj':<11} {'VS'} {'Act|Proj':<11} {'Team (Rem.)'}"
+                    separator_line = "─" * (len(header_line) - 10)  # Adjust for visual length
+                    all_table_lines.insert(0, separator_line)
+                    all_table_lines.insert(0, header_line)
 
                 # Split table into multiple embeds if needed
                 current_embed_lines = []
@@ -3372,7 +3422,7 @@ async def scoreboard(interaction: discord.Interaction, auto_refresh: bool = True
                                 color=0x32CD32
                             )
                             table_content = f"```\n{chr(10).join(current_embed_lines)}\n```"
-                            table_embed.add_field(name="Current Scores", value=table_content, inline=False)
+                            table_embed.add_field(name="Current Scores (A|P)", value=table_content, inline=False)
                             embeds.append(table_embed)
 
                         # Start new embed
@@ -3393,7 +3443,7 @@ async def scoreboard(interaction: discord.Interaction, auto_refresh: bool = True
                         color=0x32CD32
                     )
                     table_content = f"```\n{chr(10).join(current_embed_lines)}\n```"
-                    table_embed.add_field(name="Current Scores", value=table_content, inline=False)
+                    table_embed.add_field(name="Current Scores (A|P)", value=table_content, inline=False)
                     embeds.append(table_embed)
 
                 # Create summary embed
@@ -3447,7 +3497,7 @@ async def scoreboard(interaction: discord.Interaction, auto_refresh: bool = True
 
 class ScoreboardView(View):
     def __init__(self, league, current_week, auto_refresh=True, user_id=None):
-        super().__init__(timeout=1800)  # 30 minute timeout
+        super().__init__(timeout=None)  # No timeout - make it persistent
         self.league = league
         self.current_week = current_week
         self.auto_refresh = auto_refresh
@@ -3459,41 +3509,70 @@ class ScoreboardView(View):
 
     async def auto_refresh_loop(self):
         """Auto-refresh the scoreboard every 30 seconds"""
+        consecutive_errors = 0
+        max_consecutive_errors = 10
+
         try:
-            while not self.is_finished():
+            while self.auto_refresh and consecutive_errors < max_consecutive_errors:
                 await asyncio.sleep(30)  # Wait 30 seconds
 
-                if not self.is_finished():
-                    try:
-                        # Create updated embeds with error handling
-                        embeds = self.create_updated_embeds()
-                    except Exception as e:
-                        print(f"Error updating scoreboard: {e}")
-                        # Continue the loop, skip this update
+                if not self.auto_refresh:
+                    break
+
+                try:
+                    # Create updated embeds with error handling
+                    embeds = self.create_updated_embeds()
+                    if not embeds:
+                        print("No embeds created, skipping update")
                         continue
 
-                    # Try to edit the message with enhanced error handling
-                    try:
-                        if hasattr(self, '_message') and self._message:
-                            await self._message.edit(embeds=embeds, view=self)
-                    except discord.errors.NotFound:
-                        print("Auto-refresh stopped: Message was deleted")
+                    # Update timestamp in header
+                    import datetime
+                    now = datetime.datetime.now()
+                    if embeds:
+                        embeds[0].set_footer(text=f"Last updated: {now.strftime('%I:%M:%S %p')}")
+
+                    consecutive_errors = 0  # Reset error count on success
+                except Exception as e:
+                    consecutive_errors += 1
+                    print(f"Error updating scoreboard (attempt {consecutive_errors}): {e}")
+                    # Continue the loop, skip this update
+                    continue
+
+                # Try to edit the message with enhanced error handling
+                try:
+                    if hasattr(self, '_message') and self._message:
+                        await self._message.edit(embeds=embeds, view=self)
+                        print(f"Auto-refresh successful at {datetime.datetime.now().strftime('%I:%M:%S %p')}")
+                except discord.errors.NotFound:
+                    print("Auto-refresh stopped: Message was deleted")
+                    break
+                except discord.errors.Forbidden:
+                    print("Auto-refresh stopped: No permission to edit message")
+                    break
+                except discord.errors.HTTPException as e:
+                    consecutive_errors += 1
+                    print(f"Auto-refresh HTTP error (attempt {consecutive_errors}): {e}")
+                    if consecutive_errors >= max_consecutive_errors:
+                        print("Too many consecutive errors, stopping auto-refresh")
+                        self.auto_refresh = False
                         break
-                    except discord.errors.Forbidden:
-                        print("Auto-refresh stopped: No permission to edit message")
+                    continue
+                except Exception as e:
+                    consecutive_errors += 1
+                    print(f"Auto-refresh unexpected error (attempt {consecutive_errors}): {e}")
+                    if consecutive_errors >= max_consecutive_errors:
+                        print("Too many consecutive errors, stopping auto-refresh")
+                        self.auto_refresh = False
                         break
-                    except discord.errors.HTTPException as e:
-                        print(f"Auto-refresh HTTP error: {e} - continuing...")
-                        # Continue on HTTP errors, they're often temporary
-                        continue
-                    except Exception as e:
-                        print(f"Auto-refresh unexpected error: {e} - continuing...")
-                        # Continue on other errors, might be temporary
-                        continue
+                    continue
+
         except asyncio.CancelledError:
-            pass
+            print("Auto-refresh loop cancelled")
         except Exception as e:
-            print(f"Auto-refresh loop error: {e}")
+            print(f"Auto-refresh loop fatal error: {e}")
+        finally:
+            print("Auto-refresh loop ended")
 
     def create_updated_embeds(self):
         """Create updated embeds with current scores"""
@@ -3613,11 +3692,38 @@ class ScoreboardView(View):
                         opp_starters = [p for p in opponent.roster if getattr(p, 'lineupSlot', None) != "BE"]
                         opponent_score = sum(get_actual_points_only(p, self.league) for p in opp_starters)
 
+                    # Calculate projected scores for both teams
+                    def get_weekly_projected_points(player, league_ref):
+                        """Get weekly projected points for a player"""
+                        current_week = getattr(league_ref, 'current_week', 1)
+                        if hasattr(player, 'stats') and player.stats:
+                            try:
+                                week_stats = player.stats.get(current_week, {})
+                                projected = week_stats.get('projected_points', None)
+                                if projected is not None:
+                                    return projected
+                            except:
+                                pass
+                        # Fallback to other projection attributes
+                        for attr in ['proj_points', 'projected_points']:
+                            value = getattr(player, attr, None)
+                            if value is not None:
+                                return value
+                        return 0
+
+                    starters = [p for p in team.roster if getattr(p, 'lineupSlot', None) != "BE"]
+                    team_projected = sum(get_weekly_projected_points(p, self.league) for p in starters)
+
+                    opp_starters = [p for p in opponent.roster if getattr(p, 'lineupSlot', None) != "BE"]
+                    opponent_projected = sum(get_weekly_projected_points(p, self.league) for p in opp_starters)
+
                     matchups.append({
                         'team1': team,
                         'team2': opponent,
                         'score1': team_score,
-                        'score2': opponent_score
+                        'score2': opponent_score,
+                        'proj1': team_projected,
+                        'proj2': opponent_projected
                     })
 
                     teams_in_matchups.add(team.team_id)
@@ -3663,23 +3769,23 @@ class ScoreboardView(View):
                     return f"{still_playing}/{total_starters}"
 
                 # Helper function to format team names
-                def format_team_name(name, max_length=14):
-                    if len(name) <= max_length:
-                        return name
-
+                def format_team_name(name, max_length=7):
                     words = name.split()
+
                     if len(words) == 1:
-                        return name[:max_length-1] + "."
-
-                    # Two or more words: first word + first letter of second word only
-                    if len(words) >= 2:
-                        result = f"{words[0]} {words[1][0]}."
-                        if len(result) <= max_length:
-                            return result
+                        # Single word: pad with spaces to match multi-word format length
+                        if len(name) <= max_length:
+                            return name + "  "  # Add 2 spaces to match " X." format
                         else:
-                            return words[0][:max_length-3] + " " + words[1][0] + "."
+                            return name[:max_length-2] + "  "
 
-                    return words[0][:max_length-1] + "."
+                    # Two or more words: first word + first letter of second word + period
+                    result = f"{words[0]} {words[1][0]}."
+                    if len(result) <= max_length:
+                        return result
+                    else:
+                        # Truncate first word if needed to fit format
+                        return words[0][:max_length-3] + " " + words[1][0] + "."
 
                 # Build simple vs-style lines
                 all_table_lines = []
@@ -3693,37 +3799,41 @@ class ScoreboardView(View):
                     team2 = matchup['team2']
                     score1 = matchup['score1']
                     score2 = matchup['score2']
+                    proj1 = matchup['proj1']
+                    proj2 = matchup['proj2']
 
                     # Get remaining players for each team first
                     team1_remaining = get_remaining_players(team1, league)
                     team2_remaining = get_remaining_players(team2, league)
 
-                    # Format team names with balanced length for better identification while maintaining alignment
-                    base_name1 = format_team_name(team1.team_name, 9)
-                    base_name2 = format_team_name(team2.team_name, 9)
+                    # Format team names with shorter length to prevent overflow
+                    base_name1 = format_team_name(team1.team_name, 7)
+                    base_name2 = format_team_name(team2.team_name, 7)
 
                     # Ensure consistent formatting by padding remaining player counts
                     # This handles both single digit (8/9) and double digit (11/11) counts
                     name1 = f"{base_name1} ({team1_remaining})"
                     name2 = f"{base_name2} ({team2_remaining})"
 
-                    # Pad names to ensure consistent alignment - account for double digit player counts
-                    name1 = f"{name1:<18}"
-                    name2 = f"{name2:<18}"
+                    # Pad names to ensure consistent alignment - reduced to prevent overflow
+                    name1 = f"{name1:<14}"
+                    name2 = f"{name2:<14}"
 
                     formatted_matchups.append({
                         'name1': name1,
                         'name2': name2,
                         'score1': score1,
-                        'score2': score2
+                        'score2': score2,
+                        'proj1': proj1,
+                        'proj2': proj2
                     })
 
                     # Track max length for dynamic spacing
                     max_name_length = max(max_name_length, len(name1), len(name2))
 
                 # Use fixed spacing for consistent alignment across all leagues
-                # Account for double digit player counts: team names get 18 characters
-                left_spacing = 18
+                # Account for double digit player counts: team names get 14 characters
+                left_spacing = 14
 
                 # Second pass: format with consistent spacing
                 for matchup_data in formatted_matchups:
@@ -3731,23 +3841,36 @@ class ScoreboardView(View):
                     name2 = matchup_data['name2']
                     score1 = matchup_data['score1']
                     score2 = matchup_data['score2']
+                    # Handle missing projected scores gracefully
+                    proj1 = matchup_data.get('proj1', 0)
+                    proj2 = matchup_data.get('proj2', 0)
 
-                    # Format scores consistently and determine winner
-                    score1_str = f"{score1:.1f}"
-                    score2_str = f"{score2:.1f}"
+                    # Format scores with better spacing and readability
+                    score1_str = f"{score1:>4.1f}|{proj1:<5.1f}"
+                    score2_str = f"{score2:>4.1f}|{proj2:<5.1f}"
 
-                    # Add winner triangles while maintaining alignment
+                    # Add winner arrows pointing toward the winning team - compact format
+                    score1_compact = f"{score1:>4.1f}|{proj1:<5.1f}"
+                    score2_compact = f"{score2:>4.1f}|{proj2:<5.1f}"
+
                     if score1 > score2:
-                        # Team 1 winning
-                        line = f"{name1:<{left_spacing}} {score1_str:>6} ▶ |   {score2_str:<6} {name2}"
+                        # Team 1 winning - arrow points left toward winning team
+                        line = f"{name1:<{left_spacing}} {score1_compact:<11} ◀ {score2_compact:<11} {name2}"
                     elif score2 > score1:
-                        # Team 2 winning
-                        line = f"{name1:<{left_spacing}} {score1_str:>6}   | ◀ {score2_str:<6} {name2}"
+                        # Team 2 winning - arrow points right toward winning team
+                        line = f"{name1:<{left_spacing}} {score1_compact:<11} ▶ {score2_compact:<11} {name2}"
                     else:
                         # Tied
-                        line = f"{name1:<{left_spacing}} {score1_str:>6}  |   {score2_str:<6} {name2}"
+                        line = f"{name1:<{left_spacing}} {score1_compact:<11} = {score2_compact:<11} {name2}"
 
                     all_table_lines.append(line)
+
+                # Add header to explain format with proper alignment
+                if all_table_lines:
+                    header_line = f"{'Team (Rem.)':<{left_spacing}} {'Act|Proj':<11} {'VS'} {'Act|Proj':<11} {'Team (Rem.)'}"
+                    separator_line = "─" * (len(header_line) - 10)  # Adjust for visual length
+                    all_table_lines.insert(0, separator_line)
+                    all_table_lines.insert(0, header_line)
 
                 # Split table into multiple embeds if needed
                 current_embed_lines = []
@@ -3765,7 +3888,7 @@ class ScoreboardView(View):
                                 color=0x32CD32
                             )
                             table_content = f"```\n{chr(10).join(current_embed_lines)}\n```"
-                            table_embed.add_field(name="Current Scores", value=table_content, inline=False)
+                            table_embed.add_field(name="Current Scores (A|P)", value=table_content, inline=False)
                             embeds.append(table_embed)
 
                         # Start new embed
@@ -3786,7 +3909,7 @@ class ScoreboardView(View):
                         color=0x32CD32
                     )
                     table_content = f"```\n{chr(10).join(current_embed_lines)}\n```"
-                    table_embed.add_field(name="Current Scores", value=table_content, inline=False)
+                    table_embed.add_field(name="Current Scores (A|P)", value=table_content, inline=False)
                     embeds.append(table_embed)
 
                 # Create summary embed
@@ -3832,13 +3955,37 @@ class ScoreboardView(View):
     @discord.ui.button(label="🔄 Refresh Now", style=discord.ButtonStyle.primary)
     async def manual_refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Manual refresh button"""
-        await interaction.response.defer()
-
         try:
+            await interaction.response.defer()
+
             embeds = self.create_updated_embeds()
+            if not embeds:
+                await interaction.followup.send("❌ Failed to create updated scoreboard", ephemeral=True)
+                return
+
+            # Update timestamp in header
+            import datetime
+            now = datetime.datetime.now()
+            if embeds:
+                embeds[0].set_footer(text=f"Last updated: {now.strftime('%I:%M:%S %p')}")
+
             await interaction.edit_original_response(embeds=embeds, view=self)
+            print(f"Manual refresh successful at {now.strftime('%I:%M:%S %p')}")
+
+        except discord.errors.InteractionResponded:
+            # Interaction already responded to
+            try:
+                embeds = self.create_updated_embeds()
+                if embeds:
+                    await interaction.edit_original_response(embeds=embeds, view=self)
+            except Exception as e:
+                await interaction.followup.send(f"❌ Refresh failed: {str(e)[:100]}", ephemeral=True)
         except Exception as e:
-            await interaction.followup.send(f"Refresh failed: {e}", ephemeral=True)
+            print(f"Manual refresh error: {e}")
+            try:
+                await interaction.followup.send(f"❌ Refresh failed: {str(e)[:100]}", ephemeral=True)
+            except:
+                pass
 
     @discord.ui.button(label="⏸️ Stop Auto-Refresh", style=discord.ButtonStyle.secondary)
     async def toggle_refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -3866,9 +4013,11 @@ class ScoreboardView(View):
         await interaction.edit_original_response(embeds=embeds, view=self)
 
     async def on_timeout(self):
-        """Handle view timeout"""
+        """Handle view timeout - should not occur with timeout=None"""
+        print("ScoreboardView timed out unexpectedly")
         if hasattr(self, 'refresh_task'):
             self.refresh_task.cancel()
+        self.auto_refresh = False
 
 # Interactive View for Team Command
 class TeamView(View):

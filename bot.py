@@ -337,8 +337,12 @@ class SafeEmbedBuilder:
         return self
 
     def set_color(self, color):
-        """Set embed color"""
-        self.color = color
+        """Set embed color - accepts int or discord.Color"""
+        # Convert discord.Color to int if needed
+        if hasattr(color, 'value'):
+            self.color = color.value
+        else:
+            self.color = color
         return self
 
     def set_thumbnail(self, url):
@@ -1749,7 +1753,7 @@ async def standings(interaction: discord.Interaction):
         # Create standings table
         current_week = getattr(league, 'current_week', 'Unknown')
         league_name = get_league_name(user_id=interaction.user.id)
-        embed = SafeEmbedBuilder.create().set_title(f"🏆 {league_name} Standings - Week {current_week}").set_color(discord.Color.gold())
+        embed = SafeEmbedBuilder.create().set_title(f"🏆 {league_name} Standings - Week {current_week}").set_color(0xFFD700)
 
         # Create embed generator function for pagination
         def create_standings_embed(page_num, page_teams):
@@ -1757,7 +1761,7 @@ async def standings(interaction: discord.Interaction):
 
             page_embed = SafeEmbedBuilder.create()
             page_embed.set_title(f"🏆 {league_name} Standings - Week {current_week}")
-            page_embed.set_color(discord.Color.gold())
+            page_embed.set_color(0xFFD700)
 
             max_pages = (len(teams_data) - 1) // 8 + 1
             if max_pages > 1:
@@ -1852,7 +1856,7 @@ async def standings(interaction: discord.Interaction):
 
             embed_builder = SafeEmbedBuilder.create()
             embed_builder.set_title(f"🏆 {league_name} Standings - Week {current_week}")
-            embed_builder.set_color(discord.Color.gold())
+            embed_builder.set_color(0xFFD700)
 
             # Re-add teams
             rank_emojis = ['🥇', '🥈', '🥉', '4️⃣', '5️⃣', '6️⃣', '7️⃣', '8️⃣']

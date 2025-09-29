@@ -1,5 +1,17 @@
 # Environment variables (contains sensitive data)
 .env
+.env.local
+.env.production
+
+# Discord & API secrets
+*.token
+config.json
+secrets.json
+
+# User data files (may contain sensitive league info)
+user_leagues.json
+league_data.json
+user_data.json
 
 # Python
 __pycache__/
@@ -22,14 +34,17 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+
+# Logs (may contain sensitive data)
 logs/
 *.log
-*.json
+pm2.log
 
 # Virtual environments
 venv/
 env/
 ENV/
+.venv
 
 # IDE
 .vscode/
@@ -40,3 +55,11 @@ ENV/
 # OS
 .DS_Store
 Thumbs.db
+
+# PM2 files
+.pm2/
+ecosystem.config.js
+
+# Backup files
+*.bak
+*.backup

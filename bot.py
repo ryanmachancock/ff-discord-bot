@@ -10,6 +10,403 @@ from dotenv import load_dotenv
 from espn_api.football import League
 from tabulate import tabulate
 import json
+import time
+from typing import Dict, Any, Optional
+
+class ESPNCache:
+    """Simple memory cache for ESPN API data with TTL"""
+
+    def __init__(self, ttl_seconds: int = 300):  # 5 minute default TTL
+        self.cache: Dict[str, Dict[str, Any]] = {}
+        self.ttl = ttl_seconds
+
+    def _is_expired(self, timestamp: float) -> bool:
+        return time.time() - timestamp > self.ttl
+
+    def get(self, key: str) -> Optional[Any]:
+        """Get cached data if not expired"""
+        if key in self.cache:
+            entry = self.cache[key]
+            if not self._is_expired(entry['timestamp']):
+                return entry['data']
+            else:
+                # Remove expired entry
+                del self.cache[key]
+        return None
+
+    def set(self, key: str, data: Any):
+        """Store data in cache with current timestamp"""
+        self.cache[key] = {
+            'data': data,
+            'timestamp': time.time()
+        }
+
+    def clear(self):
+        """Clear all cached data"""
+        self.cache.clear()
+
+    def get_stats(self):
+        """Get cache statistics"""
+        total_entries = len(self.cache)
+        expired_entries = sum(1 for entry in self.cache.values()
+                            if self._is_expired(entry['timestamp']))
+        return {
+            'total': total_entries,
+            'expired': expired_entries,
+            'active': total_entries - expired_entries
+        }
+
+# Global cache instance
+espn_cache = ESPNCache(ttl_seconds=300)  # 5 minute cache
+
+class BackgroundRefreshManager:
+    """Manages background refresh of ESPN data to reduce API call latency"""
+
+    def __init__(self):
+        self.refresh_task = None
+        self.is_running = False
+
+    def start_background_refresh(self):
+        """Start the background refresh task"""
+        if not self.is_running:
+            self.refresh_task = asyncio.create_task(self._refresh_loop())
+            self.is_running = True
+            print("Background refresh started")
+
+    def stop_background_refresh(self):
+        """Stop the background refresh task"""
+        if self.refresh_task:
+            self.refresh_task.cancel()
+            self.is_running = False
+            print("Background refresh stopped")
+
+    async def _refresh_loop(self):
+        """Main refresh loop that runs every 3 minutes"""
+        while True:
+            try:
+                await asyncio.sleep(180)  # 3 minutes
+                await self._refresh_common_data()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                print(f"Background refresh error: {e}")
+                await asyncio.sleep(300)  # Wait 5 minutes before retry
+
+    async def _refresh_common_data(self):
+        """Refresh commonly accessed data"""
+        try:
+            # Get all registered leagues and refresh their data
+            all_leagues = league_manager.data.get('leagues', {})
+            refreshed_count = 0
+
+            for league_key, league_info in all_leagues.items():
+                try:
+                    # Create cache key
+                    user_id = league_info.get('owner_id')
+                    cache_key = f"league_{user_id}_default"
+
+                    # Check if this league data is in cache and close to expiring
+                    cached_data = espn_cache.get(cache_key)
+                    if cached_data:
+                        continue  # Skip if still fresh
+
+                    # Refresh this league's data
+                    if league_info.get('swid') and league_info.get('espn_s2'):
+                        league = League(
+                            league_id=league_info['league_id'],
+                            year=league_info['year'],
+                            swid=league_info['swid'],
+                            espn_s2=league_info['espn_s2']
+                        )
+                    else:
+                        league = League(
+                            league_id=league_info['league_id'],
+                            year=league_info['year']
+                        )
+
+                    # Trigger data loading
+                    _ = league.teams  # This loads the team data
+
+                    # Cache the refreshed data
+                    espn_cache.set(cache_key, league)
+                    refreshed_count += 1
+
+                    # Add small delay to avoid overwhelming ESPN
+                    await asyncio.sleep(2)
+
+                except Exception as e:
+                    print(f"Failed to refresh league {league_key}: {e}")
+                    continue
+
+            # Also refresh default league if configured
+            if hasattr(globals(), 'LEAGUE_ID') and LEAGUE_ID:
+                try:
+                    default_cache_key = f"default_league_{LEAGUE_ID}_{SEASON_ID}"
+                    if not espn_cache.get(default_cache_key):
+                        if SWID and ESPN_S2:
+                            default_league = League(league_id=LEAGUE_ID, year=SEASON_ID, swid=SWID, espn_s2=ESPN_S2)
+                        else:
+                            default_league = League(league_id=LEAGUE_ID, year=SEASON_ID)
+                        _ = default_league.teams
+                        espn_cache.set(default_cache_key, default_league)
+                        refreshed_count += 1
+                except Exception as e:
+                    print(f"Failed to refresh default league: {e}")
+
+            if refreshed_count > 0:
+                print(f"Background refresh completed: {refreshed_count} leagues updated")
+
+        except Exception as e:
+            print(f"Background refresh error: {e}")
+
+# Global background refresh manager
+background_refresh_manager = BackgroundRefreshManager()
+
+async def team_name_autocomplete(interaction: discord.Interaction, current: str):
+    """Autocomplete function for team names"""
+    try:
+        print(f"Team autocomplete called with input: '{current}'")  # Debug log
+
+        # Try to get league (use cache if available)
+        league = get_league(user_id=interaction.user.id)
+        if not league:
+            print("No league found for autocomplete")
+            return []
+
+        # Filter teams based on current input
+        teams = league.teams
+        print(f"Found {len(teams)} teams in league")
+
+        if not current:
+            # Return first 25 teams if no input
+            choices = [app_commands.Choice(name=team.team_name, value=team.team_name)
+                      for team in teams[:25]]
+            print(f"Returning {len(choices)} teams for empty input")
+            return choices
+
+        # Fuzzy matching - prioritize starts with, then contains
+        current_lower = current.lower()
+
+        starts_with = [team for team in teams if team.team_name.lower().startswith(current_lower)]
+        contains = [team for team in teams if current_lower in team.team_name.lower()
+                   and team not in starts_with]
+
+        # Combine and limit to 25 (Discord limit)
+        filtered_teams = (starts_with + contains)[:25]
+
+        choices = [app_commands.Choice(name=team.team_name, value=team.team_name)
+                  for team in filtered_teams]
+        print(f"Returning {len(choices)} filtered teams")
+        return choices
+
+    except Exception as e:
+        print(f"Team autocomplete error: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
+
+async def player_name_autocomplete(interaction: discord.Interaction, current: str):
+    """Autocomplete function for player names"""
+    try:
+        print(f"Player autocomplete called with input: '{current}'")  # Debug log
+
+        # Try to get league (use cache if available)
+        league = get_league(user_id=interaction.user.id)
+        if not league:
+            print("No league found for player autocomplete")
+            return []
+
+        # Collect all players from all teams
+        all_players = []
+        for team in league.teams:
+            all_players.extend(team.roster)
+
+        print(f"Found {len(all_players)} total players")
+
+        if not current:
+            # Return first 25 players if no input (prioritize common positions)
+            priority_positions = ['QB', 'RB', 'WR', 'TE']
+            priority_players = [p for p in all_players if getattr(p, 'position', '') in priority_positions]
+            choices = [app_commands.Choice(name=f"{p.name} ({getattr(p, 'position', 'UNK')})", value=p.name)
+                      for p in priority_players[:25]]
+            print(f"Returning {len(choices)} priority players for empty input")
+            return choices
+
+        # Fuzzy matching for player names
+        current_lower = current.lower()
+
+        starts_with = [p for p in all_players if p.name.lower().startswith(current_lower)]
+        contains = [p for p in all_players if current_lower in p.name.lower()
+                   and p not in starts_with]
+
+        # Combine and limit to 25
+        filtered_players = (starts_with + contains)[:25]
+
+        choices = [app_commands.Choice(name=f"{p.name} ({getattr(p, 'position', 'UNK')})", value=p.name)
+                  for p in filtered_players]
+        print(f"Returning {len(choices)} filtered players")
+        return choices
+
+    except Exception as e:
+        print(f"Player autocomplete error: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
+
+class SafeEmbedBuilder:
+    """Discord embed builder with automatic character limit validation"""
+
+    def __init__(self):
+        self.title = None
+        self.description = None
+        self.fields = []
+        self.footer = None
+        self.color = 0x0099ff
+        self.thumbnail = None
+        self._total_chars = 0
+
+    @staticmethod
+    def create():
+        return SafeEmbedBuilder()
+
+    def _update_char_count(self):
+        """Calculate total character count across all embed elements"""
+        self._total_chars = 0
+        if self.title:
+            self._total_chars += len(self.title)
+        if self.description:
+            self._total_chars += len(self.description)
+        for field in self.fields:
+            self._total_chars += len(field['name']) + len(field['value'])
+        if self.footer:
+            self._total_chars += len(self.footer)
+
+    def set_title(self, title):
+        """Set embed title with 256 character limit"""
+        if len(title) > 256:
+            title = title[:253] + "..."
+        self.title = title
+        self._update_char_count()
+        return self
+
+    def set_description(self, description):
+        """Set embed description with 4096 character limit"""
+        if len(description) > 4096:
+            description = description[:4093] + "..."
+        self.description = description
+        self._update_char_count()
+        if self._total_chars > 6000:
+            # Truncate description to stay under total limit
+            excess = self._total_chars - 6000
+            new_desc_length = len(description) - excess - 3
+            if new_desc_length > 0:
+                self.description = description[:new_desc_length] + "..."
+        return self
+
+    def add_field(self, name, value, inline=False):
+        """Add field with validation"""
+        if len(self.fields) >= 25:
+            return self  # Skip if at field limit
+
+        # Truncate field name if too long
+        if len(name) > 256:
+            name = name[:253] + "..."
+
+        # Truncate field value if too long
+        if len(value) > 1024:
+            value = value[:1021] + "..."
+
+        field = {'name': name, 'value': value, 'inline': inline}
+        self.fields.append(field)
+
+        self._update_char_count()
+
+        # If total exceeds limit, remove this field
+        if self._total_chars > 6000:
+            self.fields.pop()
+            self._update_char_count()
+
+        return self
+
+    def set_footer(self, text):
+        """Set footer with 2048 character limit"""
+        if len(text) > 2048:
+            text = text[:2045] + "..."
+        self.footer = text
+        self._update_char_count()
+        return self
+
+    def set_color(self, color):
+        """Set embed color"""
+        self.color = color
+        return self
+
+    def set_thumbnail(self, url):
+        """Set thumbnail URL"""
+        self.thumbnail = url
+        return self
+
+    def build(self):
+        """Build the final Discord embed"""
+        embed_dict = {'color': self.color}
+
+        if self.title:
+            embed_dict['title'] = self.title
+        if self.description:
+            embed_dict['description'] = self.description
+        if self.fields:
+            embed_dict['fields'] = self.fields
+        if self.footer:
+            embed_dict['footer'] = {'text': self.footer}
+        if self.thumbnail:
+            embed_dict['thumbnail'] = {'url': self.thumbnail}
+
+        return discord.Embed.from_dict(embed_dict)
+
+class PaginatedView(discord.ui.View):
+    """Reusable pagination view for standings and other large lists"""
+
+    def __init__(self, data, page_size=8, embed_generator=None):
+        super().__init__(timeout=300)
+        self.data = data
+        self.page_size = page_size
+        self.embed_generator = embed_generator
+        self.current_page = 0
+        self.max_pages = (len(data) - 1) // page_size + 1
+
+        # Disable buttons if only one page
+        if self.max_pages <= 1:
+            self.previous_button.disabled = True
+            self.next_button.disabled = True
+            self.previous_button.style = discord.ButtonStyle.secondary
+            self.next_button.style = discord.ButtonStyle.secondary
+
+    def get_page_data(self, page_num):
+        """Get data for specific page"""
+        start = page_num * self.page_size
+        end = start + self.page_size
+        return self.data[start:end]
+
+    def update_buttons(self):
+        """Update button states based on current page"""
+        self.previous_button.disabled = self.current_page <= 0
+        self.next_button.disabled = self.current_page >= self.max_pages - 1
+
+    @discord.ui.button(label='⬅️ Previous', style=discord.ButtonStyle.primary)
+    async def previous_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.current_page > 0:
+            self.current_page -= 1
+            self.update_buttons()
+            embed = self.embed_generator(self.current_page, self.get_page_data(self.current_page))
+            await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label='Next ➡️', style=discord.ButtonStyle.primary)
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.current_page < self.max_pages - 1:
+            self.current_page += 1
+            self.update_buttons()
+            embed = self.embed_generator(self.current_page, self.get_page_data(self.current_page))
+            await interaction.response.edit_message(embed=embed, view=self)
 
 class LeagueManager:
     def __init__(self):
@@ -347,11 +744,20 @@ class MyClient(discord.Client):
     async def setup_hook(self):
         print(f"Logged in as {self.user} (ID: {self.user.id})")
         print("------")
+
+        # Debug: Print all registered commands before syncing
+        commands = [cmd.name for cmd in self.tree.get_commands()]
+        print(f"DEBUG: Found {len(commands)} commands to sync: {commands}")
+
         try:
             synced = await self.tree.sync()
-            print(f"Synced {len(synced)} commands")
+            print(f"Successfully synced {len(synced)} commands")
+            for cmd in synced:
+                print(f"  - {cmd.name}: {cmd.description}")
         except Exception as e:
             print(f"Failed to sync commands: {e}")
+            import traceback
+            traceback.print_exc()
 
     async def on_error(self, event, *args, **kwargs):
         """Global error handler to prevent bot crashes"""
@@ -382,35 +788,57 @@ def get_league_name(user_id=None):
     return "Fantasy League"
 
 def get_league(user_id=None, league_key=None, timeout_retries=API_RETRY_ATTEMPTS):
-    """Initialize and return league instance with proper authentication and timeout handling"""
+    """Initialize and return league instance with caching and timeout handling"""
     import time
+
+    # Create cache key
+    if user_id:
+        cache_key = f"league_{user_id}_{league_key or 'default'}"
+    else:
+        cache_key = f"default_league_{LEAGUE_ID}_{SEASON_ID}"
+
+    # Try cache first
+    cached_league = espn_cache.get(cache_key)
+    if cached_league:
+        return cached_league
+
+    # Cache miss - fetch from ESPN API
+    league = None
 
     # If user_id is provided, try to get their league
     if user_id:
         user_league = league_manager.get_league_connection(user_id, league_key)
         if user_league:
-            return user_league
+            league = user_league
 
-    # Fallback to original default league
-    for attempt in range(timeout_retries):
-        try:
-            if SWID and ESPN_S2:
-                league = League(league_id=LEAGUE_ID, year=SEASON_ID, swid=SWID, espn_s2=ESPN_S2)
-            else:
-                league = League(league_id=LEAGUE_ID, year=SEASON_ID)
+    # Fallback to original default league if no user league found
+    if not league:
+        for attempt in range(timeout_retries):
+            try:
+                if SWID and ESPN_S2:
+                    league = League(league_id=LEAGUE_ID, year=SEASON_ID, swid=SWID, espn_s2=ESPN_S2)
+                else:
+                    league = League(league_id=LEAGUE_ID, year=SEASON_ID)
 
-            # Test the connection with a simple call
-            _ = league.teams  # This will trigger an API call
-            return league
+                # Test the connection with a simple call
+                _ = league.teams  # This will trigger an API call
+                break
 
-        except Exception as e:
-            if attempt < timeout_retries - 1:
-                print(f"League initialization attempt {attempt + 1} failed: {e}. Retrying in {API_RETRY_DELAY} seconds...")
-                time.sleep(API_RETRY_DELAY)
-                continue
-            else:
-                print(f"Failed to initialize league after {timeout_retries} attempts: {e}")
-                raise ConnectionError(f"Unable to connect to ESPN Fantasy API: {e}")
+            except Exception as e:
+                if attempt < timeout_retries - 1:
+                    print(f"League initialization attempt {attempt + 1} failed: {e}. Retrying in {API_RETRY_DELAY} seconds...")
+                    time.sleep(API_RETRY_DELAY)
+                    continue
+                else:
+                    print(f"Failed to initialize league after {timeout_retries} attempts: {e}")
+                    raise ConnectionError(f"Unable to connect to ESPN Fantasy API: {e}")
+
+    # Cache the successfully retrieved league
+    if league:
+        espn_cache.set(cache_key, league)
+        return league
+    else:
+        raise ConnectionError("Unable to initialize any league connection")
 
 def get_points(player):
     """Get total fantasy points for a player"""
@@ -515,8 +943,169 @@ def command_error_handler(func):
 
 @client.event
 async def on_ready():
-    print(f'Logged in as {client.user} (ID: {client.user.id})')
-    print('Bot is ready and commands are synced!')
+    print(f'Bot is ready! Commands should be synced via setup_hook.')
+
+    # Start background refresh for better performance
+    background_refresh_manager.start_background_refresh()
+
+@client.tree.command(name="sync_commands", description="Manually sync bot commands with Discord (admin only).")
+async def sync_commands(interaction: discord.Interaction):
+    """Manually sync commands - useful for testing new features"""
+    try:
+        await interaction.response.defer(ephemeral=True)
+
+        # Clear and re-sync commands
+        client.tree.clear_commands()
+        await client.tree.sync()
+
+        # Reload commands (this forces re-registration)
+        synced = await client.tree.sync()
+
+        await interaction.followup.send(f"✅ Successfully cleared and synced {len(synced)} commands to Discord!\n⚠️ Autocomplete may take a few minutes to activate.", ephemeral=True)
+        print(f"Manual clear+sync by {interaction.user}: {len(synced)} commands synced")
+
+    except Exception as e:
+        await interaction.followup.send(f"❌ Failed to sync commands: {str(e)[:100]}", ephemeral=True)
+        print(f"Manual sync failed: {e}")
+
+@client.tree.command(name="debug_autocomplete", description="Test autocomplete functionality")
+async def debug_autocomplete(interaction: discord.Interaction):
+    """Debug command to test if autocomplete is working"""
+    try:
+        await interaction.response.defer(ephemeral=True)
+
+        # Test if we can get league data
+        league = get_league(user_id=interaction.user.id)
+        if not league:
+            await interaction.followup.send("❌ No league found for autocomplete testing", ephemeral=True)
+            return
+
+        team_count = len(league.teams)
+        total_players = sum(len(team.roster) for team in league.teams)
+
+        await interaction.followup.send(f"✅ Autocomplete data available:\n- {team_count} teams\n- {total_players} total players\n\nIf autocomplete still doesn't work, try restarting the bot.", ephemeral=True)
+
+    except Exception as e:
+        await interaction.followup.send(f"❌ Autocomplete debug failed: {str(e)[:100]}", ephemeral=True)
+
+@client.tree.command(name="detailed_stats", description="Comprehensive league analytics with advanced metrics (desktop optimized).")
+async def detailed_stats(interaction: discord.Interaction):
+    """Desktop-optimized detailed statistics command"""
+    try:
+        await interaction.response.defer()
+
+        league = get_league(user_id=interaction.user.id)
+        if not league:
+            await interaction.followup.send("❌ No league found. Use `/register_league` to add your ESPN Fantasy League first.", ephemeral=True)
+            return
+
+        current_week = getattr(league, 'current_week', 1)
+        league_name = get_league_name(user_id=interaction.user.id)
+
+        # Create comprehensive analytics embed
+        embed = SafeEmbedBuilder.create()
+        embed.set_title(f"📊 {league_name} - Advanced Analytics (Week {current_week})")
+        embed.set_color(0x4CAF50)
+
+        # Collect detailed team data
+        teams_analysis = []
+        for team in league.teams:
+            # Calculate advanced metrics
+            total_points = getattr(team, 'points_for', 0)
+            games_played = getattr(team, 'wins', 0) + getattr(team, 'losses', 0)
+            ppg = total_points / max(games_played, 1)
+
+            # Get current week projection
+            starters = [p for p in team.roster if getattr(p, 'lineupSlot', None) != "BE"]
+            week_projection = 0
+            for player in starters:
+                proj = 0
+                if hasattr(player, 'stats') and player.stats:
+                    week_stats = player.stats.get(current_week, {})
+                    proj = week_stats.get('projected_points', 0) or 0
+                week_projection += proj
+
+            teams_analysis.append({
+                'name': team.team_name,
+                'points_for': total_points,
+                'points_against': getattr(team, 'points_against', 0),
+                'wins': getattr(team, 'wins', 0),
+                'losses': getattr(team, 'losses', 0),
+                'ppg': ppg,
+                'week_proj': week_projection
+            })
+
+        # Sort by total points
+        teams_analysis.sort(key=lambda x: x['points_for'], reverse=True)
+
+        # League overview
+        total_points = sum(t['points_for'] for t in teams_analysis)
+        avg_ppg = total_points / len(teams_analysis) / max(teams_analysis[0]['wins'] + teams_analysis[0]['losses'], 1)
+
+        overview_text = f"**League Totals:** {total_points:.1f} points across {len(teams_analysis)} teams\n"
+        overview_text += f"**Average PPG:** {avg_ppg:.1f} per team\n"
+        overview_text += f"**Season Progress:** {games_played} games played"
+
+        embed.add_field(name="🎯 League Overview", value=overview_text, inline=False)
+
+        # Top performers analysis
+        top_3_points = teams_analysis[:3]
+        top_performers_text = ""
+        for i, team in enumerate(top_3_points):
+            rank_emoji = ["🥇", "🥈", "🥉"][i]
+            efficiency = team['points_for'] / max(team['points_against'], 1)
+            top_performers_text += f"{rank_emoji} **{team['name']}** - {team['points_for']:.1f} PF ({team['ppg']:.1f} PPG) • Efficiency: {efficiency:.2f}\n"
+
+        embed.add_field(name="🏆 Points Leaders", value=top_performers_text, inline=True)
+
+        # Efficiency leaders (points for vs points against ratio)
+        efficiency_leaders = sorted(teams_analysis, key=lambda x: x['points_for'] / max(x['points_against'], 1), reverse=True)[:3]
+        efficiency_text = ""
+        for i, team in enumerate(efficiency_leaders):
+            rank_emoji = ["🎯", "📈", "⚡"][i]
+            ratio = team['points_for'] / max(team['points_against'], 1)
+            efficiency_text += f"{rank_emoji} **{team['name']}** - {ratio:.2f} ratio ({team['points_for']:.1f}/{team['points_against']:.1f})\n"
+
+        embed.add_field(name="⚡ Efficiency Leaders", value=efficiency_text, inline=True)
+
+        # Weekly projections
+        proj_leaders = sorted(teams_analysis, key=lambda x: x['week_proj'], reverse=True)[:3]
+        proj_text = ""
+        for i, team in enumerate(proj_leaders):
+            rank_emoji = ["🔮", "✨", "💫"][i]
+            proj_text += f"{rank_emoji} **{team['name']}** - {team['week_proj']:.1f} projected\n"
+
+        embed.add_field(name=f"🔮 Week {current_week} Projections", value=proj_text, inline=False)
+
+        # Power rankings (combination of record and points)
+        power_rankings = []
+        for team in teams_analysis:
+            win_pct = team['wins'] / max(team['wins'] + team['losses'], 1)
+            power_score = (win_pct * 0.6) + ((team['ppg'] / avg_ppg) * 0.4)  # 60% record, 40% scoring
+            power_rankings.append((team['name'], power_score, team['wins'], team['losses']))
+
+        power_rankings.sort(key=lambda x: x[1], reverse=True)
+
+        power_text = ""
+        for i, (name, score, wins, losses) in enumerate(power_rankings[:5]):
+            rank_num = i + 1
+            power_text += f"**{rank_num}.** {name} ({wins}-{losses}) - Power: {score:.3f}\n"
+
+        embed.add_field(name="⚔️ Power Rankings", value=power_text, inline=False)
+
+        embed.set_footer(text=f"📊 Advanced analytics • Updated Week {current_week} • Use /standings for simple view")
+
+        await interaction.followup.send(embed=embed.build())
+
+    except Exception as e:
+        error_msg = f"❌ Error generating detailed stats: {str(e)[:100]}"
+        print(f"Detailed stats error: {e}")
+        await interaction.followup.send(error_msg, ephemeral=True)
+
+@client.tree.command(name="test_new", description="Simple test command to verify new commands work.")
+async def test_new(interaction: discord.Interaction):
+    """Simple test command"""
+    await interaction.response.send_message("✅ New commands are working! This means the bot code is updated and syncing properly.", ephemeral=True)
 
 @client.tree.command(name="ping", description="Check if the bot is alive.")
 async def ping(interaction: discord.Interaction):
@@ -551,6 +1140,7 @@ async def ping(interaction: discord.Interaction):
 
 @client.tree.command(name="team", description="Get the roster for a team by name.")
 @app_commands.describe(team_name="The exact name of the team as it appears in ESPN.")
+@app_commands.autocomplete(team_name=team_name_autocomplete)
 async def team(interaction: discord.Interaction, team_name: str):
     try:
         # Check if response is already done to prevent duplicate interactions
@@ -571,11 +1161,27 @@ async def team(interaction: discord.Interaction, team_name: str):
                 await interaction.followup.send("❌ No league found. Use `/register_league` to add your ESPN Fantasy League first, or contact an admin if you want to use the default league.", ephemeral=True)
                 return
         except Exception as api_error:
-            await interaction.followup.send(f"ESPN API error: {api_error}")
+            error_message = "⚠️ **ESPN API Issue**\n"
+            if "timeout" in str(api_error).lower():
+                error_message += "ESPN servers are slow. Try again in a moment."
+            elif "401" in str(api_error) or "authentication" in str(api_error).lower():
+                error_message += "League authentication failed. Check your league settings with `/league_status`."
+            elif "404" in str(api_error):
+                error_message += "League not found. Verify your league ID is correct."
+            else:
+                error_message += f"ESPN temporarily unavailable. Please try again.\n*Error: {str(api_error)[:100]}*"
+            await interaction.followup.send(error_message)
             return
         team = next((t for t in league.teams if t.team_name.lower() == team_name.lower()), None)
         if not team:
-            await interaction.followup.send(f"Team '{team_name}' not found.")
+            # Try partial match
+            partial_matches = [t for t in league.teams if team_name.lower() in t.team_name.lower()]
+            if partial_matches:
+                suggestions = ", ".join([f"'{t.team_name}'" for t in partial_matches[:3]])
+                await interaction.followup.send(f"❌ Team '{team_name}' not found.\n💡 Did you mean: {suggestions}?")
+            else:
+                team_list = ", ".join([f"'{t.team_name}'" for t in league.teams[:5]])
+                await interaction.followup.send(f"❌ Team '{team_name}' not found.\n📋 Available teams: {team_list}...")
             return
         # Single-width emoji mappings
         pos_emoji = {
@@ -706,68 +1312,90 @@ async def team(interaction: discord.Interaction, team_name: str):
         total_actual_points = sum(get_actual_points(p) for p in starters_sorted)
         total_projected_points = sum(float(get_weekly_proj(p)) for p in starters_sorted if get_weekly_proj(p) != 'N/A' and get_weekly_proj(p) is not None)
 
-        # Create custom formatted table for perfect alignment
-        header = f"{'Player':<24} {'Projected':>10}  {'Actual':>8}"
-        separator = f"{'-'*24} {'-'*10}  {'-'*8}"
-
-        lines = [header, separator]
+        # Create mobile-friendly starter display
+        starter_lines = []
         for p in starters_sorted:
             pos = getattr(p, 'position', 'UNK')
             status = get_status(p)
-            # Put status in parentheses after name
-            name_with_status = f"{pos} {p.name} ({status})" if status else f"{pos} {p.name}"
 
             actual = get_actual_points(p)
             projected = get_weekly_proj(p)
 
             # Format projected points
             if projected == 'N/A' or projected is None:
-                proj_str = "N/A pts"
+                proj_str = "N/A"
             else:
-                proj_str = f"{float(projected):.1f} pts"
+                proj_str = f"{float(projected):.1f}"
 
             # Format actual points
-            actual_str = f"{actual:.1f} pts" if actual > 0 else "0.0 pts"
+            actual_str = f"{actual:.1f}" if actual > 0 else "0.0"
 
-            line = f"{name_with_status:<24} {proj_str:>10}  {actual_str:>8}"
-            lines.append(line)
+            # Enhanced position and status indicators
+            pos_emojis = {
+                'QB': '🏈', 'RB': '🏃‍♂️', 'WR': '🙌', 'TE': '🏈',
+                'K': '🦶', 'D/ST': '🛡️', 'DST': '🛡️', 'DEF': '🛡️'
+            }
+            pos_emoji = pos_emojis.get(pos, '⚪')
 
-        # Add separator and total row
-        lines.append(separator)
-        total_proj_str = f"{total_projected_points:.1f} pts"
-        total_actual_str = f"{total_actual_points:.1f} pts"
-        total_line = f"{'TOTAL':<24} {total_proj_str:>10}  {total_actual_str:>8}"
-        lines.append(total_line)
-        starters_text = f"```\n{chr(10).join(lines)}\n```"
-        starters_text = starters_text if starters_sorted else "None"
-        # Create custom formatted bench table for perfect alignment
+            # Enhanced status indicator with emoji
+            status_indicators = {
+                'Q': '⚠️', 'QUESTIONABLE': '⚠️',
+                'O': '❌', 'OUT': '❌',
+                'D': '🔶', 'DOUBTFUL': '🔶',
+                'IR': '🏥', 'INJURY_RESERVE': '🏥',
+                'COV': '😷', 'COVID': '😷'
+            }
+            status_emoji = status_indicators.get(status, '')
+            status_indicator = f" {status_emoji}" if status and status not in ['ACTIVE', 'N/A', ''] else ""
+
+            # Enhanced format with emoji and better spacing
+            line = f"{pos_emoji} **{pos}** {p.name}{status_indicator} `{proj_str}/{actual_str}`"
+            starter_lines.append(line)
+
+        starter_lines.append(f"\n**Total:** `{total_projected_points:.1f}/{total_actual_points:.1f}` pts")
+        starters_text = "\n".join(starter_lines) if starters_sorted else "None"
+        # Create mobile-friendly bench display
         if bench:
-            bench_header = f"{'Player':<24} {'Projected':>10}  {'Actual':>8}"
-            bench_separator = f"{'-'*24} {'-'*10}  {'-'*8}"
-
-            bench_lines = [bench_header, bench_separator]
+            bench_lines = []
             for p in bench:
                 pos = getattr(p, 'position', 'UNK')
                 status = get_status(p)
-                # Put status in parentheses after name
-                name_with_status = f"{pos} {p.name} ({status})" if status else f"{pos} {p.name}"
 
                 actual = get_actual_points(p)
                 projected = get_weekly_proj(p)
 
                 # Format projected points
                 if projected == 'N/A' or projected is None:
-                    proj_str = "N/A pts"
+                    proj_str = "N/A"
                 else:
-                    proj_str = f"{float(projected):.1f} pts"
+                    proj_str = f"{float(projected):.1f}"
 
                 # Format actual points
-                actual_str = f"{actual:.1f} pts" if actual > 0 else "0.0 pts"
+                actual_str = f"{actual:.1f}" if actual > 0 else "0.0"
 
-                line = f"{name_with_status:<24} {proj_str:>10}  {actual_str:>8}"
+                # Enhanced position and status indicators (same as starters)
+                pos_emojis = {
+                    'QB': '🏈', 'RB': '🏃‍♂️', 'WR': '🙌', 'TE': '🏈',
+                    'K': '🦶', 'D/ST': '🛡️', 'DST': '🛡️', 'DEF': '🛡️'
+                }
+                pos_emoji = pos_emojis.get(pos, '⚪')
+
+                # Enhanced status indicator with emoji
+                status_indicators = {
+                    'Q': '⚠️', 'QUESTIONABLE': '⚠️',
+                    'O': '❌', 'OUT': '❌',
+                    'D': '🔶', 'DOUBTFUL': '🔶',
+                    'IR': '🏥', 'INJURY_RESERVE': '🏥',
+                    'COV': '😷', 'COVID': '😷'
+                }
+                status_emoji = status_indicators.get(status, '')
+                status_indicator = f" {status_emoji}" if status and status not in ['ACTIVE', 'N/A', ''] else ""
+
+                # Enhanced format with emoji and better spacing
+                line = f"{pos_emoji} **{pos}** {p.name}{status_indicator} `{proj_str}/{actual_str}`"
                 bench_lines.append(line)
 
-            bench_text = f"```\n{chr(10).join(bench_lines)}\n```"
+            bench_text = "\n".join(bench_lines)
         else:
             bench_text = "None"
         # Get current week
@@ -778,8 +1406,8 @@ async def team(interaction: discord.Interaction, team_name: str):
             embed.set_thumbnail(url=team.logo_url)
         else:
             embed.set_thumbnail(url="https://a.espncdn.com/i/espn/logos/nfl/NFL.png")
-        embed.add_field(name="Starters", value=starters_text, inline=False)
-        embed.add_field(name="Bench", value=bench_text, inline=False)
+        embed.add_field(name="🚀 Starting Lineup", value=starters_text, inline=False)
+        embed.add_field(name="🪑 Bench Players", value=bench_text, inline=False)
         
         # Create interactive view with buttons
         view = TeamView(team, league)
@@ -797,23 +1425,28 @@ async def team(interaction: discord.Interaction, team_name: str):
 
 @client.tree.command(name="player", description="Get detailed stats for a specific player.")
 @app_commands.describe(player_name="The name of the player to look up.")
+@app_commands.autocomplete(player_name=player_name_autocomplete)
 async def player(interaction: discord.Interaction, player_name: str):
     try:
         await interaction.response.defer()
-        if SWID and ESPN_S2:
-            league = League(league_id=LEAGUE_ID, year=SEASON_ID, swid=SWID, espn_s2=ESPN_S2)
-        else:
-            league = League(league_id=LEAGUE_ID, year=SEASON_ID)
-        # Search for player across all teams
+        # Use cached league for better performance
+        league = get_league(user_id=interaction.user.id)
+        if not league:
+            if SWID and ESPN_S2:
+                league = League(league_id=LEAGUE_ID, year=SEASON_ID, swid=SWID, espn_s2=ESPN_S2)
+            else:
+                league = League(league_id=LEAGUE_ID, year=SEASON_ID)
+        # Search for player across all teams (optimized)
         found_player = None
         player_team = None
+        player_name_lower = player_name.lower()  # Cache the lowercase conversion
+
         for team in league.teams:
-            for p in team.roster:
-                if player_name.lower() in p.name.lower():
-                    found_player = p
-                    player_team = team
-                    break
-            if found_player:
+            # Use next() with generator for early exit optimization
+            found = next((p for p in team.roster if player_name_lower in p.name.lower()), None)
+            if found:
+                found_player = found
+                player_team = team
                 break
         if not found_player:
             await interaction.followup.send(f"Player '{player_name}' not found in any team.")
@@ -929,18 +1562,28 @@ async def player(interaction: discord.Interaction, player_name: str):
         embed.set_footer(text="💡 Try /team to see full roster breakdown")
 
         await interaction.followup.send(embed=embed)
+    except discord.errors.NotFound as e:
+        print(f"Player command timed out: {e}")
+        return
     except Exception as e:
-        await interaction.followup.send(f"Error fetching player: {e}")
+        try:
+            await interaction.followup.send(f"Error fetching player: {e}")
+        except discord.errors.NotFound:
+            print(f"Could not send player error - interaction expired")
 
 @client.tree.command(name="compare", description="Compare two teams side-by-side.")
 @app_commands.describe(team1="First team name", team2="Second team name")
+@app_commands.autocomplete(team1=team_name_autocomplete, team2=team_name_autocomplete)
 async def compare(interaction: discord.Interaction, team1: str, team2: str):
     try:
         await interaction.response.defer()
-        if SWID and ESPN_S2:
-            league = League(league_id=LEAGUE_ID, year=SEASON_ID, swid=SWID, espn_s2=ESPN_S2)
-        else:
-            league = League(league_id=LEAGUE_ID, year=SEASON_ID)
+        # Use cached league for better performance
+        league = get_league(user_id=interaction.user.id)
+        if not league:
+            if SWID and ESPN_S2:
+                league = League(league_id=LEAGUE_ID, year=SEASON_ID, swid=SWID, espn_s2=ESPN_S2)
+            else:
+                league = League(league_id=LEAGUE_ID, year=SEASON_ID)
         
         # Find both teams
         team1_obj = next((t for t in league.teams if t.team_name.lower() == team1.lower()), None)
@@ -1002,21 +1645,21 @@ async def compare(interaction: discord.Interaction, team1: str, team2: str):
         league_name = get_league_name(user_id=interaction.user.id)
         embed = discord.Embed(title=f"⚔️ {league_name} Team Comparison - Week {current_week}", color=discord.Color.purple())
 
-        # Create team name abbreviations for table headers (max 12 chars to fit columns)
-        team1_abbrev = team1_obj.team_name[:12]
-        team2_abbrev = team2_obj.team_name[:12]
+        # Mobile-friendly comparison using individual fields
+        embed.add_field(
+            name=f"📊 {team1_obj.team_name}",
+            value=f"**Record:** {team1_wins}-{team1_losses}-{team1_ties}\n**Season PF:** {team1_season_points:.1f}\n**This Week:** {team1_weekly:.1f}",
+            inline=True
+        )
 
-        # Format comparison data
-        comparison_data = f"""```
-{'Metric':<20} {team1_abbrev:<12} {team2_abbrev:<12}
-{'-'*20} {'-'*12} {'-'*12}
-{'Record':<20} {team1_wins}-{team1_losses}-{team1_ties:<9} {team2_wins}-{team2_losses}-{team2_ties}
-{'Season Points':<20} {team1_season_points:<12.2f} {team2_season_points:<12.2f}
-{'Weekly Projected':<20} {team1_weekly:<12.2f} {team2_weekly:<12.2f}
-{'Head-to-Head':<20} {h2h_team1_wins}-{h2h_team2_wins}-{h2h_ties:<9} {h2h_team2_wins}-{h2h_team1_wins}-{h2h_ties}
-```"""
+        embed.add_field(
+            name=f"📊 {team2_obj.team_name}",
+            value=f"**Record:** {team2_wins}-{team2_losses}-{team2_ties}\n**Season PF:** {team2_season_points:.1f}\n**This Week:** {team2_weekly:.1f}",
+            inline=True
+        )
 
-        embed.add_field(name="📈 Comparison Stats", value=comparison_data, inline=False)
+        # Add spacing field
+        embed.add_field(name="\u200b", value="\u200b", inline=True)
 
         # Analysis
         analysis_lines = []
@@ -1050,8 +1693,14 @@ async def compare(interaction: discord.Interaction, team1: str, team2: str):
         embed.add_field(name="🔍 Analysis", value="\n".join(analysis_lines), inline=False)
         
         await interaction.followup.send(embed=embed)
+    except discord.errors.NotFound as e:
+        print(f"Compare command timed out: {e}")
+        return
     except Exception as e:
-        await interaction.followup.send(f"Error comparing teams: {e}")
+        try:
+            await interaction.followup.send(f"Error comparing teams: {e}")
+        except discord.errors.NotFound:
+            print(f"Could not send compare error - interaction expired")
 
 @client.tree.command(name="standings", description="Show league standings with records and points.")
 async def standings(interaction: discord.Interaction):
@@ -1100,24 +1749,45 @@ async def standings(interaction: discord.Interaction):
         # Create standings table
         current_week = getattr(league, 'current_week', 'Unknown')
         league_name = get_league_name(user_id=interaction.user.id)
-        embed = discord.Embed(title=f"🏆 {league_name} Standings - Week {current_week}", color=discord.Color.gold())
+        embed = SafeEmbedBuilder.create().set_title(f"🏆 {league_name} Standings - Week {current_week}").set_color(discord.Color.gold())
 
-        # Format standings table
-        standings_lines = []
-        standings_lines.append(f"{'Rank':<4} {'Team':<20} {'Record':<8} {'PF':<8} {'PA':<8}")
-        standings_lines.append(f"{'-'*4} {'-'*20} {'-'*8} {'-'*8} {'-'*8}")
+        # Create embed generator function for pagination
+        def create_standings_embed(page_num, page_teams):
+            rank_emojis = ['🥇', '🥈', '🥉', '4️⃣', '5️⃣', '6️⃣', '7️⃣', '8️⃣', '9️⃣', '🔟', '1️⃣1️⃣', '1️⃣2️⃣', '1️⃣3️⃣', '1️⃣4️⃣', '1️⃣5️⃣', '1️⃣6️⃣']
 
-        for rank, team in enumerate(teams_data, 1):
-            name = team['name'][:20]  # Truncate long names
-            record = f"{team['wins']}-{team['losses']}-{team['ties']}"
-            pf = f"{team['points_for']:.1f}"
-            pa = f"{team['points_against']:.1f}"
+            page_embed = SafeEmbedBuilder.create()
+            page_embed.set_title(f"🏆 {league_name} Standings - Week {current_week}")
+            page_embed.set_color(discord.Color.gold())
 
-            line = f"{rank:<4} {name:<20} {record:<8} {pf:<8} {pa:<8}"
-            standings_lines.append(line)
+            max_pages = (len(teams_data) - 1) // 8 + 1
+            if max_pages > 1:
+                page_embed.set_description(f"**Page {page_num + 1} of {max_pages}**")
 
-        standings_table = f"```\n{chr(10).join(standings_lines)}\n```"
-        embed.add_field(name="📊 Current Standings", value=standings_table, inline=False)
+            # Add teams for this page
+            for i, team in enumerate(page_teams):
+                actual_rank = (page_num * 8) + i + 1
+                rank_emoji = rank_emojis[actual_rank - 1] if actual_rank <= len(rank_emojis) else f"{actual_rank}."
+                team_name = team['name'][:15]  # Truncate for field name
+                record = f"{team['wins']}-{team['losses']}"
+                if team['ties'] > 0:
+                    record += f"-{team['ties']}"
+
+                field_name = f"{rank_emoji} {actual_rank}. {team_name}"
+                field_value = f"**{record}** • {team['points_for']:.1f} PF • {team['points_against']:.1f} PA"
+
+                page_embed.add_field(name=field_name, value=field_value, inline=True)
+
+            return page_embed.build()
+
+        # Use pagination if more than 8 teams
+        if len(teams_data) > 8:
+            view = PaginatedView(teams_data, page_size=8, embed_generator=create_standings_embed)
+            view.update_buttons()
+            initial_embed = create_standings_embed(0, view.get_page_data(0))
+        else:
+            # Single page - no pagination needed
+            embed = create_standings_embed(0, teams_data)
+            view = None
 
         # Add some league stats
         highest_scoring = max(teams_data, key=lambda x: x['points_for']) if teams_data else None
@@ -1165,19 +1835,40 @@ async def standings(interaction: discord.Interaction):
         except Exception as e:
             print(f"Error calculating highest weekly score: {e}")
 
-        stats_lines = []
-        if highest_scoring:
-            stats_lines.append(f"🔥 **Highest Scoring**: {highest_scoring['name']} ({highest_scoring['points_for']:.1f} pts)")
-        if lowest_scoring:
-            stats_lines.append(f"🧊 **Lowest Scoring**: {lowest_scoring['name']} ({lowest_scoring['points_for']:.1f} pts)")
-        if highest_weekly_team and highest_weekly_score > 0:
-            stats_lines.append(f"💥 **Best Weekly Score**: {highest_weekly_team} - {highest_weekly_score:.1f} pts (Week {highest_weekly_week})")
+        # Send appropriate response based on pagination
+        if len(teams_data) > 8:
+            await interaction.followup.send(embed=initial_embed, view=view)
         else:
-            stats_lines.append("💥 **Best Weekly Score**: Not available")
+            # Add league stats to single page
+            stats_lines = []
+            if highest_scoring:
+                stats_lines.append(f"🔥 **Highest Scoring**: {highest_scoring['name']} ({highest_scoring['points_for']:.1f} pts)")
+            if lowest_scoring:
+                stats_lines.append(f"🧊 **Lowest Scoring**: {lowest_scoring['name']} ({lowest_scoring['points_for']:.1f} pts)")
+            if highest_weekly_team and highest_weekly_score > 0:
+                stats_lines.append(f"💥 **Best Weekly Score**: {highest_weekly_team} - {highest_weekly_score:.1f} pts (Week {highest_weekly_week})")
+            else:
+                stats_lines.append("💥 **Best Weekly Score**: Not available")
 
-        embed.add_field(name="📈 League Stats", value="\n".join(stats_lines), inline=False)
+            embed_builder = SafeEmbedBuilder.create()
+            embed_builder.set_title(f"🏆 {league_name} Standings - Week {current_week}")
+            embed_builder.set_color(discord.Color.gold())
 
-        await interaction.followup.send(embed=embed)
+            # Re-add teams
+            rank_emojis = ['🥇', '🥈', '🥉', '4️⃣', '5️⃣', '6️⃣', '7️⃣', '8️⃣']
+            for rank, team in enumerate(teams_data, 1):
+                rank_emoji = rank_emojis[rank - 1] if rank <= len(rank_emojis) else f"{rank}."
+                team_name = team['name'][:15]
+                record = f"{team['wins']}-{team['losses']}"
+                if team['ties'] > 0:
+                    record += f"-{team['ties']}"
+
+                field_name = f"{rank_emoji} {rank}. {team_name}"
+                field_value = f"**{record}** • {team['points_for']:.1f} PF • {team['points_against']:.1f} PA"
+                embed_builder.add_field(name=field_name, value=field_value, inline=True)
+
+            embed_builder.add_field(name="📈 League Stats", value="\n".join(stats_lines), inline=False)
+            await interaction.followup.send(embed=embed_builder.build())
 
     except Exception as e:
         error_msg = f"Error fetching standings: {e}"
@@ -1202,10 +1893,13 @@ async def stats(interaction: discord.Interaction):
 
         # Initialize league
         try:
-            if SWID and ESPN_S2:
-                league = League(league_id=LEAGUE_ID, year=SEASON_ID, swid=SWID, espn_s2=ESPN_S2)
-            else:
-                league = League(league_id=LEAGUE_ID, year=SEASON_ID)
+            # Use cached league for better performance
+            league = get_league(user_id=interaction.user.id)
+            if not league:
+                if SWID and ESPN_S2:
+                    league = League(league_id=LEAGUE_ID, year=SEASON_ID, swid=SWID, espn_s2=ESPN_S2)
+                else:
+                    league = League(league_id=LEAGUE_ID, year=SEASON_ID)
         except Exception as api_error:
             await interaction.followup.send(f"ESPN API error: {api_error}")
             return
@@ -1849,7 +2543,10 @@ async def waiver(interaction: discord.Interaction, position: str = None, min_own
     await interaction.response.defer()
 
     try:
-        league = League(league_id=LEAGUE_ID, year=SEASON_ID, espn_s2=ESPN_S2, swid=SWID)
+        # Use cached league for better performance
+        league = get_league(user_id=interaction.user.id)
+        if not league:
+            league = League(league_id=LEAGUE_ID, year=SEASON_ID, espn_s2=ESPN_S2, swid=SWID)
 
         # Get all free agents
         free_agents = league.free_agents()
@@ -1976,13 +2673,19 @@ async def waiver(interaction: discord.Interaction, position: str = None, min_own
 
         await interaction.followup.send(embed=embed)
 
+    except discord.errors.NotFound as e:
+        print(f"Waiver command timed out: {e}")
+        return
     except Exception as e:
         error_msg = f"Error analyzing waiver wire: {e}"
         print(f"Waiver error: {e}")
-        if not interaction.response.is_done():
-            await interaction.response.send_message(error_msg, ephemeral=True)
-        else:
-            await interaction.followup.send(error_msg, ephemeral=True)
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.send_message(error_msg, ephemeral=True)
+            else:
+                await interaction.followup.send(error_msg, ephemeral=True)
+        except discord.errors.NotFound:
+            print(f"Could not send waiver error - interaction expired")
 
 @client.tree.command(name="trade", description="Analyze potential trades between teams.")
 @app_commands.describe(
@@ -1995,11 +2698,17 @@ async def trade(interaction: discord.Interaction, team1: str, team2: str, team1_
     await interaction.response.defer()
 
     try:
-        league = League(league_id=LEAGUE_ID, year=SEASON_ID, espn_s2=ESPN_S2, swid=SWID)
+        # Use existing league function to avoid timeout
+        league = get_league(user_id=interaction.user.id)
+        if not league:
+            # Fallback to direct creation
+            league = League(league_id=LEAGUE_ID, year=SEASON_ID, espn_s2=ESPN_S2, swid=SWID)
 
-        # Find teams
+        # Find teams (optimized with early exit)
         team1_obj = None
         team2_obj = None
+        team1_lower = team1.lower()
+        team2_lower = team2.lower()
 
         for team in league.teams:
             # Try different owner attribute names
@@ -2007,10 +2716,17 @@ async def trade(interaction: discord.Interaction, team1: str, team2: str, team1_
             if isinstance(owner_name, list) and owner_name:
                 owner_name = owner_name[0] if owner_name else ''
 
-            if team1.lower() in team.team_name.lower() or (owner_name and team1.lower() in str(owner_name).lower()):
+            team_name_lower = team.team_name.lower()
+            owner_name_lower = str(owner_name).lower() if owner_name else ''
+
+            if not team1_obj and (team1_lower in team_name_lower or (owner_name and team1_lower in owner_name_lower)):
                 team1_obj = team
-            if team2.lower() in team.team_name.lower() or (owner_name and team2.lower() in str(owner_name).lower()):
+            if not team2_obj and (team2_lower in team_name_lower or (owner_name and team2_lower in owner_name_lower)):
                 team2_obj = team
+
+            # Early exit if both teams found
+            if team1_obj and team2_obj:
+                break
 
         if not team1_obj:
             await interaction.followup.send(f"Team '{team1}' not found. Available teams: {', '.join(t.team_name for t in league.teams)}", ephemeral=True)
@@ -2225,13 +2941,22 @@ async def trade(interaction: discord.Interaction, team1: str, team2: str, team1_
 
         await interaction.followup.send(embed=embed)
 
+    except discord.errors.NotFound as e:
+        # Handle interaction timeout (Discord error 10062)
+        print(f"Trade command timed out: {e}")
+        # Can't respond since interaction is expired
+        return
     except Exception as e:
         error_msg = f"Error analyzing trade: {e}"
         print(f"Trade error: {e}")
-        if not interaction.response.is_done():
-            await interaction.response.send_message(error_msg, ephemeral=True)
-        else:
-            await interaction.followup.send(error_msg, ephemeral=True)
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.send_message(error_msg, ephemeral=True)
+            else:
+                await interaction.followup.send(error_msg, ephemeral=True)
+        except discord.errors.NotFound:
+            # Interaction expired, can't respond
+            print("Could not send error message - interaction expired")
 
 @client.tree.command(name="menu", description="Interactive command menu for easy navigation.")
 async def menu(interaction: discord.Interaction):
@@ -2791,6 +3516,7 @@ class BackToMenuView(View):
 
 @client.tree.command(name="card", description="Generate a visual team card with key stats and graphics.")
 @app_commands.describe(team_name="Team name to generate card for")
+@app_commands.autocomplete(team_name=team_name_autocomplete)
 async def card(interaction: discord.Interaction, team_name: str):
     # Use safe defer first
     if not await safe_defer(interaction):
@@ -3222,15 +3948,16 @@ async def scoreboard(interaction: discord.Interaction, auto_refresh: bool = True
                 # Create single consolidated embed that maximizes horizontal space
                 league_name = get_league_name(user_id=interaction.user.id)
 
-                # Calculate summary stats first
+                # Calculate summary stats
                 total_points = sum(m['score1'] + m['score2'] for m in matchups)
-                avg_game_total = total_points / len(matchups) if matchups else 0
+                num_teams = len(matchups) * 2 if matchups else 0
+                avg_team_score = total_points / num_teams if num_teams > 0 else 0
                 highest_score = max(max(m['score1'], m['score2']) for m in matchups) if matchups else 0
                 closest_game = min(abs(m['score1'] - m['score2']) for m in matchups) if matchups else 0
 
                 main_embed = discord.Embed(
                     title=f"🏈 {league_name} - Week {current_week}",
-                    description=f"🔄 Auto-refresh {'ON' if auto_refresh else 'OFF'} • 🎯 Total: {total_points:.1f} • 📈 Avg: {avg_game_total:.1f} • 🔥 High: {highest_score:.1f}",
+                    description=f"🔄 Auto-refresh {'ON' if auto_refresh else 'OFF'} • 🎯 Total: {total_points:.1f} • 📈 Avg: {avg_team_score:.1f} • 🔥 High: {highest_score:.1f}",
                     color=0xFF6B35
                 )
 
@@ -3239,6 +3966,166 @@ async def scoreboard(interaction: discord.Interaction, auto_refresh: bool = True
                 now = datetime.datetime.now()
                 main_embed.set_footer(text=f"Last updated: {now.strftime('%I:%M:%S %p')}")
 
+                # Get remaining players info function
+                def get_remaining_players(team, league_ref):
+                    starters = [p for p in team.roster if getattr(p, 'lineupSlot', None) != "BE"]
+                    total_starters = len(starters)
+                    yet_to_play = 0
+
+                    def has_actual_points(player, league):
+                        """Check if player has actual points (not just projected)"""
+                        current_week = getattr(league, 'current_week', 1)
+
+                        # Check player stats for actual points
+                        if hasattr(player, 'stats') and player.stats:
+                            try:
+                                week_stats = player.stats.get(current_week, {})
+                                # Look for actual points - ESPN uses different keys
+                                actual_points = week_stats.get('points', None)
+                                if actual_points is not None and actual_points > 0:
+                                    return True
+
+                                # Check applied stats (actual game stats)
+                                applied_stats = week_stats.get('appliedStats', {})
+                                if applied_stats and len(applied_stats) > 0:
+                                    # If there are applied stats, player has played
+                                    return True
+
+                            except Exception:
+                                pass
+
+                        # Check if player has game-specific attributes indicating they played
+                        if hasattr(player, 'game_played'):
+                            game_played = getattr(player, 'game_played', 0)
+                            if game_played > 0:
+                                return True
+
+                        return False
+
+                    try:
+                        for player in starters:
+                            player_yet_to_play = True
+
+                            try:
+                                # Check injury status first - injured players don't count as "yet to play"
+                                injury_status = getattr(player, 'injuryStatus', '')
+                                if injury_status in ['OUT', 'IR', 'SUSPENDED']:
+                                    player_yet_to_play = False
+
+                                # Check if player has ACTUAL points (not projected)
+                                elif has_actual_points(player, league_ref):
+                                    player_yet_to_play = False
+
+                            except Exception:
+                                # If we can't determine status, assume yet to play
+                                yet_to_play += 1
+
+                            if player_yet_to_play:
+                                yet_to_play += 1
+
+                    except Exception:
+                        # If anything fails, fall back to showing all players
+                        yet_to_play = total_starters
+
+                    return f"{yet_to_play}/{total_starters}"
+
+                # Create simple table format like the old version
+                def format_team_name_inline(name, max_length=7):
+                    """Format team name for inline display"""
+                    words = name.split()
+                    if len(words) == 1:
+                        return name + "  " if len(name) <= max_length else name[:max_length-2] + "  "
+                    result = f"{words[0]} {words[1][0]}."
+                    return result if len(result) <= max_length else words[0][:max_length-3] + " " + words[1][0] + "."
+
+                # Create compact table
+                table_lines = []
+                for matchup in matchups:
+                    team1 = matchup['team1']
+                    team2 = matchup['team2']
+                    score1 = matchup['score1']
+                    score2 = matchup['score2']
+                    proj1 = matchup.get('proj1', 0)
+                    proj2 = matchup.get('proj2', 0)
+
+                    # Get remaining players
+                    team1_remaining = get_remaining_players(team1, league)
+                    team2_remaining = get_remaining_players(team2, league)
+
+                    # Format team names
+                    base_name1 = format_team_name_inline(team1.team_name)
+                    base_name2 = format_team_name_inline(team2.team_name)
+
+                    # Create team + remaining formatted strings
+                    team1_full = f"{base_name1} ({team1_remaining})"
+                    team2_full = f"{base_name2} ({team2_remaining})"
+
+                    # Format scores
+                    score1_str = f"{score1:4.1f}|{proj1:4.1f}"
+                    score2_str = f"{score2:4.1f}|{proj2:4.1f}"
+
+                    # Determine winner indicator
+                    if score1 > score2:
+                        vs_symbol = "◀"  # Arrow points to winner (left team)
+                    elif score2 > score1:
+                        vs_symbol = "▶"  # Arrow points to winner (right team)
+                    else:
+                        vs_symbol = "="   # Tie
+
+                    # Create table row
+                    line = f"{team1_full:<14} {score1_str:<9} {vs_symbol} {score2_str:>9} {team2_full:>14}"
+                    table_lines.append(line)
+
+                # Mobile-friendly matchup display using individual fields
+                for i, matchup in enumerate(matchups):
+                    team1 = matchup['team1']
+                    team2 = matchup['team2']
+                    score1 = matchup['score1']
+                    score2 = matchup['score2']
+                    proj1 = matchup.get('proj1', 0)
+                    proj2 = matchup.get('proj2', 0)
+
+                    # Get remaining players
+                    team1_remaining = get_remaining_players(team1, league)
+                    team2_remaining = get_remaining_players(team2, league)
+
+                    # Determine winner/status
+                    if score1 > score2:
+                        status_emoji = "🔥"
+                        status_text = f"{team1.team_name} leading"
+                    elif score2 > score1:
+                        status_emoji = "🔥"
+                        status_text = f"{team2.team_name} leading"
+                    else:
+                        status_emoji = "⚖️"
+                        status_text = "Tied game"
+
+                    # Create mobile-friendly field
+                    field_name = f"{status_emoji} Matchup {i+1}: {team1.team_name} vs {team2.team_name}"
+                    field_value = (
+                        f"**{team1.team_name}**: `{score1:.1f}` pts (proj: `{proj1:.1f}`) • {team1_remaining} left\n"
+                        f"**{team2.team_name}**: `{score2:.1f}` pts (proj: `{proj2:.1f}`) • {team2_remaining} left\n"
+                        f"*{status_text}*"
+                    )
+
+                    main_embed.add_field(name=field_name, value=field_value, inline=False)
+
+                # Add summary info to the same embed
+                closest_game = min(abs(m['score1'] - m['score2']) for m in matchups) if matchups else 0
+
+                summary_lines = []
+                summary_lines.append(f"🎯 **Total Points Scored**: {total_points:.1f}")
+                summary_lines.append(f"📈 **Average Game Total**: {avg_team_score:.1f}")
+                summary_lines.append(f"🔥 **Highest Individual Score**: {highest_score:.1f}")
+                summary_lines.append(f"⚡ **Closest Game**: {closest_game:.1f} point difference")
+
+                main_embed.add_field(name="📋 Week Summary", value="\n".join(summary_lines), inline=False)
+                main_embed.add_field(name="Stats", value="🔄 **Status:** Live Updates", inline=False)
+
+                embeds = [main_embed]
+                return embeds
+
+                # Old code below - keeping for reference but not executed
                 # Get remaining players info function
                 def get_remaining_players(team, league_ref):
                     starters = [p for p in team.roster if getattr(p, 'lineupSlot', None) != "BE"]
@@ -3406,45 +4293,42 @@ async def scoreboard(interaction: discord.Interaction, auto_refresh: bool = True
                     all_table_lines.insert(0, separator_line)
                     all_table_lines.insert(0, header_line)
 
-                # Split table into multiple embeds if needed
-                current_embed_lines = []
+                # Create mobile-friendly matchup display instead of table
+                # Create main matchups embed using SafeEmbedBuilder
+                matchups_embed = SafeEmbedBuilder.create()
+                matchups_embed.set_title("📊 Live Matchups")
+                matchups_embed.set_color(0x32CD32)
 
-                for line in all_table_lines:
-                    test_content = f"```\n{chr(10).join(current_embed_lines + [line])}\n```"
+                # Add each matchup as a field - mobile friendly
+                for i, matchup in enumerate(matchups):
+                    team1 = matchup['team1']
+                    team2 = matchup['team2']
+                    score1 = matchup['score1']
+                    score2 = matchup['score2']
+                    proj1 = matchup.get('proj1', 0)
+                    proj2 = matchup.get('proj2', 0)
 
-                    if len(test_content) > SCOREBOARD_CHAR_LIMIT and current_embed_lines:
-                        # Create embed with current lines
-                        if current_embed_lines:
-                            # No table closure needed for simple text format
+                    # Determine status
+                    if score1 > score2:
+                        status_emoji = "🔥"
+                        status_text = f"{team1.team_name} leading"
+                    elif score2 > score1:
+                        status_emoji = "🔥"
+                        status_text = f"{team2.team_name} leading"
+                    else:
+                        status_emoji = "⚖️"
+                        status_text = "Tied game"
 
-                            table_embed = discord.Embed(
-                                title=f"📊 Matchups{f' (Part {len(embeds)})' if len(embeds) > 1 else ''}",
-                                color=0x32CD32
-                            )
-                            table_content = f"```\n{chr(10).join(current_embed_lines)}\n```"
-                            table_embed.add_field(name="Current Scores (A|P)", value=table_content, inline=False)
-                            embeds.append(table_embed)
-
-                        # Start new embed
-                        current_embed_lines = []
-                        if not line.startswith("Team 1"):
-                            # Add header for continuation
-                            current_embed_lines.extend([
-                                "Team 1            | Score   | Team 2            | Score",
-                                "------------------|---------|-------------------|-------"
-                            ])
-
-                    current_embed_lines.append(line)
-
-                # Add final embed if there are remaining lines
-                if current_embed_lines:
-                    table_embed = discord.Embed(
-                        title=f"📊 Matchups{f' (Part {len(embeds)})' if len(embeds) > 1 else ''}",
-                        color=0x32CD32
+                    field_name = f"{status_emoji} {team1.team_name} vs {team2.team_name}"
+                    field_value = (
+                        f"**{team1.team_name}**: `{score1:.1f}` pts (proj: `{proj1:.1f}`)\n"
+                        f"**{team2.team_name}**: `{score2:.1f}` pts (proj: `{proj2:.1f}`)\n"
+                        f"*{status_text}*"
                     )
-                    table_content = f"```\n{chr(10).join(current_embed_lines)}\n```"
-                    table_embed.add_field(name="Current Scores (A|P)", value=table_content, inline=False)
-                    embeds.append(table_embed)
+
+                    matchups_embed.add_field(name=field_name, value=field_value, inline=False)
+
+                embeds.append(matchups_embed.build())
 
                 # Create summary embed
                 total_points = sum(m['score1'] + m['score2'] for m in matchups)
@@ -3496,13 +4380,16 @@ async def scoreboard(interaction: discord.Interaction, auto_refresh: bool = True
             await interaction.followup.send(error_msg, ephemeral=True)
 
 class ScoreboardView(View):
-    def __init__(self, league, current_week, auto_refresh=True, user_id=None):
+    def __init__(self, league, current_week, auto_refresh=True, user_id=None, all_embeds=None):
         super().__init__(timeout=None)  # No timeout - make it persistent
         self.league = league
         self.current_week = current_week
         self.auto_refresh = auto_refresh
         self.user_id = user_id  # Store user ID to get current league on refresh
         self.last_refresh = None
+        self.all_embeds = all_embeds or []
+        self.current_page = 0
+        self.max_embeds_per_page = 4  # Show header + 2 matchup embeds + summary per page
 
         if auto_refresh:
             self.refresh_task = asyncio.create_task(self.auto_refresh_loop())
@@ -3872,45 +4759,42 @@ class ScoreboardView(View):
                     all_table_lines.insert(0, separator_line)
                     all_table_lines.insert(0, header_line)
 
-                # Split table into multiple embeds if needed
-                current_embed_lines = []
+                # Create mobile-friendly matchup display instead of table
+                # Create main matchups embed using SafeEmbedBuilder
+                matchups_embed = SafeEmbedBuilder.create()
+                matchups_embed.set_title("📊 Live Matchups")
+                matchups_embed.set_color(0x32CD32)
 
-                for line in all_table_lines:
-                    test_content = f"```\n{chr(10).join(current_embed_lines + [line])}\n```"
+                # Add each matchup as a field - mobile friendly
+                for i, matchup in enumerate(matchups):
+                    team1 = matchup['team1']
+                    team2 = matchup['team2']
+                    score1 = matchup['score1']
+                    score2 = matchup['score2']
+                    proj1 = matchup.get('proj1', 0)
+                    proj2 = matchup.get('proj2', 0)
 
-                    if len(test_content) > SCOREBOARD_CHAR_LIMIT and current_embed_lines:
-                        # Create embed with current lines
-                        if current_embed_lines:
-                            # No table closure needed for simple text format
+                    # Determine status
+                    if score1 > score2:
+                        status_emoji = "🔥"
+                        status_text = f"{team1.team_name} leading"
+                    elif score2 > score1:
+                        status_emoji = "🔥"
+                        status_text = f"{team2.team_name} leading"
+                    else:
+                        status_emoji = "⚖️"
+                        status_text = "Tied game"
 
-                            table_embed = discord.Embed(
-                                title=f"📊 Matchups{f' (Part {len(embeds)})' if len(embeds) > 1 else ''}",
-                                color=0x32CD32
-                            )
-                            table_content = f"```\n{chr(10).join(current_embed_lines)}\n```"
-                            table_embed.add_field(name="Current Scores (A|P)", value=table_content, inline=False)
-                            embeds.append(table_embed)
-
-                        # Start new embed
-                        current_embed_lines = []
-                        if not line.startswith("Team 1"):
-                            # Add header for continuation
-                            current_embed_lines.extend([
-                                "Team 1            | Score   | Team 2            | Score",
-                                "------------------|---------|-------------------|-------"
-                            ])
-
-                    current_embed_lines.append(line)
-
-                # Add final embed if there are remaining lines
-                if current_embed_lines:
-                    table_embed = discord.Embed(
-                        title=f"📊 Matchups{f' (Part {len(embeds)})' if len(embeds) > 1 else ''}",
-                        color=0x32CD32
+                    field_name = f"{status_emoji} {team1.team_name} vs {team2.team_name}"
+                    field_value = (
+                        f"**{team1.team_name}**: `{score1:.1f}` pts (proj: `{proj1:.1f}`)\n"
+                        f"**{team2.team_name}**: `{score2:.1f}` pts (proj: `{proj2:.1f}`)\n"
+                        f"*{status_text}*"
                     )
-                    table_content = f"```\n{chr(10).join(current_embed_lines)}\n```"
-                    table_embed.add_field(name="Current Scores (A|P)", value=table_content, inline=False)
-                    embeds.append(table_embed)
+
+                    matchups_embed.add_field(name=field_name, value=field_value, inline=False)
+
+                embeds.append(matchups_embed.build())
 
                 # Create summary embed
                 total_points = sum(m['score1'] + m['score2'] for m in matchups)
@@ -3952,7 +4836,76 @@ class ScoreboardView(View):
 
         return embeds
 
-    @discord.ui.button(label="🔄 Refresh Now", style=discord.ButtonStyle.primary)
+    def get_current_page_embeds(self):
+        """Get header + current matchup embed"""
+        if not self.all_embeds:
+            return []
+
+        # Always include header (first embed)
+        header_embed = self.all_embeds[0]
+
+        # Get matchup embeds (exclude header and summary)
+        matchup_embeds = self.all_embeds[1:-1] if len(self.all_embeds) > 2 else []
+        summary_embed = self.all_embeds[-1] if len(self.all_embeds) > 1 else None
+
+        if not matchup_embeds:
+            # If no matchup embeds, show header + summary
+            return [header_embed, summary_embed] if summary_embed else [header_embed]
+
+        # Show header + current matchup page
+        if self.current_page < len(matchup_embeds):
+            current_matchup = matchup_embeds[self.current_page]
+
+            # If this is the last matchup page, also include summary
+            if self.current_page == len(matchup_embeds) - 1 and summary_embed:
+                return [header_embed, current_matchup, summary_embed]
+            else:
+                return [header_embed, current_matchup]
+        else:
+            # Fallback to first matchup
+            return [header_embed, matchup_embeds[0]]
+
+    def get_total_pages(self):
+        """Calculate total number of pages (matchup embeds only)"""
+        if len(self.all_embeds) <= 2:  # Just header + summary
+            return 1
+
+        matchup_embeds = len(self.all_embeds) - 2  # Exclude header and summary
+        return max(1, matchup_embeds)
+
+    @discord.ui.button(label="◀️", style=discord.ButtonStyle.secondary, row=0)
+    async def previous_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Go to previous page"""
+        if self.current_page > 0:
+            self.current_page -= 1
+            page_embeds = self.get_current_page_embeds()
+
+            # Update embed footer to show page info
+            if page_embeds:
+                page_embeds[0].set_footer(
+                    text=f"Page {self.current_page + 1}/{self.get_total_pages()} • " +
+                         (page_embeds[0].footer.text.split(" • ", 1)[1] if page_embeds[0].footer.text else "")
+                )
+
+            await interaction.response.edit_message(embeds=page_embeds, view=self)
+
+    @discord.ui.button(label="▶️", style=discord.ButtonStyle.secondary, row=0)
+    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Go to next page"""
+        if self.current_page < self.get_total_pages() - 1:
+            self.current_page += 1
+            page_embeds = self.get_current_page_embeds()
+
+            # Update embed footer to show page info
+            if page_embeds:
+                page_embeds[0].set_footer(
+                    text=f"Page {self.current_page + 1}/{self.get_total_pages()} • " +
+                         (page_embeds[0].footer.text.split(" • ", 1)[1] if page_embeds[0].footer.text else "")
+                )
+
+            await interaction.response.edit_message(embeds=page_embeds, view=self)
+
+    @discord.ui.button(label="🔄 Refresh Now", style=discord.ButtonStyle.primary, row=1)
     async def manual_refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Manual refresh button"""
         try:
@@ -3987,7 +4940,7 @@ class ScoreboardView(View):
             except:
                 pass
 
-    @discord.ui.button(label="⏸️ Stop Auto-Refresh", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="⏸️ Stop Auto-Refresh", style=discord.ButtonStyle.secondary, row=1)
     async def toggle_refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Toggle auto-refresh on/off"""
         await interaction.response.defer()
@@ -5100,6 +6053,137 @@ async def league_info(interaction: discord.Interaction):
         error_msg = f"❌ Error getting league info: {str(e)}"
         print(f"League info error: {e}")
         await safe_interaction_response(interaction, error_msg, ephemeral=True)
+
+@client.tree.command(name="insights", description="Weekly analytics dashboard with league trends and insights.")
+async def insights(interaction: discord.Interaction):
+    """Generate weekly analytics and insights for the league"""
+    try:
+        await interaction.response.defer()
+
+        # Get league data
+        league = get_league(user_id=interaction.user.id)
+        if not league:
+            await interaction.followup.send("❌ No league found. Use `/register_league` to add your ESPN Fantasy League first.", ephemeral=True)
+            return
+
+        current_week = getattr(league, 'current_week', 1)
+        league_name = get_league_name(user_id=interaction.user.id)
+
+        # Create analytics embed
+        embed = SafeEmbedBuilder.create()
+        embed.set_title(f"📊 {league_name} Analytics Dashboard - Week {current_week}")
+        embed.set_color(0x1f8b4c)  # Green color
+
+        # Collect team data
+        teams_data = []
+        total_points_this_week = 0
+        highest_scorer = None
+        lowest_scorer = None
+        highest_score = 0
+        lowest_score = float('inf')
+
+        for team in league.teams:
+            try:
+                # Use simpler data that's already available
+                total_points = getattr(team, 'points_for', 0)
+                wins = getattr(team, 'wins', 0)
+                losses = getattr(team, 'losses', 0)
+
+                # Use a simple estimation for this week's score (total/games played)
+                games_played = wins + losses
+                estimated_week_score = total_points / max(games_played, 1) if games_played > 0 else 0
+
+                total_points_this_week += estimated_week_score
+
+                if estimated_week_score > highest_score:
+                    highest_score = estimated_week_score
+                    highest_scorer = team.team_name
+
+                if estimated_week_score < lowest_score:
+                    lowest_score = estimated_week_score
+                    lowest_scorer = team.team_name
+
+                teams_data.append({
+                    'name': team.team_name,
+                    'week_score': estimated_week_score,
+                    'total_points': total_points,
+                    'wins': wins,
+                    'losses': losses
+                })
+            except Exception as e:
+                print(f"Error processing team {team.team_name}: {e}")
+                # Add basic team data even if there's an error
+                teams_data.append({
+                    'name': team.team_name,
+                    'week_score': 0,
+                    'total_points': getattr(team, 'points_for', 0),
+                    'wins': getattr(team, 'wins', 0),
+                    'losses': getattr(team, 'losses', 0)
+                })
+
+        # League overview
+        avg_score = total_points_this_week / len(teams_data) if teams_data else 0
+        total_teams = len(teams_data)
+
+        overview_text = f"**📈 League Overview**\n"
+        if highest_scorer and lowest_scorer:
+            overview_text += f"🏆 Top Team: **{highest_scorer}** ({highest_score:.1f} avg)\n"
+            overview_text += f"📉 Bottom Team: **{lowest_scorer}** ({lowest_score:.1f} avg)\n"
+        overview_text += f"📊 League Average: **{avg_score:.1f}** pts per game\n"
+        overview_text += f"👥 Active Teams: **{total_teams}**"
+
+        embed.add_field(name="🎯 League Pulse", value=overview_text, inline=False)
+
+        # Performance tiers
+        if teams_data:
+            # Sort by this week's performance
+            sorted_teams = sorted(teams_data, key=lambda x: x['week_score'], reverse=True)
+
+            # Top performers (top 25%)
+            top_count = max(1, len(sorted_teams) // 4)
+            top_performers = sorted_teams[:top_count]
+
+            # Struggling teams (bottom 25%)
+            bottom_count = max(1, len(sorted_teams) // 4)
+            bottom_performers = sorted_teams[-bottom_count:]
+
+            top_text = "\n".join([f"🔥 **{team['name']}** - {team['week_score']:.1f} pts"
+                                for team in top_performers[:3]])  # Show top 3
+
+            bottom_text = "\n".join([f"📉 **{team['name']}** - {team['week_score']:.1f} pts"
+                                   for team in bottom_performers[:3]])  # Show bottom 3
+
+            embed.add_field(name="🚀 Hot This Week", value=top_text, inline=True)
+            embed.add_field(name="❄️ Cold This Week", value=bottom_text, inline=True)
+            embed.add_field(name="\u200b", value="\u200b", inline=True)  # Spacing
+
+        # Season trends
+        if teams_data:
+            season_leader = max(teams_data, key=lambda x: x['total_points'])
+            most_wins = max(teams_data, key=lambda x: x['wins'])
+
+            trends_text = f"👑 **Season Points Leader**\n{season_leader['name']} ({season_leader['total_points']:.1f} pts)\n\n"
+            trends_text += f"🏆 **Most Wins**\n{most_wins['name']} ({most_wins['wins']}-{most_wins['losses']})"
+
+            embed.add_field(name="📈 Season Trends", value=trends_text, inline=False)
+
+        # Quick tips
+        tips = [
+            "💡 Check waiver wire for breakout players",
+            "📊 Monitor player target share trends",
+            "🏥 Keep an eye on injury reports",
+            "📅 Plan ahead for bye weeks"
+        ]
+
+        embed.add_field(name="💡 Pro Tips", value="\n".join(tips), inline=False)
+        embed.set_footer(text=f"🔄 Last updated: Week {current_week} • Use /standings for detailed rankings")
+
+        await interaction.followup.send(embed=embed.build())
+
+    except Exception as e:
+        error_msg = f"❌ Error generating insights: {str(e)[:100]}"
+        print(f"Insights command error: {e}")
+        await interaction.followup.send(error_msg, ephemeral=True)
 
 @client.tree.command(name="welcome", description="Get started guide for using the Fantasy Football bot.")
 async def welcome(interaction: discord.Interaction):

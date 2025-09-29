@@ -7,11 +7,14 @@ A comprehensive Discord bot that integrates with ESPN Fantasy Football API to pr
 ## ✨ Features
 
 - **Multi-League Support** - Register and manage multiple ESPN Fantasy leagues
-- **Real-Time Data** - Live scoring, standings, and player statistics
-- **Advanced Analytics** - In-depth team comparisons, trade analysis, and waiver wire recommendations
+- **Real-Time Data** - Live scoring, standings, and player statistics with caching
+- **Advanced Analytics** - Power rankings, efficiency metrics, and weekly insights
+- **Smart Autocomplete** - Type-ahead suggestions for team and player names
+- **Background Refresh** - Automatic data updates for faster response times
 - **Interactive Commands** - Visual team cards, scoreboards, and matchup analysis
 - **Cross-League Comparisons** - Compare teams from different leagues
 - **Private League Support** - Full access to private ESPN leagues with authentication
+- **Performance Optimized** - 5-minute caching with sub-second response times
 
 ## 🚀 Quick Start
 
@@ -96,12 +99,14 @@ For **private leagues**, you'll need to get your ESPN authentication cookies:
 | `/player` | Get detailed stats for a specific player | `player_name` |
 | `/card` | Generate visual team card with stats | `team_name` |
 
-### 📊 League Information
+### 📊 League Information & Analytics
 
 | Command | Description | Parameters |
 |---------|-------------|------------|
-| `/standings` | View league standings with records | None |
+| `/standings` | View league standings with records (paginated) | None |
 | `/stats` | Show detailed league analytics | None |
+| `/insights` | Weekly analytics dashboard with trends | None |
+| `/detailed_stats` | Comprehensive analytics with power rankings | None |
 | `/scoreboard` | Live updating scoreboard for current week | `auto_refresh` (optional) |
 | `/league_info` | Display league settings and configuration | None |
 
@@ -125,7 +130,7 @@ For **private leagues**, you'll need to get your ESPN authentication cookies:
 | `/all_leagues` | View all available server leagues | None |
 | `/compare_cross_league` | Compare teams from different leagues | `team1`, `league1`, `team2`, `league2` |
 
-### 🛠️ Utility Commands
+### 🛠️ Utility & Debug Commands
 
 | Command | Description | Parameters |
 |---------|-------------|------------|
@@ -134,6 +139,9 @@ For **private leagues**, you'll need to get your ESPN authentication cookies:
 | `/welcome` | Complete setup and usage guide | None |
 | `/league_status` | Show current default league and status | None |
 | `/ping` | Check if bot is responsive | None |
+| `/test_new` | Test if new features are working | None |
+| `/sync_commands` | Manually sync commands (admin only) | None |
+| `/debug_autocomplete` | Test autocomplete functionality | None |
 
 ## 📸 Command Examples
 
@@ -148,6 +156,25 @@ For **private leagues**, you'll need to get your ESPN authentication cookies:
 
 ### `/stats` - League Analytics
 <img width="521" height="667" alt="League stats example" src="https://github.com/user-attachments/assets/92e6cb7e-ed93-4a7e-aa63-1a119d96b001" />
+
+## 🆕 Recent Improvements
+
+### Enhanced User Experience
+- **Smart Autocomplete** - All team and player commands now include type-ahead suggestions
+- **Visual Enhancements** - Position emojis (🏈 QB, 🏃‍♂️ RB, 🙌 WR) and status indicators (⚠️ Questionable, ❌ Out)
+- **Improved Layout** - Native Discord fields replace ASCII tables for better readability
+- **Pagination Support** - Large leagues automatically paginate standings and rosters
+
+### Performance Optimizations
+- **Background Refresh** - Data pre-loads every 3 minutes for instant responses
+- **Smart Caching** - 5-minute TTL cache reduces ESPN API calls by 80%
+- **Better Error Handling** - Helpful error messages with suggestions instead of technical errors
+- **Character Validation** - Automatic truncation prevents Discord message limit violations
+
+### New Analytics Commands
+- **`/insights`** - Weekly performance dashboard with hot/cold teams and trends
+- **`/detailed_stats`** - Advanced analytics with power rankings and efficiency metrics
+- **Enhanced `/compare`** - Side-by-side team analysis with win probability
 
 ## 🔧 Advanced Usage
 

@@ -138,16 +138,16 @@ For **private leagues**, you'll need to get your ESPN authentication cookies:
 ## 📸 Command Examples
 
 ### `/team` - Team Roster Display
-<img width="515" height="686" alt="Team roster example" src="https://github.com/user-attachments/assets/d084ace1-344b-4131-a261-4cd3ea05fb42" />
+><img width="436" height="517" alt="image" src="https://github.com/user-attachments/assets/2f539911-207a-4efe-9582-fae9725f1d3a" />
 
 ### `/compare` - Team Comparison
-<img width="534" height="336" alt="Team comparison example" src="https://github.com/user-attachments/assets/7d4f1b51-5837-48d4-a836-f66304dfea44" />
+><img width="397" height="238" alt="image" src="https://github.com/user-attachments/assets/58d50d66-b7a4-468f-a188-c7f89706367b" />
 
 ### `/standings` - League Standings
-<img width="570" height="479" alt="League standings example" src="https://github.com/user-attachments/assets/316d23b8-227b-450a-8c21-274dfe5f91bf" />
+><img width="509" height="259" alt="image" src="https://github.com/user-attachments/assets/912b854f-c0d0-4aed-93e7-fe59611063bc" />
 
 ### `/stats` - League Analytics
-<img width="521" height="667" alt="League stats example" src="https://github.com/user-attachments/assets/92e6cb7e-ed93-4a7e-aa63-1a119d96b001" />
+><img width="459" height="593" alt="image" src="https://github.com/user-attachments/assets/00650b95-e328-4962-b94a-bedbee56e5f7" />
 
 ## 🔧 Advanced Usage
 

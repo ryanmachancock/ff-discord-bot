@@ -3,3 +3,4 @@ espn-api
 python-dotenv
 tabulate
 Pillow
+aiohttp

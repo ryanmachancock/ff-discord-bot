@@ -13,6 +13,9 @@ user_leagues.json
 league_data.json
 user_data.json
 
+# Downloaded player headshots / team logos (fetched on demand, not source)
+cache/
+
 # Python
 __pycache__/
 *.py[cod]

@@ -1,0 +1,129 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Discord Embed Preview</title>
+<style>
+  body { background:#313338; color:#dbdee1; font-family: "gg sans", "Helvetica Neue", Arial, sans-serif; margin:0; padding:24px; display:flex; gap:24px; }
+  textarea { width:480px; height:80vh; background:#1e1f22; color:#dbdee1; border:1px solid #1e1f22; border-radius:6px; padding:12px; font-family: Consolas, monospace; font-size:13px; }
+  button { margin-top:8px; padding:8px 16px; background:#5865f2; color:white; border:none; border-radius:4px; cursor:pointer; font-size:14px; }
+  #err { color:#f23f42; margin-top:8px; white-space:pre-wrap; font-family: Consolas, monospace; font-size:12px; }
+  .preview-col { flex:1; }
+  .msg { display:flex; gap:16px; max-width:520px; }
+  .avatar { width:40px; height:40px; border-radius:50%; background:#5865f2; flex-shrink:0; }
+  .body { flex:1; min-width:0; }
+  .author-line { font-weight:600; color:#f2f3f5; }
+  .embed { display:flex; margin-top:8px; max-width:432px; background:#2b2d31; border-radius:4px; }
+  .embed-bar { width:4px; border-radius:4px 0 0 4px; flex-shrink:0; }
+  .embed-body { padding:8px 16px 16px; flex:1; min-width:0; }
+  .embed-title { font-weight:600; color:#f2f3f5; margin-bottom:8px; white-space:pre-wrap; }
+  .embed-desc { white-space:pre-wrap; font-size:14px; line-height:1.375; color:#dbdee1; }
+  .fields { display:flex; flex-wrap:wrap; margin-top:8px; gap:8px 0; }
+  .field { padding-right:8px; box-sizing:border-box; }
+  .field.inline { flex:1 1 150px; max-width:33%; }
+  .field.block { flex:1 1 100%; }
+  .field-name { font-weight:600; font-size:14px; color:#f2f3f5; white-space:pre-wrap; }
+  .field-value { font-size:14px; line-height:1.375; white-space:pre-wrap; color:#dbdee1; }
+  .embed-footer { margin-top:8px; font-size:12px; color:#949ba4; }
+  .embed-thumb { width:80px; height:80px; object-fit:cover; border-radius:4px; float:right; margin-left:16px; }
+  .charcount { font-size:12px; color:#949ba4; margin-top:4px; }
+  .over { color:#f23f42; font-weight:600; }
+</style>
+</head>
+<body>
+  <div>
+    <div>Paste one embed dict (Discord embed JSON shape, e.g. what <code>SafeEmbedBuilder.build()</code> / <code>discord.Embed.to_dict()</code> produces):</div>
+    <textarea id="input"></textarea><br>
+    <button onclick="render()">Render</button>
+    <div id="err"></div>
+    <div id="charcount" class="charcount"></div>
+  </div>
+  <div class="preview-col">
+    <div class="msg">
+      <div class="avatar"></div>
+      <div class="body">
+        <div class="author-line">FF Bot <span style="color:#949ba4;font-weight:400;font-size:12px;">Today at 12:00 PM</span></div>
+        <div id="out"></div>
+      </div>
+    </div>
+  </div>
+
+<script>
+const sample = {
+  title: "🏆 League Standings",
+  description: "Week 5 • Regular Season",
+  color: 0x0099ff,
+  fields: [
+    { name: "1. Team Alpha", value: "5-0 • 620.4 pts", inline: false },
+    { name: "PF", value: "620.4", inline: true },
+    { name: "PA", value: "480.1", inline: true },
+    { name: "Streak", value: "W5", inline: true }
+  ],
+  footer: { text: "Use /team <name> for a roster • Updated 2m ago" }
+};
+document.getElementById('input').value = JSON.stringify(sample, null, 2);
+
+function intToHex(n) {
+  if (typeof n !== 'number') return '#5865f2';
+  return '#' + n.toString(16).padStart(6, '0');
+}
+
+function charCount(embed) {
+  let total = 0;
+  total += (embed.title || '').length;
+  total += (embed.description || '').length;
+  total += (embed.footer && embed.footer.text || '').length;
+  total += (embed.author && embed.author.name || '').length;
+  (embed.fields || []).forEach(f => { total += (f.name || '').length + (f.value || '').length; });
+  return total;
+}
+
+function render() {
+  const err = document.getElementById('err');
+  const out = document.getElementById('out');
+  const cc = document.getElementById('charcount');
+  err.textContent = '';
+  let embed;
+  try {
+    embed = JSON.parse(document.getElementById('input').value);
+  } catch (e) {
+    err.textContent = 'Invalid JSON: ' + e.message;
+    return;
+  }
+
+  const total = charCount(embed);
+  cc.innerHTML = `Total embed characters: <span class="${total > 6000 ? 'over' : ''}">${total} / 6000</span>`
+    + (embed.fields && embed.fields.length > 25 ? ' <span class="over">(over 25 field limit)</span>' : '');
+
+  let fieldsHtml = '';
+  (embed.fields || []).forEach(f => {
+    fieldsHtml += `<div class="field ${f.inline ? 'inline' : 'block'}">
+      <div class="field-name">${escapeHtml(f.name || '')}</div>
+      <div class="field-value">${escapeHtml(f.value || '')}</div>
+    </div>`;
+  });
+
+  const thumbUrl = embed.thumbnail && embed.thumbnail.url;
+
+  out.innerHTML = `
+    <div class="embed">
+      <div class="embed-bar" style="background:${intToHex(embed.color)}"></div>
+      <div class="embed-body">
+        ${thumbUrl ? `<img class="embed-thumb" src="${thumbUrl}">` : ''}
+        ${embed.title ? `<div class="embed-title">${escapeHtml(embed.title)}</div>` : ''}
+        ${embed.description ? `<div class="embed-desc">${escapeHtml(embed.description)}</div>` : ''}
+        <div class="fields">${fieldsHtml}</div>
+        ${embed.footer && embed.footer.text ? `<div class="embed-footer">${escapeHtml(embed.footer.text)}</div>` : ''}
+      </div>
+    </div>
+  `;
+}
+
+function escapeHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+render();
+</script>
+</body>
+</html>

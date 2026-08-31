@@ -39,10 +39,18 @@ render for that row, exactly like a bye-week/non-live player today.
 
 import io
 import math
+import itertools
 from PIL import Image, ImageDraw, ImageFont
 
 SCALE = 2  # render at 2x the CSS mockup's logical pixels for a crisp PNG
 CARD_W = 640 * SCALE
+# Discord fits inline attachment previews inside a ~400x300 box. Our cards are
+# tall (many stacked rows), so the ~300px HEIGHT cap is what actually governs
+# the shrink for nearly all of them -- not width. Shrinking CARD_W (tried and
+# reverted) only raises the font/canvas ratio on the width axis, which has no
+# effect when height is the binding constraint: it just increases name
+# truncation for zero visible size gain. Making cards legible without a click
+# requires reducing their total pixel HEIGHT (shorter rows/header), not width.
 
 
 def px(v):
@@ -234,8 +242,11 @@ def _football_icon(draw, x, y, w, h):
 
 
 def render_team_card(data: dict) -> io.BytesIO:
+    """Starters only -- bench players live in their own /bench card now (see
+    render_bench_card) so this card can afford full two-line rows without
+    tripping Discord's ~300px inline-preview height cap on a 12+ row list."""
     starters = data['starters']
-    bench = data.get('bench', [])
+    bench_count = data.get('bench_count', 0)
 
     f_team_name = _font('impact', px(26))
     f_team_meta = _font('bold', px(11))
@@ -246,13 +257,12 @@ def render_team_card(data: dict) -> io.BytesIO:
     f_player_name = _font('bold', px(13))
     f_tag = _font('bold', px(9.5))
     f_player_sub = _font('regular', px(11.5))
-    f_score_bug = _font('bold', px(11))
-    f_score_bug_b = _font('bold', px(11))
     f_pts_actual = _font('impact', px(17))
     f_pts_proj = _font('regular', px(10.5))
     f_total_label = _font('bold', px(11))
     f_total_val = _font('impact', px(20))
     f_total_val_sm = _font('regular', px(12))
+    f_footer = _font('bold', px(10))
 
     # ---- pass 1: measure heights ----
     HEADER_H = px(96) if data.get('live_games_count', 0) > 0 else px(78)
@@ -260,19 +270,14 @@ def render_team_card(data: dict) -> io.BytesIO:
     ROW_H_BASE = px(46)
     ROW_H_LIVE = px(60)
     TOTAL_ROW_H = px(38)
-    BENCH_TOP = px(2)
-    BENCH_BOTTOM_PAD = px(14)
+    FOOTER_H = px(26) if bench_count else 0
 
     def row_h(row):
         return ROW_H_LIVE if row.get('live') else ROW_H_BASE
 
     starters_h = sum(row_h(r) for r in starters)
-    bench_h = sum(ROW_H_BASE for _ in bench)
 
-    total_h = (
-        HEADER_H + SECTION_HDR_H + starters_h + TOTAL_ROW_H +
-        BENCH_TOP + (SECTION_HDR_H + bench_h + BENCH_BOTTOM_PAD if bench else 0)
-    )
+    total_h = HEADER_H + SECTION_HDR_H + starters_h + TOTAL_ROW_H + FOOTER_H
 
     img = Image.new("RGB", (CARD_W, total_h), ROSTER_BG)
     draw = ImageDraw.Draw(img)
@@ -379,12 +384,13 @@ def render_team_card(data: dict) -> io.BytesIO:
             if live.get('possession'):
                 _football_icon(draw, sb_x, sb_y + px(3), px(10), px(7))
                 sb_x += px(14)
+            f_score_bug = _font('bold', px(11))
             line1 = f"{live['team_abbr']} "
             draw.text((sb_x, sb_y), line1, font=f_score_bug, fill=F(PTS_MUTED))
             sb_x += _tw(draw, line1, f_score_bug)
             score = f"{live['team_score']}\u2013{live['opp_score']}"
-            draw.text((sb_x, sb_y), score, font=f_score_bug_b, fill=F(PTS_DARK))
-            sb_x += _tw(draw, score, f_score_bug_b)
+            draw.text((sb_x, sb_y), score, font=f_score_bug, fill=F(PTS_DARK))
+            sb_x += _tw(draw, score, f_score_bug)
             line2 = f" {live['opp_abbr']}"
             draw.text((sb_x, sb_y), line2, font=f_score_bug, fill=F(PTS_MUTED))
             sb_x += _tw(draw, line2, f_score_bug)
@@ -428,20 +434,12 @@ def render_team_card(data: dict) -> io.BytesIO:
     draw.text((tx + taw, y + px(12)), total_proj, font=f_total_val_sm, fill=(159, 202, 168))
     y += TOTAL_ROW_H
 
-    # ---- bench ----
-    if bench:
-        y += BENCH_TOP
-        draw.rectangle((0, y - BENCH_TOP, CARD_W, y), fill=ROSTER_BG)
-        _dashed_hline(draw, 0, CARD_W, y, (185, 194, 179), width=max(1, px(1)), dash=8, gap=5)
-        section_header(y, "Bench")
-        y += SECTION_HDR_H
-        for i, row in enumerate(bench):
-            h = ROW_H_BASE
-            base_bg = ROSTER_ZEBRA if i % 2 == 1 else ROSTER_BG
-            draw.rectangle((0, y, CARD_W, y + h), fill=_fade(base_bg, BENCH_FADE))
-            draw_row(y, h, row, faded=True)
-            y += h
-        draw.rectangle((0, y, CARD_W, y + BENCH_BOTTOM_PAD), fill=ROSTER_BG)
+    # ---- footer: bench players moved to their own /bench card ----
+    if bench_count:
+        draw.rectangle((0, y, CARD_W, y + FOOTER_H), fill=ROSTER_BG)
+        hint = f"{bench_count} Bench Player{'s' if bench_count != 1 else ''}  ·  /bench {data['team_name']}"
+        hw = _tw(draw, hint, f_footer)
+        draw.text(((CARD_W - hw) / 2, y + FOOTER_H // 2 - px(6)), hint, font=f_footer, fill=PLAYER_SUB_GRAY)
 
     buf = io.BytesIO()
     img.save(buf, format="PNG")
@@ -602,11 +600,13 @@ def _centered_section_header(draw, y, h, label, font):
 
 
 def render_matchup_card(data: dict) -> io.BytesIO:
-    """Data contract:
+    """Starters only -- bench players live in their own /bench card now (see
+    render_bench_card).
+    Data contract:
     {
       'team1': {'name','owner','record','logo_path','score'}, 'team2': {same},
       'header_sub': str ("Final · Week 17"),
-      'starters': [ROW, ...], 'bench': [ROW, ...],
+      'starters': [ROW, ...], 'bench_count1': int, 'bench_count2': int,
       'totals': {'left': float, 'right': float},
     }
     ROW = {
@@ -615,7 +615,9 @@ def render_matchup_card(data: dict) -> io.BytesIO:
     SIDE = {'name': str, 'position': str, 'headshot_path': str or None,
             'is_logo': bool, 'pts': float, 'proj': float, 'win': True/False/None}
     """
-    starters, bench = data['starters'], data.get('bench', [])
+    starters = data['starters']
+    bench_count1 = data.get('bench_count1', 0)
+    bench_count2 = data.get('bench_count2', 0)
 
     f_mu_name = _font('bold', px(14))
     f_mu_record = _font('bold', px(11))
@@ -629,14 +631,14 @@ def render_matchup_card(data: dict) -> io.BytesIO:
     f_proj = _font('regular', px(9))
     f_total_label = _font('bold', px(11))
     f_total_val = _font('impact', px(18))
-    f_section_label = _font('bold', px(10))
+    f_footer = _font('bold', px(10))
 
     HEADER_H = px(92)
     ROW_H = px(40)
     TOTAL_ROW_H = px(38)
-    SECTION_HDR_H = px(30)
+    FOOTER_H = px(26) if (bench_count1 or bench_count2) else 0
 
-    total_h = HEADER_H + ROW_H * len(starters) + TOTAL_ROW_H + (SECTION_HDR_H + ROW_H * len(bench) if bench else 0)
+    total_h = HEADER_H + ROW_H * len(starters) + TOTAL_ROW_H + FOOTER_H
     img = Image.new("RGB", (CARD_W, total_h), ROSTER_BG)
     _turf_stripes(img, (0, 0, CARD_W, HEADER_H), TURF_C1, TURF_C2, px(42))
     draw = ImageDraw.Draw(img)
@@ -756,22 +758,258 @@ def render_matchup_card(data: dict) -> io.BytesIO:
     draw.text((x_pts2 + (col_pts_w - t2w) / 2, y + TOTAL_ROW_H // 2 - px(9)), t2_str, font=f_total_val, fill=PTS_MUTED if win_total else PTS_DARK)
     y += TOTAL_ROW_H
 
-    if bench:
-        draw.rectangle((0, y, CARD_W, y + SECTION_HDR_H), fill=ROSTER_BG)
-        _centered_section_header(draw, y, SECTION_HDR_H, "BENCH", f_section_label)
+    # ---- footer: bench players moved to their own /bench card ----
+    if bench_count1 or bench_count2:
+        draw.rectangle((0, y, CARD_W, y + FOOTER_H), fill=ROSTER_BG)
+        hint = f"{bench_count1} vs {bench_count2} Bench Players  ·  /bench {t1['name']} {t2['name']}"
+        hw = _tw(draw, hint, f_footer)
+        draw.text(((CARD_W - hw) / 2, y + FOOTER_H // 2 - px(6)), hint, font=f_footer, fill=PLAYER_SUB_GRAY)
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return buf
+
+
+def render_bench_card(data: dict) -> io.BytesIO:
+    """Bench-only view, split out of /team and /matchup so those cards can
+    keep full two-line starter rows without tripping Discord's inline-preview
+    height cap. Two modes, chosen by whether 'team2' is present:
+
+    Single-team mode:
+    { 'team1': {'name','owner','record','logo_path'}, 'bench1': [ROW, ...] }
+    ROW = {'slot','position','name','team_abbr','opp_abbr','headshot_path',
+           'is_logo','status','actual','proj'}  (same shape as /team's rows)
+
+    Two-team mode adds:
+    { 'team2': {same as team1}, 'bench2': [ROW, ...] }
+    """
+    dual = 'team2' in data
+    t1 = data['team1']
+    bench1 = data['bench1']
+
+    f_team_name = _font('impact', px(22))
+    f_team_meta = _font('bold', px(11))
+    f_bench_label = _font('impact', px(16))
+    f_section_hdr = _font('bold', px(10))
+    f_player_name = _font('bold', px(13))
+    f_tag = _font('bold', px(9.5))
+    f_player_sub = _font('regular', px(11.5))
+    f_pts_actual = _font('impact', px(17))
+    f_pts_proj = _font('regular', px(10.5))
+    f_total_label = _font('bold', px(11))
+    f_total_val = _font('impact', px(20))
+
+    HEADER_H = px(72)
+    SECTION_HDR_H = px(30)
+    ROW_H = px(46)
+    TOTAL_ROW_H = px(38)
+
+    if not dual:
+        total_h = HEADER_H + SECTION_HDR_H + ROW_H * len(bench1) + TOTAL_ROW_H
+        img = Image.new("RGB", (CARD_W, total_h), ROSTER_BG)
+        _turf_stripes(img, (0, 0, CARD_W, HEADER_H), TURF_C1, TURF_C2, px(42))
+        draw = ImageDraw.Draw(img)
+
+        pad_l, pad_r = px(22), px(22)
+        logo_r = px(20)
+        logo_cx, logo_cy = pad_l + logo_r, HEADER_H // 2
+        _circle_image(img, t1.get('logo_path'), logo_cx, logo_cy, logo_r, border_color=(255, 255, 255, 150),
+                      border_w=px(2), fallback_text=t1['name'], fallback_bg=FALLBACK_BG)
+        text_x = logo_cx + logo_r + px(12)
+        draw.text((text_x, HEADER_H // 2 - px(18)), t1['name'].upper(), font=f_team_name, fill=WHITE)
+        draw.text((text_x, HEADER_H // 2 + px(4)), f"{t1['owner']} · {t1['record']}", font=f_team_meta, fill=TEAM_META)
+        label_w = _tw(draw, "BENCH", f_bench_label)
+        draw.text((CARD_W - pad_r - label_w, HEADER_H // 2 - px(11)), "BENCH", font=f_bench_label, fill=WHITE)
+
+        def section_header(y, label):
+            draw.text((px(8), y + px(9)), label.upper(), font=f_section_hdr, fill=SECTION_HDR_GREEN)
+            proj_w = _tw(draw, "PROJ", f_section_hdr)
+            draw.text((CARD_W - px(22) - proj_w, y + px(9)), "PROJ", font=f_section_hdr, fill=SECTION_HDR_GREEN)
+            _dashed_hline(draw, 0, CARD_W, y + SECTION_HDR_H, SECTION_HDR_BORDER, width=max(1, px(0.5)))
+
+        def draw_row(y, h, row):
+            draw.rectangle((0, y, CARD_W, y + h), fill=ROSTER_BG)
+            _dashed_vline(draw, 0, y, y + h, DASH_SIDELINE, width=max(1, px(1.5)))
+
+            cx = px(8 + 17)
+            cy = y + h // 2
+            is_dst = row.get('is_logo', False)
+            _circle_image(img, row.get('headshot_path'), cx, cy, px(17),
+                          border_color=HEADSHOT_BORDER, border_w=max(1, px(0.5)),
+                          fallback_text=row['name'], contain=is_dst, bg=HEADSHOT_BG)
+
+            badge_x = px(8 + 34 + 8)
+            badge_w, badge_h = px(40), px(19)
+            badge_y = y + h // 2 - badge_h // 2
+            draw.rounded_rectangle((badge_x, badge_y, badge_x + badge_w, badge_y + badge_h), radius=px(3), fill=POS_BADGE_BG)
+            slot = row['slot']
+            sw = _tw(draw, slot, f_tag)
+            draw.text((badge_x + (badge_w - sw) / 2, badge_y + px(3)), slot, font=f_tag, fill=POS_BADGE_FG)
+
+            info_x = badge_x + badge_w + px(8)
+            info_right = CARD_W - px(22) - px(56)
+            text_top = y + px(6)
+
+            nx = info_x
+            name_txt = _ellipsize(draw, row['name'], f_player_name, (info_right - info_x) * 0.62)
+            draw.text((nx, text_top), name_txt, font=f_player_name, fill=PTS_DARK)
+            nx += _tw(draw, name_txt, f_player_name) + px(6)
+            nx = _chip(draw, nx, text_top + px(2), row['position'], f_tag, POS_BADGE_FG, POS_BADGE_BG)
+            if row.get('status') == 'Q':
+                _chip(draw, nx + px(4), text_top + px(2), "Q", f_tag, STATUS_Q_FG, STATUS_Q_BG)
+            elif row.get('status') == 'O':
+                _chip(draw, nx + px(4), text_top + px(2), "O", f_tag, STATUS_OUT_FG, STATUS_OUT_BG)
+
+            sub = f"{row.get('team_abbr', '')} vs {row.get('opp_abbr', '')}".strip()
+            draw.text((info_x, text_top + px(19)), sub, font=f_player_sub, fill=PLAYER_SUB_GRAY)
+
+            pts_actual = f"{row['actual']:.1f}"
+            pts_proj = f"proj {row['proj']:.1f}"
+            pw = _tw(draw, pts_actual, f_pts_actual)
+            pts_y = y + h // 2 - px(15)
+            draw.text((CARD_W - px(22) - pw, pts_y), pts_actual, font=f_pts_actual, fill=PTS_DARK)
+            pjw = _tw(draw, pts_proj, f_pts_proj)
+            draw.text((CARD_W - px(22) - pjw, pts_y + px(19)), pts_proj, font=f_pts_proj, fill=PTS_MUTED)
+
+        y = HEADER_H
+        section_header(y, "Bench")
         y += SECTION_HDR_H
-        for i, row in enumerate(bench):
+        for i, row in enumerate(bench1):
             if i % 2 == 1:
                 draw.rectangle((0, y, CARD_W, y + ROW_H), fill=ROSTER_ZEBRA)
-            bw = _tw(draw, row['slot'], f_badge)
-            draw.rounded_rectangle((x_badge, y + ROW_H // 2 - px(10), x_badge + col_badge_w, y + ROW_H // 2 + px(10)), radius=px(3), fill=POS_BADGE_BG)
-            draw.text((x_badge + (col_badge_w - bw) / 2, y + ROW_H // 2 - px(7)), row['slot'], font=f_badge, fill=POS_BADGE_FG)
-            draw_side(x_name1, x_avatar1, row['left'], False, y, ROW_H)
-            draw_pts(x_pts1, row['left'], y, ROW_H)
-            draw.line((x_div + col_div_w / 2, y + px(6), x_div + col_div_w / 2, y + ROW_H - px(6)), fill=HEADSHOT_BORDER, width=max(1, px(0.5)))
-            draw_pts(x_pts2, row['right'], y, ROW_H)
-            draw_side(x_name2, x_avatar2, row['right'], True, y, ROW_H)
+            draw_row(y, ROW_H, row)
             y += ROW_H
+
+        draw.rectangle((0, y, CARD_W, y + TOTAL_ROW_H), fill=TOTAL_ROW_BG)
+        draw.rectangle((0, y, CARD_W, y + max(1, px(1))), fill=SECTION_HDR_GREEN)
+        draw.text((px(22), y + px(9)), "BENCH TOTAL", font=f_total_label, fill=SECTION_HDR_GREEN)
+        total_actual = sum(r['actual'] for r in bench1)
+        total_str = f"{total_actual:.1f}"
+        taw = _tw(draw, total_str, f_total_val)
+        draw.text((CARD_W - px(22) - taw, y + px(8)), total_str, font=f_total_val, fill=PTS_DARK)
+
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        buf.seek(0)
+        return buf
+
+    # ---- two-team mirrored mode ----
+    t2 = data['team2']
+    bench2 = data['bench2']
+    rows = list(itertools.zip_longest(bench1, bench2))
+
+    f_mu_name = _font('bold', px(14))
+    f_mu_record = _font('bold', px(11))
+    f_pname = _font('regular', px(12))
+    f_pos_tag = _font('bold', px(9))
+    f_pts = _font('bold', px(14))
+    f_proj = _font('regular', px(9))
+
+    ROW_H2 = px(40)
+    total_h = HEADER_H + ROW_H2 * len(rows)
+    img = Image.new("RGB", (CARD_W, total_h), ROSTER_BG)
+    _turf_stripes(img, (0, 0, CARD_W, HEADER_H), TURF_C1, TURF_C2, px(42))
+    draw = ImageDraw.Draw(img)
+
+    pad_l, pad_r = px(22), px(22)
+    logo_r = px(20)
+    label_w = _tw(draw, "BENCH", f_bench_label)
+    label_x = (CARD_W - label_w) / 2
+    team_y = HEADER_H // 2
+
+    logo1_cx = pad_l + logo_r
+    _circle_image(img, t1.get('logo_path'), logo1_cx, team_y, logo_r, border_color=(255, 255, 255, 150), border_w=px(2), fallback_text=t1['name'])
+    text1_x = logo1_cx + logo_r + px(10)
+    name1 = _ellipsize(draw, t1['name'], f_mu_name, label_x - px(12) - text1_x)
+    draw.text((text1_x, team_y - px(16)), name1, font=f_mu_name, fill=WHITE)
+    draw.text((text1_x, team_y + px(4)), f"{t1['owner']} · {t1['record']}", font=f_mu_record, fill=TEAM_META)
+
+    logo2_cx = CARD_W - pad_r - logo_r
+    _circle_image(img, t2.get('logo_path'), logo2_cx, team_y, logo_r, border_color=(255, 255, 255, 150), border_w=px(2), fallback_text=t2['name'])
+    text2_right = logo2_cx - logo_r - px(10)
+    name2 = _ellipsize(draw, t2['name'], f_mu_name, text2_right - (label_x + label_w + px(12)))
+    n2w = _tw(draw, name2, f_mu_name)
+    draw.text((text2_right - n2w, team_y - px(16)), name2, font=f_mu_name, fill=WHITE)
+    rec2 = f"{t2['owner']} · {t2['record']}"
+    r2w = _tw(draw, rec2, f_mu_record)
+    draw.text((text2_right - r2w, team_y + px(4)), rec2, font=f_mu_record, fill=TEAM_META)
+
+    draw.text((label_x, team_y - px(8)), "BENCH", font=f_bench_label, fill=WHITE)
+
+    col_badge_w, col_avatar_w, col_pts_w, col_div_w = px(30), px(24), px(44), px(12)
+    row_pad_l, row_pad_r = px(8), px(22)
+    gap6 = px(6)
+    fixed_w = col_badge_w + col_avatar_w + col_pts_w + col_div_w + col_pts_w + col_avatar_w
+    inner_w = CARD_W - row_pad_l - row_pad_r
+    name_col_w = (inner_w - fixed_w - gap6 * 7) / 2
+
+    x_badge = row_pad_l
+    x_avatar1 = x_badge + col_badge_w + gap6
+    x_name1 = x_avatar1 + col_avatar_w + gap6
+    x_pts1 = x_name1 + name_col_w + gap6
+    x_div = x_pts1 + col_pts_w + gap6
+    x_pts2 = x_div + col_div_w + gap6
+    x_name2 = x_pts2 + col_pts_w + gap6
+    x_avatar2 = x_name2 + name_col_w + gap6
+
+    EMPTY_SIDE = {'name': '', 'position': '', 'headshot_path': None, 'is_logo': False, 'actual': 0.0, 'proj': 0.0}
+
+    def draw_side(x_name, x_avatar, row, align_right, y, h):
+        is_dst = row.get('is_logo', False)
+        cx = x_avatar + col_avatar_w // 2
+        _circle_image(img, row.get('headshot_path'), cx, y + h // 2, col_avatar_w // 2,
+                      border_color=HEADSHOT_BORDER, border_w=max(1, px(0.5)),
+                      fallback_text=row['name'] or '?', contain=is_dst)
+        if not row['name']:
+            return
+        status = row.get('status')
+        tag_w = _tw(draw, row['position'], f_pos_tag) + px(10)
+        status_w = (_tw(draw, status, f_pos_tag) + px(10) + px(4)) if status else 0
+        name_avail = name_col_w - tag_w - status_w - px(4)
+        name_txt = _ellipsize(draw, row['name'], f_pname, name_avail)
+        name_y = y + h // 2 - px(7)
+        status_fg, status_bg = (STATUS_Q_FG, STATUS_Q_BG) if status == 'Q' else (STATUS_OUT_FG, STATUS_OUT_BG)
+        if not align_right:
+            draw.text((x_name, name_y), name_txt, font=f_pname, fill=PTS_DARK)
+            tag_x = x_name + _tw(draw, name_txt, f_pname) + px(4)
+            tag_x = _chip(draw, tag_x, name_y - px(1), row['position'], f_pos_tag, POS_BADGE_FG, POS_BADGE_BG)
+            if status:
+                _chip(draw, tag_x + px(4), name_y - px(1), status, f_pos_tag, status_fg, status_bg)
+        else:
+            nw = _tw(draw, name_txt, f_pname)
+            tag_x = x_name + name_col_w - tag_w - status_w
+            name_x = tag_x - px(4) - nw
+            draw.text((name_x, name_y), name_txt, font=f_pname, fill=PTS_DARK)
+            tag_x = _chip(draw, tag_x, name_y - px(1), row['position'], f_pos_tag, POS_BADGE_FG, POS_BADGE_BG)
+            if status:
+                _chip(draw, tag_x + px(4), name_y - px(1), status, f_pos_tag, status_fg, status_bg)
+
+    def draw_pts(x, row, y, h):
+        if not row['name']:
+            return
+        pts_str = f"{row['actual']:.1f}"
+        pw = _tw(draw, pts_str, f_pts)
+        draw.text((x + (col_pts_w - pw) / 2, y + h // 2 - px(13)), pts_str, font=f_pts, fill=PTS_DARK)
+        proj_str = f"proj {row['proj']:.1f}"
+        prw = _tw(draw, proj_str, f_proj)
+        draw.text((x + (col_pts_w - prw) / 2, y + h // 2 + px(3)), proj_str, font=f_proj, fill=MU_MUTED)
+
+    y = HEADER_H
+    for i, (l, r) in enumerate(rows):
+        l, r = l or EMPTY_SIDE, r or EMPTY_SIDE
+        if i % 2 == 1:
+            draw.rectangle((0, y, CARD_W, y + ROW_H2), fill=ROSTER_ZEBRA)
+        slot = l['slot'] if l['name'] else (r['slot'] if r['name'] else 'BE')
+        bw = _tw(draw, slot, f_pos_tag)
+        draw.rounded_rectangle((x_badge, y + ROW_H2 // 2 - px(10), x_badge + col_badge_w, y + ROW_H2 // 2 + px(10)), radius=px(3), fill=POS_BADGE_BG)
+        draw.text((x_badge + (col_badge_w - bw) / 2, y + ROW_H2 // 2 - px(7)), slot, font=f_pos_tag, fill=POS_BADGE_FG)
+        draw_side(x_name1, x_avatar1, l, False, y, ROW_H2)
+        draw_pts(x_pts1, l, y, ROW_H2)
+        draw.line((x_div + col_div_w / 2, y + px(6), x_div + col_div_w / 2, y + ROW_H2 - px(6)), fill=HEADSHOT_BORDER, width=max(1, px(0.5)))
+        draw_pts(x_pts2, r, y, ROW_H2)
+        draw_side(x_name2, x_avatar2, r, True, y, ROW_H2)
+        y += ROW_H2
 
     buf = io.BytesIO()
     img.save(buf, format="PNG")
@@ -1723,21 +1961,12 @@ if __name__ == "__main__":
             {'slot': 'K', 'position': 'K', 'name': "Ka'imi Fairbairn", 'team_abbr': 'HOU', 'opp_abbr': 'JAX',
              'headshot_path': p[2971573], 'actual': 10.0, 'proj': 7.7},
         ]
-        bench = [
-            {'slot': 'BE', 'position': 'TE', 'name': 'Oronde Gadsden', 'team_abbr': 'LAC', 'opp_abbr': 'DEN',
-             'headshot_path': p[4595342], 'actual': 12.2, 'proj': 6.6},
-            {'slot': 'BE', 'position': 'WR', 'name': 'Josh Downs', 'team_abbr': 'IND', 'opp_abbr': 'LAR',
-             'headshot_path': p[4688813], 'actual': 5.4, 'proj': 9.5},
-            {'slot': 'BE', 'position': 'QB', 'name': 'C.J. Stroud', 'team_abbr': 'HOU', 'opp_abbr': 'JAX',
-             'headshot_path': p[4432577], 'status': 'O', 'actual': 17.8, 'proj': 17.2},
-        ]
-
         data = {
             'team_name': 'CeeDeez Nutz', 'owner_name': 'Ryan', 'record': '6-8',
             'rank': 9, 'total_teams': 12, 'current_week': 17,
             'proj_record': '7-7', 'proj_record_note': 'unlucky',
             'live_games_count': 2,
-            'starters': starters, 'bench': bench,
+            'starters': starters, 'bench_count': 3,
             'starters_total_actual': sum(r['actual'] for r in starters),
             'starters_total_proj': sum(r['proj'] for r in starters),
         }
@@ -1831,7 +2060,7 @@ if __name__ == "__main__":
             'team2': {'name': "Tyler's Mediocre team", 'owner': 'Tyler', 'record': '6-8', 'score': 50.6,
                       'logo_path': logos[logo_urls['tylers']]},
             'header_sub': 'Final · Week 17',
-            'starters': starters, 'bench': bench,
+            'starters': starters, 'bench_count1': len(bench), 'bench_count2': len(bench),
             'totals': {'left': sum(r['left']['pts'] for r in starters), 'right': sum(r['right']['pts'] for r in starters)},
         }
         buf = render_matchup_card(data)
@@ -1889,6 +2118,54 @@ if __name__ == "__main__":
         print("OK: wrote scoreboard_card_demo.png")
 
     asyncio.run(demo_matchup())
+
+    async def demo_bench():
+        from image_cache import get_logos_by_url
+        bench1_raw = [
+            (4595342, 'Oronde Gadsden', 'TE', 'LAC', 'DEN', 12.2, 6.6),
+            (4688813, 'Josh Downs', 'WR', 'IND', 'LAR', 5.4, 9.5),
+            (4432577, 'C.J. Stroud', 'QB', 'HOU', 'JAX', 17.8, 17.2, 'O'),
+        ]
+        bench2_raw = [
+            (4374302, 'Amon-Ra St. Brown', 'WR', 'DET', 'MIN', 14.8, 19.4),
+            (4569618, 'Garrett Wilson', 'WR', 'NYJ', 'MIA', 0.0, 0.0),
+            (3128720, 'Nick Chubb', 'RB', 'HOU', 'JAX', 0.1, 2.9),
+            (4361741, 'Brock Purdy', 'QB', 'SF', 'SEA', 42.9, 23.7),
+        ]
+        ids = [r[0] for r in bench1_raw] + [r[0] for r in bench2_raw]
+        images = await get_images(player_ids=ids, team_abbrs=[])
+        p = images['players']
+
+        def row(pid, name, pos, team_abbr, opp_abbr, actual, proj, status=None):
+            r = {'slot': 'BE', 'position': pos, 'name': name, 'team_abbr': team_abbr, 'opp_abbr': opp_abbr,
+                 'headshot_path': p[pid], 'is_logo': False, 'actual': actual, 'proj': proj}
+            if status:
+                r['status'] = status
+            return r
+
+        bench1 = [row(*r) for r in bench1_raw]
+        bench2 = [row(*r) for r in bench2_raw]
+
+        logo_urls = {
+            'ceedeez': 'https://g.espncdn.com/lm-static/logo-packs/ffl/8bitHeros-JoeyEllis/8bit_football-08.svg',
+            'tylers': 'https://i.pinimg.com/564x/ce/f2/0c/cef20cffa0a0c5c9d20e9484392a2534.jpg',
+        }
+        logos = await get_logos_by_url(list(logo_urls.values()))
+        team1 = {'name': 'CeeDeez Nutz', 'owner': 'Ryan', 'record': '6-8', 'logo_path': logos[logo_urls['ceedeez']]}
+        team2 = {'name': "Tyler's Mediocre team", 'owner': 'Tyler', 'record': '6-8', 'logo_path': logos[logo_urls['tylers']]}
+
+        buf = render_bench_card({'team1': team1, 'bench1': bench1})
+        with open("bench_single_demo.png", "wb") as f:
+            f.write(buf.read())
+        print("OK: wrote bench_single_demo.png")
+
+        buf = render_bench_card({'team1': team1, 'bench1': bench1, 'team2': team2, 'bench2': bench2})
+        with open("bench_dual_demo.png", "wb") as f:
+            f.write(buf.read())
+        print("OK: wrote bench_dual_demo.png")
+
+    asyncio.run(demo_bench())
+
     async def demo_player():
         images = await get_images(player_ids=[4361741], team_abbrs=['sf'])
         data = {

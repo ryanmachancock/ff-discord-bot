@@ -3,7 +3,6 @@ print("Starting Fantasy Football bot...")
 import os
 import asyncio
 import statistics
-import itertools
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -14,7 +13,7 @@ from tabulate import tabulate
 import json
 import time
 from typing import Dict, Any, Optional
-from image_render import render_team_card, render_standings_card, render_matchup_card, render_scoreboard_card, render_player_card, render_player_list_card, render_compare_card, render_trade_card, render_stat_tiles_card, render_power_rankings_card, render_league_pulse_card, render_league_info_card
+from image_render import render_team_card, render_standings_card, render_matchup_card, render_scoreboard_card, render_player_card, render_player_list_card, render_compare_card, render_trade_card, render_stat_tiles_card, render_power_rankings_card, render_league_pulse_card, render_league_info_card, render_bench_card
 from image_cache import get_images, get_logos_by_url
 
 # Shared visual style so every command's embeds look like one bot instead of
@@ -992,6 +991,85 @@ async def ping(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
+async def _build_roster_rows(league, team, current_week):
+    """Real per-week actual/projected points, slotting, and injury status for
+    one team's full roster -- shared by /team (starters) and /bench (bench).
+    Returns (starter_rows, bench_rows).
+
+    team.roster's player.stats dict comes back empty once the season isn't
+    "live" in ESPN's eyes (e.g. completed weeks) -- box_scores() is the
+    reliable source for this week's actual/projected points AND gives a real
+    pro_opponent field the plain roster objects don't have."""
+    box_score = next(
+        (m for m in league.box_scores(week=current_week)
+         if (m.home_team and m.home_team.team_id == team.team_id) or
+            (m.away_team and m.away_team.team_id == team.team_id)),
+        None
+    )
+    lineup = (box_score.home_lineup if box_score.home_team.team_id == team.team_id else box_score.away_lineup) if box_score else team.roster
+
+    # FLEX shows up as a combo slot like "RB/WR/TE" -- D/ST and BE are
+    # exact matches so they don't get swept into that bucket.
+    slot_order = {'QB': 0, 'RB': 1, 'WR': 2, 'TE': 3, 'FLEX': 4, 'D/ST': 5, 'K': 6}
+
+    def display_slot(player):
+        slot = getattr(player, 'slot_position', None) or getattr(player, 'lineupSlot', '') or ''
+        if slot == 'BE':
+            return 'BE'
+        if slot in ('D/ST', 'DST'):
+            return 'D/ST'
+        if '/' in slot:
+            return 'FLEX'
+        return slot or player.position
+
+    def sort_key(player):
+        return slot_order.get(display_slot(player), 99)
+
+    def get_status(player):
+        if player.position in ('D/ST', 'DST', 'DEF'):
+            return None
+        status = getattr(player, 'injuryStatus', None)
+        if status == 'QUESTIONABLE':
+            return 'Q'
+        if status in ('OUT', 'DOUBTFUL', 'INJURY_RESERVE'):
+            return 'O'
+        return None
+
+    starters = sorted([p for p in lineup if display_slot(p) != 'BE'], key=sort_key)
+    bench = [p for p in lineup if display_slot(p) == 'BE']
+
+    player_ids = [p.playerId for p in starters + bench if p.position not in ('D/ST', 'DST', 'DEF')]
+    team_abbrs = [p.proTeam.lower() for p in starters + bench if p.position in ('D/ST', 'DST', 'DEF') and p.proTeam]
+    images = await get_images(player_ids=player_ids, team_abbrs=team_abbrs)
+
+    def build_row(player):
+        is_dst = player.position in ('D/ST', 'DST', 'DEF')
+        if box_score:
+            actual = float(getattr(player, 'points', 0) or 0)
+            proj = float(getattr(player, 'projected_points', 0) or 0)
+        else:
+            # No box score for this team/week -- plain roster Player objects
+            # don't expose per-week points at all, so fall back to season
+            # average rather than showing a fake 0.0 for every player.
+            actual = 0.0
+            proj = float(getattr(player, 'avg_points', 0) or 0)
+        return {
+            'slot': display_slot(player),
+            'position': player.position,
+            'name': player.name,
+            'team_abbr': player.proTeam or '',
+            'opp_abbr': getattr(player, 'pro_opponent', '') or '',
+            'headshot_path': images['teams'].get(player.proTeam.lower()) if is_dst and player.proTeam else images['players'].get(player.playerId),
+            'is_logo': is_dst,
+            'status': get_status(player),
+            'actual': actual,
+            'proj': proj,
+            'live': None,  # live scoreboard data isn't wired up yet -- see project memory
+        }
+
+    return [build_row(p) for p in starters], [build_row(p) for p in bench]
+
+
 @client.tree.command(name="team", description="Generate a visual roster card for a team.")
 @app_commands.describe(team_name="The exact name of the team as it appears in ESPN.")
 @app_commands.autocomplete(team_name=team_name_autocomplete)
@@ -1017,80 +1095,7 @@ async def team(interaction: discord.Interaction, team_name: str):
             return
 
         current_week = getattr(league, 'current_week', 1)
-
-        # team.roster's player.stats dict comes back empty once the season
-        # isn't "live" in ESPN's eyes (e.g. completed weeks) -- box_scores()
-        # is the reliable source for this week's actual/projected points AND
-        # gives a real pro_opponent field the plain roster objects don't have.
-        box_score = next(
-            (m for m in league.box_scores(week=current_week)
-             if (m.home_team and m.home_team.team_id == team.team_id) or
-                (m.away_team and m.away_team.team_id == team.team_id)),
-            None
-        )
-        lineup = (box_score.home_lineup if box_score.home_team.team_id == team.team_id else box_score.away_lineup) if box_score else team.roster
-
-        # FLEX shows up as a combo slot like "RB/WR/TE" -- D/ST and BE are
-        # exact matches so they don't get swept into that bucket.
-        slot_order = {'QB': 0, 'RB': 1, 'WR': 2, 'TE': 3, 'FLEX': 4, 'D/ST': 5, 'K': 6}
-
-        def display_slot(player):
-            slot = getattr(player, 'slot_position', None) or getattr(player, 'lineupSlot', '') or ''
-            if slot == 'BE':
-                return 'BE'
-            if slot in ('D/ST', 'DST'):
-                return 'D/ST'
-            if '/' in slot:
-                return 'FLEX'
-            return slot or player.position
-
-        def sort_key(player):
-            return slot_order.get(display_slot(player), 99)
-
-        def get_status(player):
-            if player.position in ('D/ST', 'DST', 'DEF'):
-                return None
-            status = getattr(player, 'injuryStatus', None)
-            if status == 'QUESTIONABLE':
-                return 'Q'
-            if status in ('OUT', 'DOUBTFUL', 'INJURY_RESERVE'):
-                return 'O'
-            return None
-
-        starters = sorted([p for p in lineup if display_slot(p) != 'BE'], key=sort_key)
-        bench = [p for p in lineup if display_slot(p) == 'BE']
-
-        player_ids = [p.playerId for p in starters + bench if p.position not in ('D/ST', 'DST', 'DEF')]
-        team_abbrs = [p.proTeam.lower() for p in starters + bench if p.position in ('D/ST', 'DST', 'DEF') and p.proTeam]
-        images = await get_images(player_ids=player_ids, team_abbrs=team_abbrs)
-
-        def build_row(player):
-            is_dst = player.position in ('D/ST', 'DST', 'DEF')
-            if box_score:
-                actual = float(getattr(player, 'points', 0) or 0)
-                proj = float(getattr(player, 'projected_points', 0) or 0)
-            else:
-                # No box score for this team/week -- plain roster Player objects
-                # don't expose per-week points at all, so fall back to season
-                # average rather than showing a fake 0.0 for every player.
-                actual = 0.0
-                proj = float(getattr(player, 'avg_points', 0) or 0)
-            return {
-                'slot': display_slot(player),
-                'position': player.position,
-                'name': player.name,
-                'team_abbr': player.proTeam or '',
-                'opp_abbr': getattr(player, 'pro_opponent', '') or '',
-                'headshot_path': images['teams'].get(player.proTeam.lower()) if is_dst and player.proTeam else images['players'].get(player.playerId),
-                'is_logo': is_dst,
-                'status': get_status(player),
-                'actual': actual,
-                'proj': proj,
-                'live': None,  # live scoreboard data isn't wired up yet -- see project memory
-            }
-
-        starter_rows = [build_row(p) for p in starters]
-        bench_rows = [build_row(p) for p in bench]
+        starter_rows, bench_rows = await _build_roster_rows(league, team, current_week)
 
         wins, losses = getattr(team, 'wins', 0), getattr(team, 'losses', 0)
         sorted_teams = sorted(league.teams, key=lambda t: (getattr(t, 'wins', 0), getattr(t, 'points_for', 0)), reverse=True)
@@ -1129,7 +1134,7 @@ async def team(interaction: discord.Interaction, team_name: str):
             'proj_record_note': None,
             'live_games_count': 0,
             'starters': starter_rows,
-            'bench': bench_rows,
+            'bench_count': len(bench_rows),
             'starters_total_actual': sum(r['actual'] for r in starter_rows),
             'starters_total_proj': sum(r['proj'] for r in starter_rows),
         }
@@ -1665,14 +1670,14 @@ async def matchup(interaction: discord.Interaction, team1: str, team2: str = Non
                 return 'FLEX'
             return slot or p.position
 
-        # Bench isn't slotted by position, so pair the two benches by index
-        # rather than trying to match positions that don't correspond.
         starters1 = sorted([p for p in lineup1 if display_slot(p) != 'BE'], key=lambda p: slot_order.get(display_slot(p), 99))
         starters2 = sorted([p for p in lineup2 if display_slot(p) != 'BE'], key=lambda p: slot_order.get(display_slot(p), 99))
         bench1 = [p for p in lineup1 if display_slot(p) == 'BE']
         bench2 = [p for p in lineup2 if display_slot(p) == 'BE']
 
-        all_players = starters1 + starters2 + bench1 + bench2
+        # Bench players aren't rendered on this card anymore (see /bench), so
+        # only fetch headshots for starters.
+        all_players = starters1 + starters2
         player_ids = [p.playerId for p in all_players if p.position not in ('D/ST', 'DST', 'DEF')]
         team_abbrs = [p.proTeam.lower() for p in all_players if p.position in ('D/ST', 'DST', 'DEF') and p.proTeam]
         images = await get_images(player_ids=player_ids, team_abbrs=team_abbrs)
@@ -1695,8 +1700,6 @@ async def matchup(interaction: discord.Interaction, team1: str, team2: str = Non
         for p1, p2 in zip(starters1, starters2):
             pts1, pts2 = float(getattr(p1, 'points', 0) or 0), float(getattr(p2, 'points', 0) or 0)
             starter_rows.append({'slot': display_slot(p1), 'left': side(p1, pts1 > pts2), 'right': side(p2, pts2 > pts1)})
-
-        bench_rows = [{'slot': 'BE', 'left': side(p1), 'right': side(p2)} for p1, p2 in itertools.zip_longest(bench1, bench2)]
 
         gp_values = [getattr(p, 'game_played', 0) for p in lineup1]
         if gp_values and all(v == 100 for v in gp_values):
@@ -1723,7 +1726,7 @@ async def matchup(interaction: discord.Interaction, team1: str, team2: str = Non
             'team2': {'name': team2_obj.team_name, 'owner': owner_name(team2_obj), 'record': record_str(team2_obj),
                       'score': float(score2), 'logo_path': logos.get(team2_obj.logo_url)},
             'header_sub': f"{status} · Week {current_week}",
-            'starters': starter_rows, 'bench': bench_rows,
+            'starters': starter_rows, 'bench_count1': len(bench1), 'bench_count2': len(bench2),
             'totals': {'left': sum(r['left']['pts'] for r in starter_rows), 'right': sum(r['right']['pts'] for r in starter_rows)},
         }
         image_buf = render_matchup_card(card_data)
@@ -1731,6 +1734,55 @@ async def matchup(interaction: discord.Interaction, team1: str, team2: str = Non
     except Exception as e:
         print(f"Matchup command error: {e}")
         await safe_interaction_response(interaction, f"❌ Error creating matchup card: {e}", ephemeral=True)
+
+@client.tree.command(name="bench", description="View a team's bench -- or compare two benches side by side.")
+@app_commands.describe(team1="First team name", team2="Second team name (optional -- compares both benches if given)")
+@app_commands.autocomplete(team1=team_name_autocomplete, team2=team_name_autocomplete)
+async def bench(interaction: discord.Interaction, team1: str, team2: str = None):
+    if not await safe_defer(interaction):
+        return
+
+    try:
+        league = get_league(user_id=interaction.user.id)
+        if not league:
+            await safe_interaction_response(interaction, "❌ No league found. Use `/register_league` to add your ESPN Fantasy League first, or contact an admin if you want to use the default league.", ephemeral=True)
+            return
+
+        team1_obj = next((t for t in league.teams if t.team_name.lower() == team1.lower()), None)
+        if not team1_obj:
+            await interaction.followup.send(f"Team '{team1}' not found.")
+            return
+
+        current_week = getattr(league, 'current_week', 1)
+        _, bench1_rows = await _build_roster_rows(league, team1_obj, current_week)
+
+        if not team2:
+            logos = await get_logos_by_url([team1_obj.logo_url])
+            card_data = {
+                'team1': {'name': team1_obj.team_name, 'owner': _team_owner_name(team1_obj), 'record': _team_record_str(team1_obj),
+                          'logo_path': logos.get(team1_obj.logo_url)},
+                'bench1': bench1_rows,
+            }
+        else:
+            team2_obj = next((t for t in league.teams if t.team_name.lower() == team2.lower()), None)
+            if not team2_obj:
+                await interaction.followup.send(f"Team '{team2}' not found.")
+                return
+            _, bench2_rows = await _build_roster_rows(league, team2_obj, current_week)
+            logos = await get_logos_by_url([team1_obj.logo_url, team2_obj.logo_url])
+            card_data = {
+                'team1': {'name': team1_obj.team_name, 'owner': _team_owner_name(team1_obj), 'record': _team_record_str(team1_obj),
+                          'logo_path': logos.get(team1_obj.logo_url)},
+                'team2': {'name': team2_obj.team_name, 'owner': _team_owner_name(team2_obj), 'record': _team_record_str(team2_obj),
+                          'logo_path': logos.get(team2_obj.logo_url)},
+                'bench1': bench1_rows, 'bench2': bench2_rows,
+            }
+
+        image_buf = render_bench_card(card_data)
+        await interaction.followup.send(file=discord.File(fp=image_buf, filename="bench.png"))
+    except Exception as e:
+        print(f"Bench command error: {e}")
+        await safe_interaction_response(interaction, f"❌ Error creating bench card: {e}", ephemeral=True)
 
 @client.tree.command(name="waiver", description="Analyze waiver wire for top pickup recommendations.")
 @app_commands.describe(

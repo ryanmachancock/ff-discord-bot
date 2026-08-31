@@ -917,7 +917,7 @@ async def detailed_stats(interaction: discord.Interaction):
             return
 
         current_week = getattr(league, 'current_week', 1)
-        box_scores = league.box_scores(week=current_week)
+        box_scores = _safe_box_scores(league, current_week)
 
         teams_analysis = []
         week_proj_by_team = {}
@@ -991,6 +991,21 @@ async def ping(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
+def _safe_box_scores(league, week):
+    """league.box_scores() indexes ESPN's raw JSON with data[team]['rosterForCurrentScoringPeriod']
+    (espn_api/football/box_score.py) instead of .get() -- early in a new season,
+    before ESPN has populated a scoring-period roster for every team (e.g. before
+    Week 1 lineups lock), that key is simply absent and the whole call raises a
+    bare KeyError. Every caller here already has a real fallback for "no box
+    score found" (season averages, a friendly not-found message, an empty
+    scoreboard), so swallowing this one specific early-season failure into an
+    empty list lets that existing degradation take over instead of crashing."""
+    try:
+        return league.box_scores(week=week)
+    except KeyError:
+        return []
+
+
 async def _build_roster_rows(league, team, current_week):
     """Real per-week actual/projected points, slotting, and injury status for
     one team's full roster -- shared by /team (starters) and /bench (bench).
@@ -1001,7 +1016,7 @@ async def _build_roster_rows(league, team, current_week):
     reliable source for this week's actual/projected points AND gives a real
     pro_opponent field the plain roster objects don't have."""
     box_score = next(
-        (m for m in league.box_scores(week=current_week)
+        (m for m in _safe_box_scores(league, current_week)
          if (m.home_team and m.home_team.team_id == team.team_id) or
             (m.away_team and m.away_team.team_id == team.team_id)),
         None
@@ -1092,6 +1107,10 @@ async def team(interaction: discord.Interaction, team_name: str):
             else:
                 team_list = ", ".join(f"'{t.team_name}'" for t in league.teams[:5])
                 await interaction.followup.send(f"❌ Team '{team_name}' not found.\n📋 Available teams: {team_list}...")
+            return
+
+        if not team.roster:
+            await safe_interaction_response(interaction, f"❌ {team.team_name} has no roster yet -- this league hasn't drafted for the {league.year} season.", ephemeral=True)
             return
 
         current_week = getattr(league, 'current_week', 1)
@@ -1246,7 +1265,7 @@ async def player(interaction: discord.Interaction, player_name: str):
         current_week = getattr(league, 'current_week', 1)
         highlight_label = highlight_text = None
         try:
-            box_score = next((m for m in league.box_scores(week=current_week)
+            box_score = next((m for m in _safe_box_scores(league, current_week)
                                if m.home_team and m.home_team.team_id == player_team.team_id or m.away_team and m.away_team.team_id == player_team.team_id), None)
             if box_score:
                 lineup = box_score.home_lineup if box_score.home_team.team_id == player_team.team_id else box_score.away_lineup
@@ -1313,7 +1332,7 @@ def _h2h_series(team_a, team_b):
 
 async def _build_compare_card(league, team1_obj, team2_obj, user_id, league1_name=None, league2_name=None):
     current_week = getattr(league, 'current_week', 1)
-    box_scores = league.box_scores(week=current_week)
+    box_scores = _safe_box_scores(league, current_week)
 
     def week_proj(team_obj):
         bs = next(
@@ -1632,8 +1651,12 @@ async def matchup(interaction: discord.Interaction, team1: str, team2: str = Non
             await interaction.followup.send(f"Team '{team1}' not found.")
             return
 
+        if not team1_obj.roster:
+            await safe_interaction_response(interaction, f"❌ {team1_obj.team_name} has no roster yet -- this league hasn't drafted for the {league.year} season.", ephemeral=True)
+            return
+
         current_week = getattr(league, 'current_week', 1)
-        box_scores = league.box_scores(week=current_week)
+        box_scores = _safe_box_scores(league, current_week)
 
         box_score = None
         team2_obj = None
@@ -1753,6 +1776,10 @@ async def bench(interaction: discord.Interaction, team1: str, team2: str = None)
             await interaction.followup.send(f"Team '{team1}' not found.")
             return
 
+        if not team1_obj.roster:
+            await safe_interaction_response(interaction, f"❌ {team1_obj.team_name} has no roster yet -- this league hasn't drafted for the {league.year} season.", ephemeral=True)
+            return
+
         current_week = getattr(league, 'current_week', 1)
         _, bench1_rows = await _build_roster_rows(league, team1_obj, current_week)
 
@@ -1767,6 +1794,9 @@ async def bench(interaction: discord.Interaction, team1: str, team2: str = None)
             team2_obj = next((t for t in league.teams if t.team_name.lower() == team2.lower()), None)
             if not team2_obj:
                 await interaction.followup.send(f"Team '{team2}' not found.")
+                return
+            if not team2_obj.roster:
+                await safe_interaction_response(interaction, f"❌ {team2_obj.team_name} has no roster yet -- this league hasn't drafted for the {league.year} season.", ephemeral=True)
                 return
             _, bench2_rows = await _build_roster_rows(league, team2_obj, current_week)
             logos = await get_logos_by_url([team1_obj.logo_url, team2_obj.logo_url])
@@ -2521,7 +2551,7 @@ class BackToMenuView(View):
 async def _build_scoreboard_card(league, user_id):
     """Shared by /scoreboard and its Refresh button."""
     current_week = getattr(league, 'current_week', 1)
-    box_scores = league.box_scores(week=current_week)
+    box_scores = _safe_box_scores(league, current_week)
 
     def record_str(t):
         r = f"{t.wins}-{t.losses}"

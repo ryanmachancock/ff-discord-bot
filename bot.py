@@ -3,6 +3,7 @@ print("Starting Fantasy Football bot...")
 import os
 import asyncio
 import statistics
+import itertools
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -608,43 +609,6 @@ class LeagueManager:
 # Initialize league manager
 league_manager = LeagueManager()
 
-def get_current_week_points(player, league):
-    """Get current week projected/actual points for a player"""
-    # Get current week from league
-    current_week = getattr(league, 'current_week', 1)
-
-    # Try to get current week stats from player.stats
-    if hasattr(player, 'stats') and player.stats:
-        try:
-            # ESPN API stores stats by week - try to get current week's actual or projected points
-            week_stats = player.stats.get(current_week, {})
-
-            # Try actual points first (for games in progress or completed)
-            actual_points = week_stats.get('points', None)
-            if actual_points is not None:
-                return actual_points
-
-            # If no actual points, try projected points
-            projected_points = week_stats.get('projected_points', None)
-            if projected_points is not None:
-                return projected_points
-
-            # Alternative stat keys ESPN might use
-            alt_points = week_stats.get('appliedStats', {}).get('0', None)  # ESPN sometimes uses stat ID 0 for fantasy points
-            if alt_points is not None:
-                return alt_points
-
-        except Exception as e:
-            print(f"Error accessing stats for {player.name}: {e}")
-
-    # Fallback to simple attributes (likely season totals)
-    return (
-        getattr(player, 'projected_points', None)
-        or getattr(player, 'points', None)
-        or getattr(player, 'avg_points', 0)  # Weekly average as last resort
-        or 'N/A'
-    )
-
 load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
 LEAGUE_ID = int(os.getenv('ESPN_LEAGUE_ID'))
@@ -1102,6 +1066,15 @@ async def team(interaction: discord.Interaction, team_name: str):
 
         def build_row(player):
             is_dst = player.position in ('D/ST', 'DST', 'DEF')
+            if box_score:
+                actual = float(getattr(player, 'points', 0) or 0)
+                proj = float(getattr(player, 'projected_points', 0) or 0)
+            else:
+                # No box score for this team/week -- plain roster Player objects
+                # don't expose per-week points at all, so fall back to season
+                # average rather than showing a fake 0.0 for every player.
+                actual = 0.0
+                proj = float(getattr(player, 'avg_points', 0) or 0)
             return {
                 'slot': display_slot(player),
                 'position': player.position,
@@ -1111,8 +1084,8 @@ async def team(interaction: discord.Interaction, team_name: str):
                 'headshot_path': images['teams'].get(player.proTeam.lower()) if is_dst and player.proTeam else images['players'].get(player.playerId),
                 'is_logo': is_dst,
                 'status': get_status(player),
-                'actual': float(getattr(player, 'points', 0) or 0),
-                'proj': float(getattr(player, 'projected_points', 0) or 0),
+                'actual': actual,
+                'proj': proj,
                 'live': None,  # live scoreboard data isn't wired up yet -- see project memory
             }
 
@@ -1206,7 +1179,7 @@ def _player_position_stats(player):
             {'value': f"{int(g('receivingTouchdowns'))}", 'label': 'Rec TD'},
             {'value': f"{int(g('receivingTargets'))}", 'label': 'Targets'},
             {'value': f"{g('receivingYardsPerReception'):.1f}", 'label': 'Yds/Rec'},
-            {'value': f"{g('receivingYardsAfterCatch'):.1f}", 'label': 'YAC/G'},
+            {'value': f"{g('receivingYardsAfterCatch') / games_played:.1f}", 'label': 'YAC/G'},
         ]
     if pos == 'K':
         made, att = g('madeFieldGoals'), g('attemptedFieldGoals')
@@ -1335,10 +1308,22 @@ def _h2h_series(team_a, team_b):
 
 async def _build_compare_card(league, team1_obj, team2_obj, user_id, league1_name=None, league2_name=None):
     current_week = getattr(league, 'current_week', 1)
-    starters1 = [p for p in team1_obj.roster if getattr(p, 'lineupSlot', None) != "BE"]
-    starters2 = [p for p in team2_obj.roster if getattr(p, 'lineupSlot', None) != "BE"]
-    proj1 = sum(float(get_current_week_points(p, league) or 0) for p in starters1 if get_current_week_points(p, league) != 'N/A')
-    proj2 = sum(float(get_current_week_points(p, league) or 0) for p in starters2 if get_current_week_points(p, league) != 'N/A')
+    box_scores = league.box_scores(week=current_week)
+
+    def week_proj(team_obj):
+        bs = next(
+            (m for m in box_scores
+             if (m.home_team and m.home_team.team_id == team_obj.team_id) or
+                (m.away_team and m.away_team.team_id == team_obj.team_id)),
+            None
+        )
+        if not bs:
+            return sum(float(getattr(p, 'avg_points', 0) or 0) for p in team_obj.roster if getattr(p, 'lineupSlot', None) != 'BE')
+        lineup = bs.home_lineup if bs.home_team.team_id == team_obj.team_id else bs.away_lineup
+        return sum(float(getattr(p, 'projected_points', 0) or 0) for p in lineup if getattr(p, 'slot_position', None) != 'BE')
+
+    proj1 = week_proj(team1_obj)
+    proj2 = week_proj(team2_obj)
 
     games1 = team1_obj.wins + team1_obj.losses + getattr(team1_obj, 'ties', 0)
     games2 = team2_obj.wins + team2_obj.losses + getattr(team2_obj, 'ties', 0)
@@ -1694,6 +1679,9 @@ async def matchup(interaction: discord.Interaction, team1: str, team2: str = Non
         logos = await get_logos_by_url([team1_obj.logo_url, team2_obj.logo_url])
 
         def side(p, win=None):
+            if p is None:
+                return {'name': '', 'position': '', 'headshot_path': None, 'is_logo': False,
+                        'pts': 0.0, 'proj': 0.0, 'win': None}
             is_dst = p.position in ('D/ST', 'DST', 'DEF')
             return {
                 'name': p.name, 'position': p.position,
@@ -1708,7 +1696,7 @@ async def matchup(interaction: discord.Interaction, team1: str, team2: str = Non
             pts1, pts2 = float(getattr(p1, 'points', 0) or 0), float(getattr(p2, 'points', 0) or 0)
             starter_rows.append({'slot': display_slot(p1), 'left': side(p1, pts1 > pts2), 'right': side(p2, pts2 > pts1)})
 
-        bench_rows = [{'slot': 'BE', 'left': side(p1), 'right': side(p2)} for p1, p2 in zip(bench1, bench2)]
+        bench_rows = [{'slot': 'BE', 'left': side(p1), 'right': side(p2)} for p1, p2 in itertools.zip_longest(bench1, bench2)]
 
         gp_values = [getattr(p, 'game_played', 0) for p in lineup1]
         if gp_values and all(v == 100 for v in gp_values):

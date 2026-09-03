@@ -186,47 +186,38 @@ class BackgroundRefreshManager:
 # Global background refresh manager
 background_refresh_manager = BackgroundRefreshManager()
 
+# Team names change essentially never mid-season, so autocomplete gets its
+# own long-lived cache instead of riding on espn_cache's 5-minute TTL --
+# that TTL is sized for live score/roster data, and every expiry was forcing
+# a full synchronous ESPN network call inline in the autocomplete handler
+# (blocking the bot's whole event loop) just to re-read 12 team names.
+_team_names_cache = {}
+TEAM_NAMES_CACHE_TTL = 3600
+
 async def team_name_autocomplete(interaction: discord.Interaction, current: str):
     """Autocomplete function for team names"""
     try:
-        print(f"Team autocomplete called with input: '{current}'")  # Debug log
-
-        # Try to get league (use cache if available)
-        league = get_league(user_id=interaction.user.id)
-        if not league:
-            print("No league found for autocomplete")
-            return []
-
-        # Filter teams based on current input
-        teams = league.teams
-        print(f"Found {len(teams)} teams in league")
+        cache_key = f"team_names_{interaction.user.id}"
+        cached = _team_names_cache.get(cache_key)
+        if cached and time.time() - cached[1] < TEAM_NAMES_CACHE_TTL:
+            team_names = cached[0]
+        else:
+            league = get_league(user_id=interaction.user.id)
+            if not league:
+                return []
+            team_names = [team.team_name for team in league.teams]
+            _team_names_cache[cache_key] = (team_names, time.time())
 
         if not current:
-            # Return first 25 teams if no input
-            choices = [app_commands.Choice(name=team.team_name, value=team.team_name)
-                      for team in teams[:25]]
-            print(f"Returning {len(choices)} teams for empty input")
-            return choices
+            return [app_commands.Choice(name=name, value=name) for name in team_names[:25]]
 
-        # Fuzzy matching - prioritize starts with, then contains
         current_lower = current.lower()
-
-        starts_with = [team for team in teams if team.team_name.lower().startswith(current_lower)]
-        contains = [team for team in teams if current_lower in team.team_name.lower()
-                   and team not in starts_with]
-
-        # Combine and limit to 25 (Discord limit)
-        filtered_teams = (starts_with + contains)[:25]
-
-        choices = [app_commands.Choice(name=team.team_name, value=team.team_name)
-                  for team in filtered_teams]
-        print(f"Returning {len(choices)} filtered teams")
-        return choices
+        starts_with = [name for name in team_names if name.lower().startswith(current_lower)]
+        contains = [name for name in team_names if current_lower in name.lower() and name not in starts_with]
+        return [app_commands.Choice(name=name, value=name) for name in (starts_with + contains)[:25]]
 
     except Exception as e:
         print(f"Team autocomplete error: {e}")
-        import traceback
-        traceback.print_exc()
         return []
 
 async def player_name_autocomplete(interaction: discord.Interaction, current: str):
@@ -1636,6 +1627,7 @@ async def sleeper(interaction: discord.Interaction, position: str = None):
 
 @client.tree.command(name="matchup", description="Head-to-head visual matchup card for this week.")
 @app_commands.describe(team1="First team name", team2="Second team name (optional - will try to find current matchup)")
+@app_commands.autocomplete(team1=team_name_autocomplete, team2=team_name_autocomplete)
 async def matchup(interaction: discord.Interaction, team1: str, team2: str = None):
     if not await safe_defer(interaction):
         return
@@ -1907,6 +1899,7 @@ async def waiver(interaction: discord.Interaction, position: str = None, min_own
     team1_players="Players team1 gives up (comma-separated)",
     team2_players="Players team2 gives up (comma-separated)"
 )
+@app_commands.autocomplete(team1=team_name_autocomplete, team2=team_name_autocomplete)
 async def trade(interaction: discord.Interaction, team1: str, team2: str, team1_players: str, team2_players: str):
     if not await safe_defer(interaction):
         return

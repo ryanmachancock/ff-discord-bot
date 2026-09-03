@@ -161,6 +161,31 @@ def _dashed_vline(draw, x, y0, y1, color, width=1, dash=6, gap=4):
         y += dash + gap
 
 
+def _finalize(img):
+    """Every card ends by calling this instead of building its own BytesIO --
+    Discord doesn't put any border around a posted image attachment, so
+    without one, content that runs flush to the edge (the dashed sideline at
+    x=0, the turf header's top bleed, the /bench footer hint) can read as an
+    unintentional crop rather than a deliberate card boundary. What the
+    border needs contrast against is Discord's OWN chrome, not the card's
+    internal colors -- both the chat background and the click-to-expand
+    lightbox backdrop are near-black on Discord's (default, and far more
+    common) dark theme, so white is what actually reads there (a near-black
+    border, tried first, was invisible against that same near-black chrome
+    even though it looked fine against the card's own white/green content
+    in isolation). The frame is added as genuinely new canvas -- expand the
+    image and paste the card inside it -- rather than an outline drawn on
+    top of the existing edge pixels, which clipped into content sitting
+    close to the border (the bottom footer hint text)."""
+    bw = px(8)
+    framed = Image.new("RGB", (img.width + bw * 2, img.height + bw * 2), WHITE)
+    framed.paste(img, (bw, bw))
+    buf = io.BytesIO()
+    framed.save(buf, format="PNG")
+    buf.seek(0)
+    return buf
+
+
 def _turf_stripes(img, box, c1, c2, stripe_w):
     """Approximates the CSS `repeating-linear-gradient(115deg, ...)` turf
     texture with sheared parallelogram bands -- close enough for a
@@ -402,7 +427,7 @@ def render_team_card(data: dict) -> io.BytesIO:
                 _chip(draw, sb_x, sb_y - px(1), "RZ", f_tag, F(RZ_TAG_FG), F(RZ_TAG_BG))
 
         pts_actual = f"{row['actual']:.1f}"
-        pts_proj = f"proj {row['proj']:.1f}"
+        pts_proj = f"({row['proj']:.1f})"
         pw = _tw(draw, pts_actual, f_pts_actual)
         pts_y = y + h // 2 - px(15) - (px(7) if live else 0)
         draw.text((CARD_W - px(22) - pw, pts_y), pts_actual, font=f_pts_actual, fill=F(PTS_DARK))
@@ -441,10 +466,7 @@ def render_team_card(data: dict) -> io.BytesIO:
         hw = _tw(draw, hint, f_footer)
         draw.text(((CARD_W - hw) / 2, y + FOOTER_H // 2 - px(6)), hint, font=f_footer, fill=PLAYER_SUB_GRAY)
 
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    buf.seek(0)
-    return buf
+    return _finalize(img)
 
 
 def render_standings_card(data: dict) -> io.BytesIO:
@@ -579,10 +601,7 @@ def render_standings_card(data: dict) -> io.BytesIO:
                 draw.text((CARD_W - pad_r - gbw, y + px(9)), gb_text, font=f_playoff_sub, fill=PTS_MUTED)
             y += PLAYOFF_H
 
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    buf.seek(0)
-    return buf
+    return _finalize(img)
 
 
 MU_MUTED = (163, 156, 143)
@@ -727,7 +746,7 @@ def render_matchup_card(data: dict) -> io.BytesIO:
         pts_str = f"{side['pts']:.1f}"
         pw = _tw(draw, pts_str, f_pts)
         draw.text((x + (col_pts_w - pw) / 2, y + h // 2 - px(13)), pts_str, font=f_pts, fill=color)
-        proj_str = f"proj {side['proj']:.1f}"
+        proj_str = f"({side['proj']:.1f})"
         prw = _tw(draw, proj_str, f_proj)
         draw.text((x + (col_pts_w - prw) / 2, y + h // 2 + px(3)), proj_str, font=f_proj, fill=MU_MUTED)
 
@@ -765,10 +784,7 @@ def render_matchup_card(data: dict) -> io.BytesIO:
         hw = _tw(draw, hint, f_footer)
         draw.text(((CARD_W - hw) / 2, y + FOOTER_H // 2 - px(6)), hint, font=f_footer, fill=PLAYER_SUB_GRAY)
 
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    buf.seek(0)
-    return buf
+    return _finalize(img)
 
 
 def render_bench_card(data: dict) -> io.BytesIO:
@@ -865,7 +881,7 @@ def render_bench_card(data: dict) -> io.BytesIO:
             draw.text((info_x, text_top + px(19)), sub, font=f_player_sub, fill=PLAYER_SUB_GRAY)
 
             pts_actual = f"{row['actual']:.1f}"
-            pts_proj = f"proj {row['proj']:.1f}"
+            pts_proj = f"({row['proj']:.1f})"
             pw = _tw(draw, pts_actual, f_pts_actual)
             pts_y = y + h // 2 - px(15)
             draw.text((CARD_W - px(22) - pw, pts_y), pts_actual, font=f_pts_actual, fill=PTS_DARK)
@@ -889,10 +905,7 @@ def render_bench_card(data: dict) -> io.BytesIO:
         taw = _tw(draw, total_str, f_total_val)
         draw.text((CARD_W - px(22) - taw, y + px(8)), total_str, font=f_total_val, fill=PTS_DARK)
 
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        buf.seek(0)
-        return buf
+        return _finalize(img)
 
     # ---- two-team mirrored mode ----
     t2 = data['team2']
@@ -991,7 +1004,7 @@ def render_bench_card(data: dict) -> io.BytesIO:
         pts_str = f"{row['actual']:.1f}"
         pw = _tw(draw, pts_str, f_pts)
         draw.text((x + (col_pts_w - pw) / 2, y + h // 2 - px(13)), pts_str, font=f_pts, fill=PTS_DARK)
-        proj_str = f"proj {row['proj']:.1f}"
+        proj_str = f"({row['proj']:.1f})"
         prw = _tw(draw, proj_str, f_proj)
         draw.text((x + (col_pts_w - prw) / 2, y + h // 2 + px(3)), proj_str, font=f_proj, fill=MU_MUTED)
 
@@ -1011,10 +1024,7 @@ def render_bench_card(data: dict) -> io.BytesIO:
         draw_side(x_name2, x_avatar2, r, True, y, ROW_H2)
         y += ROW_H2
 
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    buf.seek(0)
-    return buf
+    return _finalize(img)
 
 
 STATUS_LIVE_FG = (71, 103, 163)
@@ -1163,10 +1173,7 @@ def render_scoreboard_card(data: dict) -> io.BytesIO:
 
         y += ROW_H
 
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    buf.seek(0)
-    return buf
+    return _finalize(img)
 
 
 STATUS_ACTIVE_BG = (0, 0, 0, 71)
@@ -1283,10 +1290,7 @@ def render_player_card(data: dict) -> io.BytesIO:
         draw.rounded_rectangle((bx, y + FOOTER_H // 2 - px(9), bx + bw, y + FOOTER_H // 2 + px(9)), radius=px(3), fill=POS_BADGE_BG)
         draw.text((bx + px(6), y + FOOTER_H // 2 - px(6)), data['roster_slot'], font=f_badge, fill=POS_BADGE_FG)
 
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    buf.seek(0)
-    return buf
+    return _finalize(img)
 
 
 TAG_GEM_BG = (222, 238, 227)
@@ -1427,10 +1431,7 @@ def render_player_list_card(data: dict) -> io.BytesIO:
         fvw = _tw(draw, data['footer_value'], f_footer_val)
         draw.text((CARD_W - pad_r - fvw, y + FOOTER_H // 2 - px(7)), data['footer_value'], font=f_footer_val, fill=PTS_DARK)
 
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    buf.seek(0)
-    return buf
+    return _finalize(img)
 
 
 def render_compare_card(data: dict) -> io.BytesIO:
@@ -1511,10 +1512,7 @@ def render_compare_card(data: dict) -> io.BytesIO:
         draw.text(((CARD_W - lw_) / 2, y + ROW_H // 2 - px(5)), row['label'].upper(), font=f_cmp_label, fill=PTS_MUTED)
         y += ROW_H
 
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    buf.seek(0)
-    return buf
+    return _finalize(img)
 
 
 FAIRNESS_COLOR = (184, 100, 31)
@@ -1616,10 +1614,7 @@ def render_trade_card(data: dict) -> io.BytesIO:
     lw = _tw(draw, label.upper(), f_fairness)
     draw.text(((CARD_W - lw) / 2, y + FAIRNESS_H // 2 - px(6)), label.upper(), font=f_fairness, fill=FAIRNESS_COLOR)
 
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    buf.seek(0)
-    return buf
+    return _finalize(img)
 
 
 def render_stat_tiles_card(data: dict) -> io.BytesIO:
@@ -1673,10 +1668,7 @@ def render_stat_tiles_card(data: dict) -> io.BytesIO:
             vw = _tw(draw, t['value'], f_tile_val)
             draw.text((vx + vw + px(6), ty + px(48)), t['sub'], font=f_tile_sub, fill=PTS_MUTED)
 
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    buf.seek(0)
-    return buf
+    return _finalize(img)
 
 
 def render_power_rankings_card(data: dict) -> io.BytesIO:
@@ -1764,10 +1756,7 @@ def render_power_rankings_card(data: dict) -> io.BytesIO:
         fvw = _tw(draw, data['footer_value'], f_footer_val)
         draw.text((CARD_W - pad_r - fvw, y + FOOTER_H // 2 - px(7)), data['footer_value'], font=f_footer_val, fill=PTS_DARK)
 
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    buf.seek(0)
-    return buf
+    return _finalize(img)
 
 
 PULSE_HOT_FG = (30, 107, 48)
@@ -1850,10 +1839,7 @@ def render_league_pulse_card(data: dict) -> io.BytesIO:
         fvw = _tw(draw, data['footer_value'], f_footer_val)
         draw.text((CARD_W - pad_r - fvw, y + FOOTER_H // 2 - px(7)), data['footer_value'], font=f_footer_val, fill=PTS_DARK)
 
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    buf.seek(0)
-    return buf
+    return _finalize(img)
 
 
 def render_league_info_card(data: dict) -> io.BytesIO:
@@ -1918,10 +1904,7 @@ def render_league_info_card(data: dict) -> io.BytesIO:
             draw.text((cx + px(8), cy + px(3)), chip, font=f_chip, fill=POS_BADGE_FG)
             cx += cw + px(8)
 
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    buf.seek(0)
-    return buf
+    return _finalize(img)
 
 
 if __name__ == "__main__":

@@ -90,80 +90,83 @@ For **private leagues**, you'll need to get your ESPN authentication cookies:
 
 ## 📋 Commands Reference
 
+All data commands render a visual card (a Pillow-drawn PNG) rather than plain text, so results stay readable and on-brand no matter how much data they carry.
+
 ### 🎯 Core Team Commands
 
 | Command | Description | Parameters |
 |---------|-------------|------------|
-| `/team` | Get detailed roster for a team | `team_name` |
-| `/compare` | Compare two teams side-by-side | `team1`, `team2` |
-| `/player` | Get detailed stats for a specific player | `player_name` |
-| `/card` | Generate visual team card with stats | `team_name` |
+| `/team` | Visual roster card for a team, with Prev/Next buttons to browse teams and weeks | `team_name` |
+| `/bench` | View a team's bench -- or compare two benches side by side | `team1`, `team2` (optional) |
+| `/compare` | Visual season-long comparison of two teams | `team1`, `team2` |
+| `/player` | Visual player card with season stats | `player_name` |
 
 ### 📊 League Information & Analytics
 
 | Command | Description | Parameters |
 |---------|-------------|------------|
-| `/standings` | View league standings with records (paginated) | None |
-| `/stats` | Show detailed league analytics | None |
-| `/insights` | Weekly analytics dashboard with trends | None |
-| `/detailed_stats` | Comprehensive analytics with power rankings | None |
-| `/scoreboard` | Live updating scoreboard for current week | `auto_refresh` (optional) |
+| `/standings` | Regular season standings with records and points | None |
+| `/playoffs` | Visual championship playoff bracket | None |
+| `/stats` | League superlatives -- consistency, luck, schedule strength | None |
+| `/insights` | League pulse -- who's hot, who's cold, by season PPG | None |
+| `/detailed_stats` | Power rankings and league-wide scoring analytics | None |
+| `/scoreboard` | Visual scoreboard for all of this week's matchups | None |
 | `/league_info` | Display league settings and configuration | None |
 
 ### 🔍 Analysis & Strategy
 
 | Command | Description | Parameters |
 |---------|-------------|------------|
-| `/matchup` | Player-by-player matchup analysis | `team1`, `team2` (optional) |
-| `/trade` | Analyze potential trades between teams | `team1`, `team2`, `give_players`, `get_players` |
-| `/waiver` | Top waiver wire pickup recommendations | `position`, `min_owned`, `max_owned` |
+| `/matchup` | Head-to-head visual matchup card for this week | `team1`, `team2` (optional) |
+| `/trade` | Visual trade analysis between two teams | `team1`, `team2`, `team1_players`, `team2_players` |
+| `/waiver` | Top waiver wire pickup recommendations | `position` (optional), `min_owned`, `max_owned` |
 | `/sleeper` | Find undervalued sleeper picks | `position` (optional) |
 
 ### 🏆 Multi-League Management
 
 | Command | Description | Parameters |
 |---------|-------------|------------|
-| `/register_league` | Register a new ESPN league | `league_id`, `league_name`, `year`, `swid`, `espn_s2` |
+| `/register_league` | Register a new ESPN league | `league_id`, `league_name`, `swid` (optional), `espn_s2` (optional) |
 | `/my_leagues` | View your registered leagues | None |
 | `/switch_league` | Switch your default league | `league_name` |
 | `/remove_league` | Remove a league from your account | `league_name` |
 | `/all_leagues` | View all available server leagues | None |
-| `/compare_cross_league` | Compare teams from different leagues | `team1`, `league1`, `team2`, `league2` |
+| `/compare_cross_league` | Compare teams from different leagues | `team1`, `team2`, `league1` (optional), `league2` (optional) |
 
 ### 🛠️ Utility & Debug Commands
 
 | Command | Description | Parameters |
 |---------|-------------|------------|
-| `/menu` | Interactive command menu | None |
 | `/help` | Quick command reference | None |
 | `/welcome` | Complete setup and usage guide | None |
 | `/league_status` | Show current default league and status | None |
 | `/ping` | Check if bot is responsive | None |
-| `/test_new` | Test if new features are working | None |
 | `/sync_commands` | Manually sync commands (admin only) | None |
-| `/debug_autocomplete` | Test autocomplete functionality | None |
+| `/debug_autocomplete` | Test autocomplete functionality (admin only) | None |
 
 ## 📸 Command Examples
 
 ### `/team` - Team Roster Display
-><img width="436" height="517" alt="image" src="https://github.com/user-attachments/assets/2f539911-207a-4efe-9582-fae9725f1d3a" />
+><img width="640" alt="/team command example" src="docs/screenshots/team.png" />
 
 ### `/compare` - Team Comparison
-><img width="397" height="238" alt="image" src="https://github.com/user-attachments/assets/58d50d66-b7a4-468f-a188-c7f89706367b" />
+><img width="640" alt="/compare command example" src="docs/screenshots/compare.png" />
 
 ### `/standings` - League Standings
-><img width="509" height="259" alt="image" src="https://github.com/user-attachments/assets/912b854f-c0d0-4aed-93e7-fe59611063bc" />
+><img width="640" alt="/standings command example" src="docs/screenshots/standings.png" />
 
 ### `/stats` - League Analytics
-><img width="459" height="593" alt="image" src="https://github.com/user-attachments/assets/00650b95-e328-4962-b94a-bedbee56e5f7" />
+><img width="640" alt="/stats command example" src="docs/screenshots/stats.png" />
+
+### `/playoffs` - Playoff Bracket
+><img width="640" alt="/playoffs command example" src="docs/screenshots/playoffs.png" />
 
 ## 🆕 Recent Improvements
 
-### Enhanced User Experience
-- **Smart Autocomplete** - All team and player commands now include type-ahead suggestions
-- **Visual Enhancements** - Position emojis (🏈 QB, 🏃‍♂️ RB, 🙌 WR) and status indicators (⚠️ Questionable, ❌ Out)
-- **Improved Layout** - Native Discord fields replace ASCII tables for better readability
-- **Pagination Support** - Large leagues automatically paginate standings and rosters
+### Visual Card Redesign
+- **Rendered cards, not embeds** - Every data command draws a PNG (turf header, headshots/logos, status tags) instead of a Discord embed, so layout stays consistent no matter how much data it carries
+- **Smart Autocomplete** - Team-name commands share one cached autocomplete lookup for instant suggestions
+- **Real playoff bracket** - `/playoffs` draws an actual tree bracket with connector lines, byes, and the reigning champion, built from real recorded matchups (not a hardcoded seeding formula)
 
 ### Performance Optimizations
 - **Background Refresh** - Data pre-loads every 3 minutes for instant responses
@@ -192,12 +195,8 @@ The bot supports managing multiple ESPN leagues simultaneously:
 For private leagues, you'll need to provide ESPN authentication:
 
 ```bash
-/register_league league_id:123456 league_name:"My Private League" year:2025 swid:"{YOUR-SWID}" espn_s2:"YOUR-ESPN-S2-COOKIE"
+/register_league league_id:123456 league_name:"My Private League" swid:"{YOUR-SWID}" espn_s2:"YOUR-ESPN-S2-COOKIE"
 ```
-
-### Interactive Menu System
-
-Use `/menu` to access an interactive button-based interface for easier command navigation.
 
 ## 🐛 Troubleshooting
 

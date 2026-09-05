@@ -13,13 +13,13 @@ from tabulate import tabulate
 import json
 import time
 from typing import Dict, Any, Optional
-from image_render import render_team_card, render_standings_card, render_matchup_card, render_scoreboard_card, render_player_card, render_player_list_card, render_compare_card, render_trade_card, render_stat_tiles_card, render_power_rankings_card, render_league_pulse_card, render_league_info_card, render_bench_card
+from image_render import render_team_card, render_standings_card, render_matchup_card, render_scoreboard_card, render_player_card, render_player_list_card, render_compare_card, render_trade_card, render_stat_tiles_card, render_power_rankings_card, render_league_pulse_card, render_league_info_card, render_bench_card, render_playoff_bracket_card, render_reference_card
 from image_cache import get_images, get_logos_by_url
 
 # Shared visual style so every command's embeds look like one bot instead of
 # ~15 unrelated ad-hoc colors. BRAND = normal content, the rest are for
 # state-confirmation moments only.
-EMBED_COLOR_BRAND = 0x2C7DFA
+EMBED_COLOR_BRAND = 0x2F6B3A  # same brand green used throughout the Pillow cards (SECTION_HDR_GREEN)
 EMBED_COLOR_SUCCESS = 0x2ECC71
 EMBED_COLOR_WARNING = 0xF1C40F
 EMBED_COLOR_ERROR = 0xE74C3C
@@ -982,6 +982,8 @@ async def ping(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
+_box_scores_cache = {}
+
 def _safe_box_scores(league, week):
     """league.box_scores() indexes ESPN's raw JSON with data[team]['rosterForCurrentScoringPeriod']
     (espn_api/football/box_score.py) instead of .get() -- early in a new season,
@@ -990,11 +992,28 @@ def _safe_box_scores(league, week):
     bare KeyError. Every caller here already has a real fallback for "no box
     score found" (season averages, a friendly not-found message, an empty
     scoreboard), so swallowing this one specific early-season failure into an
-    empty list lets that existing degradation take over instead of crashing."""
+    empty list lets that existing degradation take over instead of crashing.
+
+    Also cached -- box_scores() is a synchronous ESPN network call with no
+    caching of its own, so every card render (and every /team nav-button
+    click, which can fire several in quick succession) was re-fetching the
+    same week's data fresh. A completed week's scores never change again, so
+    those are cached indefinitely; the current/live week gets a short window
+    (scores update mid-game) long enough to absorb a burst of clicks without
+    going stale for more than half a minute."""
+    cache_key = f"box_scores_{league.league_id}_{league.year}_{week}"
+    cached = _box_scores_cache.get(cache_key)
+    if cached:
+        data, timestamp, is_final = cached
+        if is_final or time.time() - timestamp < 20:
+            return data
     try:
-        return league.box_scores(week=week)
+        data = league.box_scores(week=week)
     except KeyError:
-        return []
+        data = []
+    is_final = week < getattr(league, 'current_week', 1)
+    _box_scores_cache[cache_key] = (data, time.time(), is_final)
+    return data
 
 
 async def _build_roster_rows(league, team, current_week):
@@ -1076,6 +1095,123 @@ async def _build_roster_rows(league, team, current_week):
     return [build_row(p) for p in starters], [build_row(p) for p in bench]
 
 
+async def _build_team_card_data(league, team, week):
+    """Same card-building logic /team uses, pulled out so the TeamNavView
+    buttons can re-render for a different team/week without duplicating it."""
+    starter_rows, bench_rows = await _build_roster_rows(league, team, week)
+
+    wins, losses = getattr(team, 'wins', 0), getattr(team, 'losses', 0)
+    sorted_teams = sorted(league.teams, key=lambda t: (getattr(t, 'wins', 0), getattr(t, 'points_for', 0)), reverse=True)
+    rank = next((i + 1 for i, t in enumerate(sorted_teams) if t.team_id == team.team_id), 0)
+
+    owner_data = getattr(team, 'owners', None) or getattr(team, 'owner', None)
+    owner_name = "N/A"
+    if owner_data:
+        if isinstance(owner_data, dict):
+            owner_name = (owner_data.get('displayName') or
+                          f"{owner_data.get('firstName', '')} {owner_data.get('lastName', '')}".strip() or
+                          owner_data.get('id', 'N/A'))
+        elif isinstance(owner_data, str):
+            owner_name = owner_data
+        elif isinstance(owner_data, list) and owner_data:
+            first_owner = owner_data[0]
+            if isinstance(first_owner, dict):
+                owner_name = (first_owner.get('firstName') or first_owner.get('displayName') or
+                              f"{first_owner.get('firstName', '')} {first_owner.get('lastName', '')}".strip() or
+                              first_owner.get('id', 'N/A'))
+            else:
+                owner_name = str(first_owner)
+    if owner_name and '@' in owner_name and '.' in owner_name:
+        owner_name = owner_name.split('@')[0]
+    if not owner_name or owner_name == "N/A" or len(str(owner_name)) > 50:
+        owner_name = "Unknown Owner"
+
+    return {
+        'team_name': team.team_name,
+        'owner_name': owner_name,
+        'record': f"{wins}-{losses}",
+        'rank': rank,
+        'total_teams': len(league.teams),
+        'current_week': week,
+        'proj_record': None,
+        'proj_record_note': None,
+        'live_games_count': 0,
+        'starters': starter_rows,
+        'bench_count': len(bench_rows),
+        'starters_total_actual': sum(r['actual'] for r in starter_rows),
+        'starters_total_proj': sum(r['proj'] for r in starter_rows),
+    }
+
+
+class TeamNavView(View):
+    """Prev/Next arrows for team (ordered best-to-worst by record, mirroring
+    the visible RANK X OF Y already on the card) and week (capped at the
+    league's current week -- future weeks aren't reliably populated yet).
+    Each row's middle button is a disabled label showing what's currently
+    displayed, so the whole control reads as "arrows around the current
+    thing" without needing any caption; boundary arrows disable themselves
+    rather than wrapping around."""
+
+    def __init__(self, user_id, league, team_order, team_idx, week):
+        super().__init__(timeout=1800)
+        self.user_id = user_id
+        self.league = league
+        self.team_order = team_order
+        self.team_idx = team_idx
+        self.week = week
+        self.max_week = getattr(league, 'current_week', 1)
+        self._sync()
+
+    def _sync(self):
+        # Short, fixed-format "N / total" counters instead of the raw team
+        # name -- a long name (e.g. "Swift Nation (Travis version)") made
+        # this button far wider than the week row's, throwing the two rows
+        # out of balance. The team name is already the headline of the card
+        # image itself; this row only needs to say where you are in the list.
+        self.prev_team.disabled = self.team_idx == 0
+        self.next_team.disabled = self.team_idx == len(self.team_order) - 1
+        self.team_label.label = f"Rank {self.team_idx + 1} / {len(self.team_order)}"
+        self.prev_week.disabled = self.week <= 1
+        self.next_week.disabled = self.week >= self.max_week
+        self.week_label.label = f"Wk {self.week} / {self.max_week}"
+
+    async def _render(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        team = next(t for t in self.league.teams if t.team_name == self.team_order[self.team_idx])
+        card_data = await _build_team_card_data(self.league, team, self.week)
+        image_buf = render_team_card(card_data)
+        self._sync()
+        await interaction.edit_original_response(attachments=[discord.File(fp=image_buf, filename="team_card.png")], view=self)
+
+    @discord.ui.button(emoji="◀", style=discord.ButtonStyle.secondary, row=0)
+    async def prev_team(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.team_idx -= 1
+        await self._render(interaction)
+
+    @discord.ui.button(label="Team", style=discord.ButtonStyle.secondary, disabled=True, row=0)
+    async def team_label(self, interaction: discord.Interaction, button: discord.ui.Button):
+        pass
+
+    @discord.ui.button(emoji="▶", style=discord.ButtonStyle.secondary, row=0)
+    async def next_team(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.team_idx += 1
+        await self._render(interaction)
+
+    @discord.ui.button(emoji="◀", style=discord.ButtonStyle.secondary, row=1)
+    async def prev_week(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.week -= 1
+        await self._render(interaction)
+
+    @discord.ui.button(label="Week", style=discord.ButtonStyle.secondary, disabled=True, row=1)
+    async def week_label(self, interaction: discord.Interaction, button: discord.ui.Button):
+        pass
+
+    @discord.ui.button(emoji="▶", style=discord.ButtonStyle.secondary, row=1)
+    async def next_week(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.week += 1
+        await self._render(interaction)
+
+
 @client.tree.command(name="team", description="Generate a visual roster card for a team.")
 @app_commands.describe(team_name="The exact name of the team as it appears in ESPN.")
 @app_commands.autocomplete(team_name=team_name_autocomplete)
@@ -1105,52 +1241,14 @@ async def team(interaction: discord.Interaction, team_name: str):
             return
 
         current_week = getattr(league, 'current_week', 1)
-        starter_rows, bench_rows = await _build_roster_rows(league, team, current_week)
-
-        wins, losses = getattr(team, 'wins', 0), getattr(team, 'losses', 0)
-        sorted_teams = sorted(league.teams, key=lambda t: (getattr(t, 'wins', 0), getattr(t, 'points_for', 0)), reverse=True)
-        rank = next((i + 1 for i, t in enumerate(sorted_teams) if t.team_id == team.team_id), 0)
-
-        owner_data = getattr(team, 'owners', None) or getattr(team, 'owner', None)
-        owner_name = "N/A"
-        if owner_data:
-            if isinstance(owner_data, dict):
-                owner_name = (owner_data.get('displayName') or
-                              f"{owner_data.get('firstName', '')} {owner_data.get('lastName', '')}".strip() or
-                              owner_data.get('id', 'N/A'))
-            elif isinstance(owner_data, str):
-                owner_name = owner_data
-            elif isinstance(owner_data, list) and owner_data:
-                first_owner = owner_data[0]
-                if isinstance(first_owner, dict):
-                    owner_name = (first_owner.get('firstName') or first_owner.get('displayName') or
-                                  f"{first_owner.get('firstName', '')} {first_owner.get('lastName', '')}".strip() or
-                                  first_owner.get('id', 'N/A'))
-                else:
-                    owner_name = str(first_owner)
-        if owner_name and '@' in owner_name and '.' in owner_name:
-            owner_name = owner_name.split('@')[0]
-        if not owner_name or owner_name == "N/A" or len(str(owner_name)) > 50:
-            owner_name = "Unknown Owner"
-
-        card_data = {
-            'team_name': team.team_name,
-            'owner_name': owner_name,
-            'record': f"{wins}-{losses}",
-            'rank': rank,
-            'total_teams': len(league.teams),
-            'current_week': current_week,
-            'proj_record': None,
-            'proj_record_note': None,
-            'live_games_count': 0,
-            'starters': starter_rows,
-            'bench_count': len(bench_rows),
-            'starters_total_actual': sum(r['actual'] for r in starter_rows),
-            'starters_total_proj': sum(r['proj'] for r in starter_rows),
-        }
-
+        card_data = await _build_team_card_data(league, team, current_week)
         image_buf = render_team_card(card_data)
-        await interaction.followup.send(file=discord.File(fp=image_buf, filename="team_card.png"))
+
+        ranked_teams = sorted(league.teams, key=lambda t: (getattr(t, 'wins', 0), getattr(t, 'points_for', 0)), reverse=True)
+        team_order = [t.team_name for t in ranked_teams]
+        view = TeamNavView(interaction.user.id, league, team_order, team_order.index(team.team_name), current_week)
+
+        await interaction.followup.send(file=discord.File(fp=image_buf, filename="team_card.png"), view=view)
     except Exception as e:
         print(f"Team command error: {e}")
         await safe_interaction_response(interaction, f"❌ Error creating team card: {e}", ephemeral=True)
@@ -1491,6 +1589,180 @@ async def standings(interaction: discord.Interaction):
     except Exception as e:
         print(f"Standings command error: {e}")
         await safe_interaction_response(interaction, f"❌ Error creating standings card: {e}", ephemeral=True)
+
+
+async def _build_playoff_bracket_data(league):
+    """Builds the championship path (byes -> semifinals -> championship,
+    losers dropped) by tracking a shrinking 'alive' set through each real
+    playoff week's box scores, rather than assuming any particular
+    seeding/bye formula ourselves -- this naturally handles byes and any
+    playoff_team_count because it only ever looks at actual recorded
+    matchups (who a still-alive team actually played, and who actually
+    won), never a theoretical bracket shape we'd have to guess at.
+
+    Each round is a list of SLOTs (a 'game' of two teams, or a 'bye' of
+    one), and every slot beyond round 1 carries 'sources': the index/indices
+    of the previous round's slot(s) that produced its participant(s) --
+    derived purely from real team-id continuity across rounds, never a
+    seeding formula. That linkage is what lets the renderer draw actual
+    bracket connector lines instead of just stacking rounds with no visible
+    relationship between them.
+
+    Returns (rounds, champion), or (None, None) if the regular season isn't
+    over yet (there's no seeding to bracket until it is)."""
+    settings = league.settings
+    reg_season_count = getattr(settings, 'reg_season_count', None)
+    playoff_team_count = getattr(settings, 'playoff_team_count', None)
+    current_week = getattr(league, 'current_week', 1)
+    if not reg_season_count or not playoff_team_count:
+        return None, None
+    if current_week <= reg_season_count:
+        return None, None
+
+    def win_pct(t):
+        games = t.wins + t.losses + getattr(t, 'ties', 0)
+        return (t.wins + getattr(t, 'ties', 0) * 0.5) / games if games else 0.0
+
+    ranked = sorted(league.teams, key=lambda t: (win_pct(t), t.points_for), reverse=True)
+    playoff_teams = ranked[:playoff_team_count]
+    seed_of = {t.team_id: i + 1 for i, t in enumerate(playoff_teams)}
+    logos = await get_logos_by_url([t.logo_url for t in playoff_teams])
+
+    def slot_team(t):
+        return {'seed': seed_of[t.team_id], 'name': t.team_name, 'logo_path': logos.get(t.logo_url)}
+
+    matchup_periods = getattr(settings, 'matchup_periods', None)
+    last_week = max((int(k) for k in matchup_periods.keys()), default=reg_season_count) if matchup_periods else reg_season_count
+
+    alive = {t.team_id: t for t in playoff_teams}
+    slot_index_of = {t.team_id: i for i, t in enumerate(playoff_teams)}  # round-1 order = seed order
+    rounds = []
+    champion = None
+
+    for week in range(reg_season_count + 1, last_week + 1):
+        week_box_scores = _safe_box_scores(league, week)
+        games_by_team = {}
+        for m in week_box_scores:
+            if m.home_team and m.away_team and m.home_team.team_id in alive and m.away_team.team_id in alive:
+                games_by_team[m.home_team.team_id] = m
+                games_by_team[m.away_team.team_id] = m
+
+        if not games_by_team:
+            break  # this round hasn't been scheduled/paired by ESPN yet
+
+        bye_ids = {tid for tid in alive if tid not in games_by_team}
+        prev_order = sorted(alive.keys(), key=lambda tid: slot_index_of[tid])
+
+        round_slots = []
+        new_slot_index_of = {}
+        advancing = {}
+        placed = set()
+
+        for tid in prev_order:
+            if tid in placed:
+                continue
+            if tid in bye_ids:
+                t = alive[tid]
+                round_slots.append({'type': 'bye', 'team': slot_team(t), 'sources': [slot_index_of[tid]]})
+                new_slot_index_of[tid] = len(round_slots) - 1
+                advancing[tid] = t
+                placed.add(tid)
+                continue
+
+            m = games_by_team[tid]
+            home_id, away_id = m.home_team.team_id, m.away_team.team_id
+            placed.add(home_id)
+            placed.add(away_id)
+
+            gp_values = [getattr(p, 'game_played', 0) for p in m.home_lineup]
+            if gp_values and all(v == 100 for v in gp_values):
+                status = 'final'
+            elif any(v > 0 for v in gp_values):
+                status = 'live'
+            else:
+                status = 'tbd'
+
+            score1, score2 = float(m.home_score), float(m.away_score)
+            win1 = win2 = None
+            if status == 'final':
+                win1, win2 = score1 > score2, score2 > score1
+                winner_id = home_id if win1 else away_id
+                advancing[winner_id] = alive[winner_id]
+
+            round_slots.append({
+                'type': 'game', 'status': status,
+                'team1': {**slot_team(m.home_team), 'score': score1, 'win': win1},
+                'team2': {**slot_team(m.away_team), 'score': score2, 'win': win2},
+                'sources': [slot_index_of[home_id], slot_index_of[away_id]],
+            })
+            new_slot_index_of[home_id] = len(round_slots) - 1
+            new_slot_index_of[away_id] = len(round_slots) - 1
+
+        rounds.append(round_slots)
+
+        if not all(s['type'] == 'bye' or s['status'] == 'final' for s in round_slots):
+            break  # this round is still being played -- don't guess at future pairings
+
+        alive = advancing
+        slot_index_of = new_slot_index_of
+        if len(alive) == 1:
+            champion = slot_team(next(iter(alive.values())))
+            break
+
+    # Reorder every round (working backward) so a slot's sources always sit
+    # ADJACENT to each other in the previous round. Rounds were built in
+    # seed order, which doesn't guarantee that -- e.g. seed 1's bye and
+    # seed 2's bye end up on opposite ends of round 1, while the actual
+    # semifinal pairing crosses the middle (seed 1 joins the 4-vs-5 winner,
+    # seed 2 joins the 3-vs-6 winner). Averaging two DISTANT sources for one
+    # semifinal and two MIDDLE sources for the other can land on the exact
+    # same Y position (they're symmetric around the same center), so one
+    # semifinal box silently rendered on top of the other. Reordering so
+    # true siblings are always next to each other eliminates that by
+    # construction, which is what any correct bracket layout requires.
+    for ri in range(len(rounds) - 1, 0, -1):
+        new_order = [src for slot in rounds[ri] for src in slot['sources']]
+        remap = {old_idx: new_idx for new_idx, old_idx in enumerate(new_order)}
+        for slot in rounds[ri]:
+            slot['sources'] = [remap[s] for s in slot['sources']]
+        rounds[ri - 1] = [rounds[ri - 1][old_idx] for old_idx in new_order]
+
+    return rounds, champion
+
+
+@client.tree.command(name="playoffs", description="Visual playoff bracket -- championship path only.")
+async def playoffs(interaction: discord.Interaction):
+    if not await safe_defer(interaction):
+        return
+
+    try:
+        league = get_league(user_id=interaction.user.id)
+        if not league:
+            await safe_interaction_response(interaction, "❌ No league found. Use `/register_league` to add your ESPN Fantasy League first, or contact an admin if you want to use the default league.", ephemeral=True)
+            return
+
+        reg_season_count = getattr(league.settings, 'reg_season_count', None)
+        current_week = getattr(league, 'current_week', 1)
+        if not reg_season_count or current_week <= reg_season_count:
+            await safe_interaction_response(interaction, f"❌ Playoffs haven't started yet -- check back after Week {reg_season_count or '?'}. Use `/standings` for the current regular-season race.", ephemeral=True)
+            return
+
+        rounds, champion = await _build_playoff_bracket_data(league)
+        if not rounds:
+            await safe_interaction_response(interaction, "❌ The playoff bracket hasn't been seeded yet -- check back once Week 1 of the playoffs has been scheduled.", ephemeral=True)
+            return
+
+        card_data = {
+            'league_name': get_league_name(user_id=interaction.user.id), 'season': league.year,
+            'rounds': rounds, 'champion': champion,
+        }
+        image_buf = render_playoff_bracket_card(card_data)
+        await interaction.followup.send(file=discord.File(fp=image_buf, filename="playoffs.png"))
+    except Exception as e:
+        print(f"Playoffs command error: {e}")
+        await safe_interaction_response(interaction, f"❌ Error creating playoff bracket: {e}", ephemeral=True)
+
+
 @client.tree.command(name="stats", description="League superlatives -- consistency, luck, schedule strength.")
 async def stats(interaction: discord.Interaction):
     if not await safe_defer(interaction):
@@ -1574,6 +1846,10 @@ async def sleeper(interaction: discord.Interaction, position: str = None):
         league = get_league(user_id=interaction.user.id)
         if not league:
             await safe_interaction_response(interaction, "\u274c No league found. Use `/register_league` to add your ESPN Fantasy League first, or contact an admin if you want to use the default league.", ephemeral=True)
+            return
+
+        if not any(t.roster for t in league.teams):
+            await safe_interaction_response(interaction, f"\u274c This league hasn't drafted yet for the {league.year} season -- before a draft, every NFL player shows up as a \"free agent,\" so sleeper picks aren't meaningful yet.", ephemeral=True)
             return
 
         free_agents = league.free_agents(size=200)
@@ -1822,6 +2098,10 @@ async def waiver(interaction: discord.Interaction, position: str = None, min_own
             await safe_interaction_response(interaction, "\u274c No league found. Use `/register_league` to add your ESPN Fantasy League first, or contact an admin if you want to use the default league.", ephemeral=True)
             return
 
+        if not any(t.roster for t in league.teams):
+            await safe_interaction_response(interaction, f"\u274c This league hasn't drafted yet for the {league.year} season -- before a draft, every NFL player shows up as a \"free agent,\" so there's no real waiver wire yet.", ephemeral=True)
+            return
+
         valid_positions = ['QB', 'RB', 'WR', 'TE', 'K', 'D/ST', 'DST']
         if position:
             position = position.upper()
@@ -1984,562 +2264,6 @@ async def trade(interaction: discord.Interaction, team1: str, team2: str, team1_
     except Exception as e:
         print(f"Trade command error: {e}")
         await safe_interaction_response(interaction, f"\u274c Error analyzing trade: {e}", ephemeral=True)
-
-@client.tree.command(name="menu", description="Interactive command menu for easy navigation.")
-async def menu(interaction: discord.Interaction):
-    """Main interactive menu for bot commands"""
-    embed = discord.Embed(
-        title="🏈 Fantasy Football Command Center",
-        description="Select a category to explore available commands",
-        color=EMBED_COLOR_BRAND
-    )
-
-    embed.add_field(
-        name="📊 Team Analytics",
-        value="• Team rosters & stats\n• Compare teams\n• Weekly matchups\n• League standings",
-        inline=True
-    )
-
-    embed.add_field(
-        name="🎯 Strategy Tools",
-        value="• Waiver wire analysis\n• Trade analyzer\n• Sleeper picks\n• Player stats",
-        inline=True
-    )
-
-    embed.add_field(
-        name="📈 League Data",
-        value="• Season statistics\n• Performance metrics\n• Head-to-head records",
-        inline=True
-    )
-
-    view = MainMenuView()
-    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-
-# Interactive Menu Views
-class MainMenuView(View):
-    def __init__(self):
-        super().__init__(timeout=300)
-
-    @discord.ui.button(label="Team Analytics", emoji="📊", style=discord.ButtonStyle.primary, row=0)
-    async def team_analytics(self, interaction: discord.Interaction, button: discord.ui.Button):
-        embed = discord.Embed(
-            title="📊 Team Analytics Commands",
-            description="Choose a team analysis command",
-            color=EMBED_COLOR_BRAND
-        )
-
-        embed.add_field(
-            name="Available Commands",
-            value="• `/team [name]` - View team roster & player stats\n"
-                  "• `/compare [team1] [team2]` - Compare two teams\n"
-                  "• `/matchup [team1] [team2]` - Weekly matchup analysis\n"
-                  "• `/standings` - League standings & records",
-            inline=False
-        )
-
-        view = TeamAnalyticsView()
-        await interaction.response.edit_message(embed=embed, view=view)
-
-    @discord.ui.button(label="Strategy Tools", emoji="🎯", style=discord.ButtonStyle.secondary, row=0)
-    async def strategy_tools(self, interaction: discord.Interaction, button: discord.ui.Button):
-        embed = discord.Embed(
-            title="🎯 Strategy Tools",
-            description="Choose a strategy command",
-            color=EMBED_COLOR_BRAND
-        )
-
-        embed.add_field(
-            name="Available Commands",
-            value="• `/waiver [position] [min_owned] [max_owned]` - Waiver wire analysis\n"
-                  "• `/trade [team1] [team2] [players1] [players2]` - Trade analyzer\n"
-                  "• `/sleeper [position] [min_proj] [max_owned]` - Find sleeper picks\n"
-                  "• `/stats` - Advanced league statistics",
-            inline=False
-        )
-
-        view = StrategyToolsView()
-        await interaction.response.edit_message(embed=embed, view=view)
-
-    @discord.ui.button(label="League Data", emoji="📈", style=discord.ButtonStyle.success, row=0)
-    async def league_data(self, interaction: discord.Interaction, button: discord.ui.Button):
-        embed = discord.Embed(
-            title="📈 League Data Commands",
-            description="Choose a league analysis command",
-            color=EMBED_COLOR_BRAND
-        )
-
-        embed.add_field(
-            name="Available Commands",
-            value="• `/standings` - Current league standings\n"
-                  "• `/stats` - Detailed league statistics\n"
-                  "• `/compare [team1] [team2]` - Head-to-head analysis",
-            inline=False
-        )
-
-        view = LeagueDataView()
-        await interaction.response.edit_message(embed=embed, view=view)
-
-    @discord.ui.button(label="Back to Main", emoji="🏠", style=discord.ButtonStyle.gray, row=1)
-    async def back_to_main(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Recreate main menu
-        embed = discord.Embed(
-            title="🏈 Fantasy Football Command Center",
-            description="Select a category to explore available commands",
-            color=EMBED_COLOR_BRAND
-        )
-
-        embed.add_field(
-            name="📊 Team Analytics",
-            value="• Team rosters & stats\n• Compare teams\n• Weekly matchups\n• League standings",
-            inline=True
-        )
-
-        embed.add_field(
-            name="🎯 Strategy Tools",
-            value="• Waiver wire analysis\n• Trade analyzer\n• Sleeper picks\n• Player stats",
-            inline=True
-        )
-
-        embed.add_field(
-            name="📈 League Data",
-            value="• Season statistics\n• Performance metrics\n• Head-to-head records",
-            inline=True
-        )
-
-        view = MainMenuView()
-        await interaction.response.edit_message(embed=embed, view=view)
-
-class TeamAnalyticsView(View):
-    def __init__(self):
-        super().__init__(timeout=300)
-
-    @discord.ui.button(label="Team Roster", emoji="👥", style=discord.ButtonStyle.primary)
-    async def team_roster(self, interaction: discord.Interaction, button: discord.ui.Button):
-        embed = discord.Embed(
-            title="👥 Team Roster Command",
-            description="View detailed team roster with player stats",
-            color=EMBED_COLOR_BRAND
-        )
-        embed.add_field(
-            name="Command",
-            value="`/team [team_name]`",
-            inline=False
-        )
-        embed.add_field(
-            name="Example",
-            value="`/team Swift Nation`",
-            inline=False
-        )
-        embed.add_field(
-            name="What it shows",
-            value="• Starting lineup with projected points\n• Bench players\n• Player positions and injury status\n• Interactive buttons for filtering",
-            inline=False
-        )
-        await interaction.response.edit_message(embed=embed, view=BackToMenuView("team"))
-
-    @discord.ui.button(label="Compare Teams", emoji="⚖️", style=discord.ButtonStyle.primary)
-    async def compare_teams(self, interaction: discord.Interaction, button: discord.ui.Button):
-        embed = discord.Embed(
-            title="⚖️ Compare Teams Command",
-            description="Comprehensive team comparison analysis",
-            color=EMBED_COLOR_BRAND
-        )
-        embed.add_field(
-            name="Command",
-            value="`/compare [team1] [team2]`",
-            inline=False
-        )
-        embed.add_field(
-            name="Example",
-            value="`/compare \"Swift Nation\" \"Team SoloMid\"`",
-            inline=False
-        )
-        embed.add_field(
-            name="What it shows",
-            value="• Season records and standings\n• Total points comparison\n• Head-to-head history\n• Weekly projections",
-            inline=False
-        )
-        await interaction.response.edit_message(embed=embed, view=BackToMenuView("team"))
-
-    @discord.ui.button(label="Weekly Matchup", emoji="🏆", style=discord.ButtonStyle.primary)
-    async def weekly_matchup(self, interaction: discord.Interaction, button: discord.ui.Button):
-        embed = discord.Embed(
-            title="🏆 Weekly Matchup Command",
-            description="Detailed current week matchup analysis",
-            color=EMBED_COLOR_BRAND
-        )
-        embed.add_field(
-            name="Command",
-            value="`/matchup [team1] [team2]` (team2 optional)",
-            inline=False
-        )
-        embed.add_field(
-            name="Example",
-            value="`/matchup \"Swift Nation\"` (auto-finds opponent)",
-            inline=False
-        )
-        embed.add_field(
-            name="What it shows",
-            value="• Position-by-position breakdown\n• Projected winner\n• Key players for each team\n• Matchup competitiveness",
-            inline=False
-        )
-        await interaction.response.edit_message(embed=embed, view=BackToMenuView("team"))
-
-    @discord.ui.button(label="League Standings", emoji="🏅", style=discord.ButtonStyle.primary)
-    async def league_standings(self, interaction: discord.Interaction, button: discord.ui.Button):
-        embed = discord.Embed(
-            title="🏅 League Standings Command",
-            description="Current league standings and team records",
-            color=EMBED_COLOR_BRAND
-        )
-        embed.add_field(
-            name="Command",
-            value="`/standings`",
-            inline=False
-        )
-        embed.add_field(
-            name="What it shows",
-            value="• Team rankings and records\n• Points for/against\n• Highest/lowest scoring teams\n• Best weekly performances",
-            inline=False
-        )
-        await interaction.response.edit_message(embed=embed, view=BackToMenuView("team"))
-
-    @discord.ui.button(label="Back", emoji="⬅️", style=discord.ButtonStyle.gray, row=1)
-    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Recreate main menu directly
-        embed = discord.Embed(
-            title="🏈 Fantasy Football Command Center",
-            description="Select a category to explore available commands",
-            color=EMBED_COLOR_BRAND
-        )
-
-        embed.add_field(
-            name="📊 Team Analytics",
-            value="View individual team performance and roster analysis",
-            inline=True
-        )
-
-        embed.add_field(
-            name="🎯 Strategy Tools",
-            value="Waiver wire, trades, and strategic insights",
-            inline=True
-        )
-
-        embed.add_field(
-            name="📈 League Data",
-            value="Standings, statistics, and league-wide analysis",
-            inline=True
-        )
-
-        view = MainMenuView()
-        await interaction.response.edit_message(embed=embed, view=view)
-
-class StrategyToolsView(View):
-    def __init__(self):
-        super().__init__(timeout=300)
-
-    @discord.ui.button(label="Waiver Wire", emoji="🎯", style=discord.ButtonStyle.secondary)
-    async def waiver_wire(self, interaction: discord.Interaction, button: discord.ui.Button):
-        embed = discord.Embed(
-            title="🎯 Waiver Wire Command",
-            description="Analyze available free agents for pickup opportunities",
-            color=EMBED_COLOR_BRAND
-        )
-        embed.add_field(
-            name="Command",
-            value="`/waiver [position] [min_owned] [max_owned]`",
-            inline=False
-        )
-        embed.add_field(
-            name="Example",
-            value="`/waiver RB 0 25` (RBs owned by 0-25% of leagues)",
-            inline=False
-        )
-        embed.add_field(
-            name="What it shows",
-            value="• Top available players by projection\n• Hidden gems (low ownership, high points)\n• Position depth analysis\n• Ownership insights",
-            inline=False
-        )
-        await interaction.response.edit_message(embed=embed, view=BackToMenuView("strategy"))
-
-    @discord.ui.button(label="Trade Analyzer", emoji="🤝", style=discord.ButtonStyle.secondary)
-    async def trade_analyzer(self, interaction: discord.Interaction, button: discord.ui.Button):
-        embed = discord.Embed(
-            title="🤝 Trade Analyzer Command",
-            description="Comprehensive analysis of potential trades",
-            color=EMBED_COLOR_BRAND
-        )
-        embed.add_field(
-            name="Command",
-            value="`/trade [team1] [team2] [team1_players] [team2_players]`",
-            inline=False
-        )
-        embed.add_field(
-            name="Example",
-            value="`/trade \"Swift Nation\" \"Team SoloMid\" \"Lamar Jackson\" \"Josh Allen\"`",
-            inline=False
-        )
-        embed.add_field(
-            name="What it shows",
-            value="• Projected points comparison\n• Season average analysis\n• Trade fairness assessment\n• Position analysis\n• Injury risk evaluation",
-            inline=False
-        )
-        await interaction.response.edit_message(embed=embed, view=BackToMenuView("strategy"))
-
-    @discord.ui.button(label="Sleeper Picks", emoji="😴", style=discord.ButtonStyle.secondary)
-    async def sleeper_picks(self, interaction: discord.Interaction, button: discord.ui.Button):
-        embed = discord.Embed(
-            title="😴 Sleeper Picks Command",
-            description="Find undervalued players with upside potential",
-            color=EMBED_COLOR_BRAND
-        )
-        embed.add_field(
-            name="Command",
-            value="`/sleeper [position] [min_projection] [max_owned]`",
-            inline=False
-        )
-        embed.add_field(
-            name="Example",
-            value="`/sleeper WR 8 15` (WRs with 8+ pts, <15% owned)",
-            inline=False
-        )
-        embed.add_field(
-            name="What it shows",
-            value="• High-upside, low-owned players\n• Breakout candidate analysis\n• Value vs. ownership comparison\n• Position-specific sleepers",
-            inline=False
-        )
-        await interaction.response.edit_message(embed=embed, view=BackToMenuView("strategy"))
-
-    @discord.ui.button(label="League Stats", emoji="📊", style=discord.ButtonStyle.secondary)
-    async def league_stats(self, interaction: discord.Interaction, button: discord.ui.Button):
-        embed = discord.Embed(
-            title="📊 League Statistics Command",
-            description="Advanced statistical analysis of league performance",
-            color=EMBED_COLOR_BRAND
-        )
-        embed.add_field(
-            name="Command",
-            value="`/stats`",
-            inline=False
-        )
-        embed.add_field(
-            name="What it shows",
-            value="• Scoring consistency analysis\n• Weekly high/low performers\n• Luck vs. skill metrics\n• Team efficiency ratings",
-            inline=False
-        )
-        await interaction.response.edit_message(embed=embed, view=BackToMenuView("strategy"))
-
-    @discord.ui.button(label="Back", emoji="⬅️", style=discord.ButtonStyle.gray, row=1)
-    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Recreate main menu directly
-        embed = discord.Embed(
-            title="🏈 Fantasy Football Command Center",
-            description="Select a category to explore available commands",
-            color=EMBED_COLOR_BRAND
-        )
-
-        embed.add_field(
-            name="📊 Team Analytics",
-            value="View individual team performance and roster analysis",
-            inline=True
-        )
-
-        embed.add_field(
-            name="🎯 Strategy Tools",
-            value="Waiver wire, trades, and strategic insights",
-            inline=True
-        )
-
-        embed.add_field(
-            name="📈 League Data",
-            value="Standings, statistics, and league-wide analysis",
-            inline=True
-        )
-
-        view = MainMenuView()
-        await interaction.response.edit_message(embed=embed, view=view)
-
-class LeagueDataView(View):
-    def __init__(self):
-        super().__init__(timeout=300)
-
-    @discord.ui.button(label="Standings", emoji="🏅", style=discord.ButtonStyle.success)
-    async def standings(self, interaction: discord.Interaction, button: discord.ui.Button):
-        embed = discord.Embed(
-            title="🏅 League Standings",
-            description="Current league standings and records",
-            color=EMBED_COLOR_BRAND
-        )
-        embed.add_field(
-            name="Command",
-            value="`/standings`",
-            inline=False
-        )
-        embed.add_field(
-            name="What it shows",
-            value="• Team rankings by record\n• Points for and against\n• Playoff positioning\n• Season highlights",
-            inline=False
-        )
-        await interaction.response.edit_message(embed=embed, view=BackToMenuView("league"))
-
-    @discord.ui.button(label="Statistics", emoji="📈", style=discord.ButtonStyle.success)
-    async def statistics(self, interaction: discord.Interaction, button: discord.ui.Button):
-        embed = discord.Embed(
-            title="📈 League Statistics",
-            description="Detailed performance analytics",
-            color=EMBED_COLOR_BRAND
-        )
-        embed.add_field(
-            name="Command",
-            value="`/stats`",
-            inline=False
-        )
-        embed.add_field(
-            name="What it shows",
-            value="• Consistency rankings\n• Weekly extremes\n• Efficiency metrics\n• Statistical insights",
-            inline=False
-        )
-        await interaction.response.edit_message(embed=embed, view=BackToMenuView("league"))
-
-    @discord.ui.button(label="Team Comparison", emoji="⚖️", style=discord.ButtonStyle.success)
-    async def team_comparison(self, interaction: discord.Interaction, button: discord.ui.Button):
-        embed = discord.Embed(
-            title="⚖️ Team Comparison",
-            description="Head-to-head team analysis",
-            color=EMBED_COLOR_BRAND
-        )
-        embed.add_field(
-            name="Command",
-            value="`/compare [team1] [team2]`",
-            inline=False
-        )
-        embed.add_field(
-            name="What it shows",
-            value="• Season performance comparison\n• Head-to-head records\n• Strength analysis\n• Projection differences",
-            inline=False
-        )
-        await interaction.response.edit_message(embed=embed, view=BackToMenuView("league"))
-
-    @discord.ui.button(label="Back", emoji="⬅️", style=discord.ButtonStyle.gray, row=1)
-    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Recreate main menu directly instead of calling method on new instance
-        embed = discord.Embed(
-            title="🏈 Fantasy Football Command Center",
-            description="Select a category to explore available commands",
-            color=EMBED_COLOR_BRAND
-        )
-
-        embed.add_field(
-            name="📊 Team Analytics",
-            value="View individual team performance and roster analysis",
-            inline=True
-        )
-
-        embed.add_field(
-            name="🎯 Strategy Tools",
-            value="Waiver wire, trades, and strategic insights",
-            inline=True
-        )
-
-        embed.add_field(
-            name="📈 League Data",
-            value="Standings, statistics, and league-wide analysis",
-            inline=True
-        )
-
-        view = MainMenuView()
-        await interaction.response.edit_message(embed=embed, view=view)
-
-class BackToMenuView(View):
-    def __init__(self, menu_type):
-        super().__init__(timeout=300)
-        self.menu_type = menu_type
-
-    @discord.ui.button(label="Back to Category", emoji="⬅️", style=discord.ButtonStyle.gray)
-    async def back_to_category(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.menu_type == "team":
-            embed = discord.Embed(
-                title="📊 Team Analytics Commands",
-                description="Choose a team analysis command",
-                color=EMBED_COLOR_BRAND
-            )
-
-            embed.add_field(
-                name="Available Commands",
-                value="• `/team [name]` - View team roster & player stats\n"
-                      "• `/compare [team1] [team2]` - Compare two teams\n"
-                      "• `/matchup [team1] [team2]` - Weekly matchup analysis\n"
-                      "• `/standings` - League standings & records",
-                inline=False
-            )
-
-            view = TeamAnalyticsView()
-            await interaction.response.edit_message(embed=embed, view=view)
-        elif self.menu_type == "strategy":
-            embed = discord.Embed(
-                title="🎯 Strategy Tools",
-                description="Choose a strategy command",
-                color=EMBED_COLOR_BRAND
-            )
-
-            embed.add_field(
-                name="Available Commands",
-                value="• `/waiver [position] [min_owned] [max_owned]` - Waiver wire analysis\n"
-                      "• `/trade [team1] [team2] [players1] [players2]` - Trade analyzer\n"
-                      "• `/sleeper [position] [min_proj] [max_owned]` - Find sleeper picks\n"
-                      "• `/stats` - Advanced league statistics",
-                inline=False
-            )
-
-            view = StrategyToolsView()
-            await interaction.response.edit_message(embed=embed, view=view)
-        elif self.menu_type == "league":
-            embed = discord.Embed(
-                title="📈 League Data Commands",
-                description="Choose a league analysis command",
-                color=EMBED_COLOR_BRAND
-            )
-
-            embed.add_field(
-                name="Available Commands",
-                value="• `/standings` - Current league standings\n"
-                      "• `/stats` - Detailed league statistics\n"
-                      "• `/compare [team1] [team2]` - Head-to-head analysis",
-                inline=False
-            )
-
-            view = LeagueDataView()
-            await interaction.response.edit_message(embed=embed, view=view)
-
-    @discord.ui.button(label="Main Menu", emoji="🏠", style=discord.ButtonStyle.primary)
-    async def back_to_main(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Recreate main menu
-        embed = discord.Embed(
-            title="🏈 Fantasy Football Command Center",
-            description="Select a category to explore available commands",
-            color=EMBED_COLOR_BRAND
-        )
-
-        embed.add_field(
-            name="📊 Team Analytics",
-            value="• Team rosters & stats\n• Compare teams\n• Weekly matchups\n• League standings",
-            inline=True
-        )
-
-        embed.add_field(
-            name="🎯 Strategy Tools",
-            value="• Waiver wire analysis\n• Trade analyzer\n• Sleeper picks\n• Player stats",
-            inline=True
-        )
-
-        embed.add_field(
-            name="📈 League Data",
-            value="• Season statistics\n• Performance metrics\n• Head-to-head records",
-            inline=True
-        )
-
-        view = MainMenuView()
-        await interaction.response.edit_message(embed=embed, view=view)
 
 async def _build_scoreboard_card(league, user_id):
     """Shared by /scoreboard and its Refresh button."""
@@ -3167,156 +2891,110 @@ async def insights(interaction: discord.Interaction):
 @client.tree.command(name="welcome", description="Get started guide for using the Fantasy Football bot.")
 async def welcome(interaction: discord.Interaction):
     """Comprehensive welcome and setup guide"""
-    embed = discord.Embed(
-        title="🏈 Welcome to Fantasy Football Bot!",
-        description="**Your complete guide to dominating fantasy football with data-driven insights**",
-        color=EMBED_COLOR_BRAND
-    )
-
-    # Quick Start Section
-    embed.add_field(
-        name="🚀 Quick Start (New Users)",
-        value="**1.** Run `/register_league` with your ESPN League ID\n"
-              "**2.** Try `/scoreboard` to see live scores\n"
-              "**3.** Use `/menu` to explore all features\n"
-              "**4.** Check out `/league_info` for your league details",
-        inline=False
-    )
-
-    # Add spacing
-    embed.add_field(name="\u200b", value="\u200b", inline=False)
-
-    # Finding League ID
-    embed.add_field(
-        name="🔍 How to Find Your ESPN League ID",
-        value="**1.** Go to your ESPN Fantasy Football league\n"
-              "**2.** Look at the URL: `fantasy.espn.com/football/league?leagueId=XXXXXX`\n"
-              "**3.** Copy the numbers after `leagueId=`\n"
-              "**4.** That's your League ID!",
-        inline=True
-    )
-
-    # Private Leagues
-    embed.add_field(
-        name="🔒 Private Leagues",
-        value="**Need SWID & ESPN_S2 cookies:**\n"
-              "• Log into ESPN in your browser\n"
-              "• Open Developer Tools (F12)\n"
-              "• Go to Application → Cookies\n"
-              "• Find `SWID` and `espn_s2` values\n"
-              "• Use them in `/register_league`",
-        inline=True
-    )
-
-    # Add spacing
-    embed.add_field(name="\u200b", value="\u200b", inline=False)
-
-    # Popular Commands
-    embed.add_field(
-        name="⭐ Most Popular Commands",
-        value="🏆 `/scoreboard` - Live weekly scores\n"
-              "📊 `/standings` - League standings\n"
-              "👥 `/team [name]` - Team roster & stats\n"
-              "🔍 `/player [name]` - Player details\n"
-              "⚔️ `/compare [team1] [team2]` - Team comparison\n"
-              "📈 `/stats` - League analytics",
-        inline=True
-    )
-
-    # Advanced Features
-    embed.add_field(
-        name="🎯 Advanced Features",
-        value="🔄 `/trade` - Trade analyzer\n"
-              "💎 `/sleeper` - Sleeper pick finder\n"
-              "📋 `/waiver` - Waiver wire analysis\n"
-              "🆚 `/matchup` - Weekly matchup preview\n"
-              "📱 `/team` - Visual team roster card\n"
-              "🌐 `/compare_cross_league` - Cross-league comparison",
-        inline=True
-    )
-
-    # Add spacing
-    embed.add_field(name="\u200b", value="\u200b", inline=False)
-
-    # Multiple Leagues
-    embed.add_field(
-        name="🔗 Multiple Leagues",
-        value="• Register multiple leagues with `/register_league`\n"
-              "• View all your leagues: `/my_leagues`\n"
-              "• Switch active league: `/switch_league`\n"
-              "• Remove leagues: `/remove_league`\n"
-              "• Check current status: `/league_status`",
-        inline=False
-    )
-
-    # Support
-    embed.add_field(
-        name="❓ Need Help?",
-        value="• Use `/menu` for interactive command explorer\n"
-              "• Run `/help` for quick command reference\n"
-              "• All commands work with your registered league automatically\n"
-              "• Bot updates live scores every 30 seconds during games",
-        inline=False
-    )
-
-    embed.set_footer(text="💡 Pro tip: Pin this message for easy reference! Use /menu to explore all features.")
-
-    await interaction.response.send_message(embed=embed)
+    card_data = {
+        'title': "Welcome to Fantasy Football Bot",
+        'subtitle': "Your complete guide to dominating fantasy football with data-driven insights",
+        'sections': [
+            {'title': "Quick Start (New Users)", 'items': [
+                ("1.", "Run /register_league with your ESPN League ID"),
+                ("2.", "Try /scoreboard to see live scores"),
+                ("3.", "Check out /league_info for your league details"),
+                ("4.", "Run /help any time for the full command reference"),
+            ]},
+            [
+                {'title': "How to Find Your ESPN League ID", 'items': [
+                    ("1.", "Go to your ESPN Fantasy Football league"),
+                    ("2.", "URL: fantasy.espn.com/football/league?leagueId=XXXXXX"),
+                    ("3.", "Copy the numbers after leagueId="),
+                    ("4.", "That's your League ID!"),
+                ]},
+                {'title': "Private Leagues (Need SWID & ESPN_S2 Cookies)", 'items': [
+                    ("•", "Log into ESPN in your browser"),
+                    ("•", "Open Developer Tools (F12)"),
+                    ("•", "Go to Application → Cookies"),
+                    ("•", "Find SWID and espn_s2 values"),
+                    ("•", "Use them in /register_league"),
+                ]},
+            ],
+            [
+                {'title': "Most Popular Commands", 'items': [
+                    ("/scoreboard", "Live weekly scores"),
+                    ("/standings", "Regular season standings"),
+                    ("/playoffs", "Playoff bracket"),
+                    ("/team [name]", "Team roster & stats"),
+                    ("/bench [name]", "Bench players"),
+                    ("/player [name]", "Player details"),
+                ]},
+                {'title': "Advanced Features", 'items': [
+                    ("/compare [team1] [team2]", "Team comparison"),
+                    ("/stats", "League analytics"),
+                    ("/trade", "Trade analyzer"),
+                    ("/sleeper", "Sleeper pick finder"),
+                    ("/waiver", "Waiver wire analysis"),
+                    ("/matchup", "Weekly matchup preview"),
+                ]},
+            ],
+            [
+                {'title': "Multiple Leagues", 'items': [
+                    ("•", "Register multiple leagues with /register_league"),
+                    ("•", "View all your leagues: /my_leagues"),
+                    ("•", "Switch active league: /switch_league"),
+                    ("•", "Remove leagues: /remove_league"),
+                    ("•", "Check current status: /league_status"),
+                ]},
+                {'title': "Need Help?", 'items': [
+                    ("•", "Run /help for quick command reference"),
+                    ("•", "All commands work with your registered league automatically"),
+                ]},
+            ],
+        ],
+        'footer': "Pro tip: Pin this message for easy reference! Run /help any time for the full command list.",
+    }
+    image_buf = render_reference_card(card_data)
+    await interaction.response.send_message(file=discord.File(fp=image_buf, filename="welcome.png"))
 
 @client.tree.command(name="help", description="Quick command reference and help.")
 async def help_command(interaction: discord.Interaction):
     """Quick help and command reference"""
-    embed = discord.Embed(
-        title="🆘 Fantasy Football Bot Help",
-        description="**Quick command reference - Use `/welcome` for the full setup guide**",
-        color=EMBED_COLOR_BRAND
-    )
-
-    # Getting Started
-    embed.add_field(
-        name="🏁 Getting Started",
-        value="**New users:** Run `/welcome` for complete setup guide\n"
-              "**Register league:** `/register_league [league_id] [name]`\n"
-              "**Need help finding League ID?** Check `/welcome`",
-        inline=False
-    )
-
-    # Core Commands
-    embed.add_field(
-        name="📊 Core Commands",
-        value="`/scoreboard` - Live scores & matchups\n"
-              "`/standings` - League standings\n"
-              "`/team [name]` - Team roster\n"
-              "`/player [name]` - Player stats\n"
-              "`/league_info` - League settings",
-        inline=True
-    )
-
-    # Analysis Tools
-    embed.add_field(
-        name="🔍 Analysis Tools",
-        value="`/compare [team1] [team2]` - Compare teams\n"
-              "`/stats` - League analytics\n"
-              "`/matchup` - Weekly preview\n"
-              "`/trade` - Trade analyzer\n"
-              "`/waiver` - Waiver recommendations",
-        inline=True
-    )
-
-    # League Management
-    embed.add_field(
-        name="⚙️ League Management",
-        value="`/my_leagues` - Your registered leagues\n"
-              "`/switch_league [name]` - Change active league\n"
-              "`/league_status` - Current settings\n"
-              "`/all_leagues` - Available leagues\n"
-              "`/menu` - Interactive command explorer",
-        inline=False
-    )
-
-    embed.set_footer(text="💡 Use /welcome for detailed setup instructions and finding your ESPN League ID")
-
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    card_data = {
+        'title': "Fantasy Football Bot Help",
+        'subtitle': "Quick command reference · Use /welcome for the full setup guide",
+        'sections': [
+            {'title': "Getting Started", 'items': [
+                ("New users:", "Run /welcome for complete setup guide"),
+                ("Register league:", "/register_league [league_id] [name]"),
+                ("Finding League ID?", "Check /welcome"),
+            ]},
+            [
+                {'title': "Core Commands", 'items': [
+                    ("/scoreboard", "Live scores & matchups"),
+                    ("/standings", "Regular season standings"),
+                    ("/playoffs", "Playoff bracket"),
+                    ("/team [name]", "Team roster"),
+                    ("/bench [name]", "Bench players"),
+                    ("/player [name]", "Player stats"),
+                    ("/league_info", "League settings"),
+                ]},
+                {'title': "Analysis Tools", 'items': [
+                    ("/compare [team1] [team2]", "Compare teams"),
+                    ("/stats", "League analytics"),
+                    ("/matchup", "Weekly preview"),
+                    ("/trade", "Trade analyzer"),
+                    ("/waiver", "Waiver recommendations"),
+                    ("/sleeper", "Sleeper picks"),
+                ]},
+            ],
+            {'title': "League Management", 'items': [
+                ("/my_leagues", "Your registered leagues"),
+                ("/switch_league [name]", "Change active league"),
+                ("/league_status", "Current settings"),
+                ("/all_leagues", "Available leagues"),
+            ]},
+        ],
+        'footer': "Use /welcome for detailed setup instructions and finding your ESPN League ID",
+    }
+    image_buf = render_reference_card(card_data)
+    await interaction.response.send_message(file=discord.File(fp=image_buf, filename="help.png"), ephemeral=True)
 
 if __name__ == '__main__':
     import time

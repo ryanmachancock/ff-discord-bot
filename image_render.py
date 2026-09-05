@@ -497,15 +497,18 @@ def render_standings_card(data: dict) -> io.BytesIO:
     f_playoff_label = _font('bold', px(10))
     f_playoff_sub = _font('bold', px(11))
 
+    f_footer = _font('bold', px(10))
+
     HEADER_H = px(78)
     HDR_ROW_H = px(28)
     ROW_H = px(44)
     PLAYOFF_H = px(34)
+    FOOTER_H = px(26)
 
     n_playoff = data.get('playoff_team_count') or 0
     has_playoff_line = 0 < n_playoff < len(teams)
 
-    total_h = HEADER_H + HDR_ROW_H + ROW_H * len(teams) + (PLAYOFF_H if has_playoff_line else 0)
+    total_h = HEADER_H + HDR_ROW_H + ROW_H * len(teams) + (PLAYOFF_H if has_playoff_line else 0) + FOOTER_H
     img = Image.new("RGB", (CARD_W, total_h), ROSTER_BG)
     _turf_stripes(img, (0, 0, CARD_W, HEADER_H), TURF_C1, TURF_C2, px(42))
     draw = ImageDraw.Draw(img)
@@ -519,7 +522,7 @@ def render_standings_card(data: dict) -> io.BytesIO:
     text_x = logo_cx + logo_r + px(12)
     name_y = HEADER_H // 2 - px(20)
     draw.text((text_x, name_y), data['league_name'].upper(), font=f_league_name, fill=WHITE)
-    meta = f"{data['team_count']} TEAMS  ·  {data['scoring_label'].upper()}"
+    meta = f"{data['team_count']} TEAMS  ·  REGULAR SEASON  ·  {data['scoring_label'].upper()}"
     draw.text((text_x, name_y + px(30)), meta, font=f_league_meta, fill=TEAM_META)
 
     right_label = data['header_right_label']
@@ -600,6 +603,10 @@ def render_standings_card(data: dict) -> io.BytesIO:
                 gbw = _tw(draw, gb_text, f_playoff_sub)
                 draw.text((CARD_W - pad_r - gbw, y + px(9)), gb_text, font=f_playoff_sub, fill=PTS_MUTED)
             y += PLAYOFF_H
+
+    footer = "Regular season only  ·  /playoffs for the postseason bracket"
+    fw = _tw(draw, footer, f_footer)
+    draw.text(((CARD_W - fw) / 2, y + FOOTER_H // 2 - px(6)), footer, font=f_footer, fill=PLAYER_SUB_GRAY)
 
     return _finalize(img)
 
@@ -1172,6 +1179,186 @@ def render_scoreboard_card(data: dict) -> io.BytesIO:
             draw.text((x_status + (col_status_w - lw) / 2, cy - px(4)), label, font=f_status_label, fill=STATUS_MUTED_FG)
 
         y += ROW_H
+
+    return _finalize(img)
+
+
+def render_playoff_bracket_card(data: dict) -> io.BytesIO:
+    """Data contract:
+    {
+      'league_name': str, 'season': int,
+      'rounds': [ [SLOT, ...], ... ],  # one list of slots per round, round 0 first
+      'champion': {'seed': int, 'name': str, 'logo_path': str or None} or None,
+    }
+    SLOT is either:
+      {'type': 'bye', 'team': TEAM, 'sources': [prev_round_slot_index]}
+    or:
+      {'type': 'game', 'status': 'final'/'live'/'tbd',
+       'team1': {**TEAM, 'score': float, 'win': bool or None},
+       'team2': {**TEAM, 'score': float, 'win': bool or None},
+       'sources': [prev_round_slot_index, prev_round_slot_index]}
+    TEAM = {'seed': int, 'name': str, 'logo_path': str or None}
+
+    This is a real tree, not just a flat list of rounds -- 'sources' is the
+    previous round's slot index/indices that produced this slot's
+    participant(s), derived from actual team-id continuity across real box
+    scores (never a seeding formula). That's what lets this actually look
+    like a bracket: each round is its own column, and every advancing team
+    gets a drawn connector line from where they came from, the way a real
+    tournament bracket reads at a glance instead of needing the viewer to
+    track names across a stack of separate lists.
+    """
+    rounds = data['rounds']
+    champion = data.get('champion')
+
+    f_league_name = _font('impact', px(24))
+    f_league_meta = _font('bold', px(10.5))
+    f_round_label = _font('bold', px(10))
+    f_seed = _font('bold', px(8.5))
+    f_name = _font('bold', px(11))
+    f_score = _font('impact', px(13))
+    f_bye_label = _font('bold', px(8.5))
+    f_champ_label = _font('bold', px(10))
+    f_champ_name = _font('impact', px(16))
+
+    HEADER_H = px(64)
+    TOP_PAD = px(30)
+    BOTTOM_PAD = px(20)
+    SLOT_H = px(64)      # vertical spacing between adjacent round-0 slots
+    BOX_H = px(46)        # actual drawn box height within a slot
+    COL_W = px(168)
+    COL_GAP = px(46)
+    CHAMPION_COL_W = px(140)
+    LINE_COLOR = SECTION_HDR_BORDER
+
+    n_rounds = len(rounds)
+    col_x = [px(22) + i * (COL_W + COL_GAP) for i in range(n_rounds)]
+    champ_x = col_x[-1] + COL_W + COL_GAP if n_rounds else px(22)
+
+    # ---- pass 1: compute each slot's vertical center, bottom-up isn't
+    # needed since round 0's order already reflects the real bracket shape
+    # (built by the data layer walking the previous round in slot order) --
+    # each later slot's y is just the average of its sources' y from the
+    # round actually drawn immediately to its left.
+    slot_y = []  # slot_y[round_idx][slot_idx] = y-center
+    for ri, rnd in enumerate(rounds):
+        ys = []
+        for slot in rnd:
+            if ri == 0:
+                ys.append(HEADER_H + TOP_PAD + len(ys) * SLOT_H + SLOT_H / 2)
+            else:
+                src_ys = [slot_y[ri - 1][s] for s in slot['sources']]
+                ys.append(sum(src_ys) / len(src_ys))
+        slot_y.append(ys)
+
+    content_bottom = TOP_PAD + len(rounds[0]) * SLOT_H if rounds else TOP_PAD
+    total_h = HEADER_H + content_bottom + BOTTOM_PAD
+    total_w = champ_x + CHAMPION_COL_W + px(22)
+
+    img = Image.new("RGB", (round(total_w), round(total_h)), ROSTER_BG)
+    _turf_stripes(img, (0, 0, round(total_w), HEADER_H), TURF_C1, TURF_C2, px(42))
+    draw = ImageDraw.Draw(img)
+
+    logo_r = px(19)
+    logo_cx, logo_cy = px(22) + logo_r, HEADER_H // 2
+    _circle_image(img, None, logo_cx, logo_cy, logo_r, border_color=(255, 255, 255, 150), border_w=px(2),
+                  fallback_text=data['league_name'])
+    text_x = logo_cx + logo_r + px(10)
+    draw.text((text_x, HEADER_H // 2 - px(17)), data['league_name'].upper(), font=f_league_name, fill=WHITE)
+    meta = f"PLAYOFF BRACKET  ·  {data['season']}"
+    draw.text((text_x, HEADER_H // 2 + px(4)), meta, font=f_league_meta, fill=TEAM_META)
+
+    def score_color(win):
+        if win is None:
+            return SCORE_PENDING
+        return PTS_DARK if win else PTS_MUTED
+
+    def draw_team_line(box_x, y, team, score=None, win=None, muted=False, right_label=None):
+        """box_x is the slot box's own left edge -- padding on both sides is
+        applied here so a long score/label can never run flush against (and
+        get clipped by) the box's rounded corner."""
+        left_pad, right_pad = px(8), px(8)
+        x = box_x + left_pad
+        right_edge = box_x + COL_W - right_pad
+
+        seed_txt = f"#{team['seed']}"
+        sw = _tw(draw, seed_txt, f_seed)
+        draw.text((x, y), seed_txt, font=f_seed, fill=PTS_MUTED)
+
+        if score is not None:
+            r_str, r_font, r_w = f"{score:.1f}", f_score, _tw(draw, f"{score:.1f}", f_score)
+        elif right_label:
+            r_str, r_font, r_w = right_label, f_bye_label, _tw(draw, right_label, f_bye_label)
+        else:
+            r_str, r_font, r_w = None, None, 0
+
+        avail = right_edge - (r_w + px(6) if r_str else 0) - (x + sw + px(4))
+        name = _ellipsize(draw, team['name'], f_name, avail)
+        draw.text((x + sw + px(4), y - px(1)), name, font=f_name, fill=PLAYER_SUB_GRAY if muted else PTS_DARK)
+
+        if score is not None:
+            draw.text((right_edge - r_w, y - px(2)), r_str, font=r_font, fill=score_color(win))
+        elif right_label:
+            draw.text((right_edge - r_w, y), r_str, font=r_font, fill=PTS_MUTED)
+
+    def draw_slot(ri, si, slot):
+        x = col_x[ri]
+        y = slot_y[ri][si]
+        box_top = y - BOX_H / 2
+        draw.rounded_rectangle((x, box_top, x + COL_W, box_top + BOX_H), radius=px(4), fill=ROSTER_ZEBRA, outline=SECTION_HDR_BORDER, width=max(1, px(0.5)))
+        if slot['type'] == 'bye':
+            draw_team_line(x, y - px(6), slot['team'], right_label="BYE")
+        else:
+            draw_team_line(x, box_top + px(6), slot['team1'], slot['team1']['score'], slot['team1']['win'],
+                           muted=slot['team1']['win'] is False)
+            draw_team_line(x, box_top + BOX_H - px(16), slot['team2'], slot['team2']['score'], slot['team2']['win'],
+                           muted=slot['team2']['win'] is False)
+            draw.line((x + px(8), y, x + COL_W - px(8), y), fill=SECTION_HDR_BORDER, width=max(1, px(0.5)))
+            if slot['status'] == 'live':
+                draw.ellipse((x + COL_W - px(10), box_top + px(2), x + COL_W - px(4), box_top + px(8)), fill=LIVE_DOT_BLUE)
+
+    def draw_connector(ri, si, slot):
+        """A right-angle elbow from each of this slot's sources (previous
+        round, right edge) into this slot's left edge -- a straight line for
+        a single (bye-continuation) source, a merging 'V' for two."""
+        x_dst = col_x[ri]
+        y_dst = slot_y[ri][si]
+        x_src_edge = col_x[ri - 1] + COL_W
+        mid_x = (x_src_edge + x_dst) / 2
+        sources = slot['sources']
+        if len(sources) == 1:
+            y_src = slot_y[ri - 1][sources[0]]
+            draw.line((x_src_edge, y_src, x_dst, y_src), fill=LINE_COLOR, width=max(1, px(1.5)))
+            if y_src != y_dst:
+                draw.line((x_dst, y_src, x_dst, y_dst), fill=LINE_COLOR, width=max(1, px(1.5)))
+        else:
+            for s in sources:
+                y_src = slot_y[ri - 1][s]
+                draw.line((x_src_edge, y_src, mid_x, y_src), fill=LINE_COLOR, width=max(1, px(1.5)))
+            y_a, y_b = slot_y[ri - 1][sources[0]], slot_y[ri - 1][sources[1]]
+            draw.line((mid_x, y_a, mid_x, y_b), fill=LINE_COLOR, width=max(1, px(1.5)))
+            draw.line((mid_x, y_dst, x_dst, y_dst), fill=LINE_COLOR, width=max(1, px(1.5)))
+
+    for ri, rnd in enumerate(rounds):
+        label = "Championship" if ri == n_rounds - 1 else "Semifinals" if ri == n_rounds - 2 else f"Round {ri + 1}"
+        draw.text((col_x[ri], HEADER_H + px(4)), label.upper(), font=f_round_label, fill=SECTION_HDR_GREEN)
+        for si, slot in enumerate(rnd):
+            if ri > 0:
+                draw_connector(ri, si, slot)
+            draw_slot(ri, si, slot)
+
+    if champion and rounds:
+        y = slot_y[-1][0]
+        x_src_edge = col_x[-1] + COL_W
+        draw.line((x_src_edge, y, champ_x, y), fill=LINE_COLOR, width=max(1, px(1.5)))
+        box_top = y - BOX_H / 2
+        draw.rounded_rectangle((champ_x, box_top, champ_x + CHAMPION_COL_W, box_top + BOX_H), radius=px(4), fill=TOTAL_ROW_BG, outline=SECTION_HDR_GREEN, width=max(1, px(1)))
+        draw.text((champ_x + px(10), box_top + px(4)), "CHAMPION", font=f_champ_label, fill=SECTION_HDR_GREEN)
+        logo_r2 = px(12)
+        _circle_image(img, champion.get('logo_path'), champ_x + px(10) + logo_r2, box_top + BOX_H - px(14), logo_r2, fallback_text=champion['name'])
+        name_avail = CHAMPION_COL_W - px(20) - logo_r2 * 2 - px(6)
+        cname = _ellipsize(draw, champion['name'], f_champ_name, name_avail)
+        draw.text((champ_x + px(10) + logo_r2 * 2 + px(6), box_top + BOX_H - px(23)), cname, font=f_champ_name, fill=PTS_DARK)
 
     return _finalize(img)
 
@@ -1907,6 +2094,86 @@ def render_league_info_card(data: dict) -> io.BytesIO:
     return _finalize(img)
 
 
+def render_reference_card(data: dict) -> io.BytesIO:
+    """Generic command-reference card shared by /help and /welcome so both
+    match the card visual system instead of falling back to a default
+    Discord embed.
+
+    Wider than the roster-style cards on purpose: this content is naturally
+    a long list of short rows, and Discord's inline preview is HEIGHT-bound
+    (see CARD_W comment above) -- spreading rows into side-by-side columns
+    cuts total height a lot, which raises the effective font size in the
+    shrunk preview far more than just bumping the font would on its own.
+
+    Data contract:
+    {
+      'title': str, 'subtitle': str,
+      'sections': [section_or_row, ...],
+      'footer': str or None,
+    }
+    section_or_row is either one {'title': str, 'items': [(label, desc), ...]}
+    section (rendered full width), or a list of 2+ such sections rendered
+    side by side as columns (mirrors the old embed's inline=True fields).
+    """
+    rows = [s if isinstance(s, list) else [s] for s in data['sections']]
+    footer = data.get('footer')
+
+    card_w = round(CARD_W * 1.5)
+
+    f_title = _font('impact', px(26))
+    f_subtitle = _font('bold', px(12))
+    f_section_hdr = _font('bold', px(11.5))
+    f_label = _font('bold', px(13))
+    f_desc = _font('regular', px(13))
+    f_footer = _font('regular', px(11))
+
+    HEADER_H = px(70)
+    SECTION_HDR_H = px(28)
+    ROW_H = px(28)
+    FOOTER_H = px(32) if footer else 0
+    PAD = px(24)
+    COL_GAP = px(28)
+
+    def row_height(row):
+        return SECTION_HDR_H + max(len(col['items']) for col in row) * ROW_H
+
+    total_h = HEADER_H + sum(row_height(r) for r in rows) + FOOTER_H
+    img = Image.new("RGB", (card_w, total_h), ROSTER_BG)
+    _turf_stripes(img, (0, 0, card_w, HEADER_H), TURF_C1, TURF_C2, px(48))
+    draw = ImageDraw.Draw(img)
+
+    icon_r = px(23)
+    icon_cx, icon_cy = PAD + icon_r, HEADER_H // 2
+    _circle_image(img, None, icon_cx, icon_cy, icon_r, border_color=(255, 255, 255, 150), border_w=px(2), fallback_text="FF")
+    text_x = icon_cx + icon_r + px(16)
+    draw.text((text_x, HEADER_H // 2 - px(21)), data['title'].upper(), font=f_title, fill=WHITE)
+    draw.text((text_x, HEADER_H // 2 + px(11)), data['subtitle'], font=f_subtitle, fill=TEAM_META)
+
+    y = HEADER_H
+    for row in rows:
+        ncols = len(row)
+        col_w = (card_w - COL_GAP * (ncols - 1)) / ncols
+        for i, section in enumerate(row):
+            cx = i * (col_w + COL_GAP)
+            draw.text((cx + px(8), y + px(9)), section['title'].upper(), font=f_section_hdr, fill=SECTION_HDR_GREEN)
+            _dashed_hline(draw, cx, cx + col_w, y + SECTION_HDR_H, SECTION_HDR_BORDER, width=max(1, px(0.5)))
+            ry = y + SECTION_HDR_H
+            for j, (label, desc) in enumerate(section['items']):
+                if j % 2 == 1:
+                    draw.rectangle((cx, ry, cx + col_w, ry + ROW_H), fill=ROSTER_ZEBRA)
+                draw.text((cx + PAD, ry + ROW_H // 2 - px(9)), label, font=f_label, fill=PTS_DARK)
+                lw = _tw(draw, label, f_label)
+                desc_fit = _ellipsize(draw, desc, f_desc, col_w - PAD - lw - px(10) - PAD)
+                draw.text((cx + PAD + lw + px(10), ry + ROW_H // 2 - px(9)), desc_fit, font=f_desc, fill=PLAYER_SUB_GRAY)
+                ry += ROW_H
+        y += row_height(row)
+
+    if footer:
+        draw.text((card_w / 2, y + FOOTER_H / 2), footer, font=f_footer, fill=PLAYER_SUB_GRAY, anchor="mm")
+
+    return _finalize(img)
+
+
 if __name__ == "__main__":
     import asyncio
     from image_cache import get_images
@@ -2148,6 +2415,65 @@ if __name__ == "__main__":
         print("OK: wrote bench_dual_demo.png")
 
     asyncio.run(demo_bench())
+
+    async def demo_playoffs():
+        # Real 2025 Nutt Sacks playoff bracket, verified against the actual
+        # league (including the real slot/sources tree _build_playoff_bracket_data
+        # produces): seeds 1-2 (GOAT, RINO) bye round 1, GOAT wins it all.
+        from image_cache import get_logos_by_url
+        logo_urls = {
+            'GOAT': 'https://media.4-paws.org/3/4/6/9/3469d55bcda3d9fd8f5b60b1045bd01cb36e4300/VIER%20PFOTEN_2019-10-08_065-1930x1335.jpg',
+            'RINO': 'https://g.espncdn.com/lm-static/ffl/images/default_logos/1.svg',
+            'Team Josh Allen': 'https://ih1.redbubble.net/image.1133972217.8204/flat,128x128,075,t.jpg',
+            'LaPorta Potty': 'https://a.espncdn.com/i/teamlogos/ncaa/500/8.png',
+            'Danger Rangers': 'https://mystique-api.fantasy.espn.com/apis/v1/domains/lm/images/0dd370c0-7428-11f0-9926-ff4c4a4ff9e8',
+            'Swift Nation (Travis version)': 'https://media-cldnry.s-nbcnews.com/image/upload/rockcms/2024-05/240516-travis-kelce-taylor-swift-ac-1038p-62f872.jpg',
+        }
+        logos = await get_logos_by_url(list(logo_urls.values()))
+        lp = {name: logos.get(url) for name, url in logo_urls.items()}
+
+        def team(seed, name):
+            return {'seed': seed, 'name': name, 'logo_path': lp[name]}
+
+        def bye(seed, name, source):
+            return {'type': 'bye', 'team': team(seed, name), 'sources': [source]}
+
+        def game(seed1, name1, score1, win1, seed2, name2, score2, win2, sources):
+            return {'type': 'game', 'status': 'final',
+                    'team1': {**team(seed1, name1), 'score': score1, 'win': win1},
+                    'team2': {**team(seed2, name2), 'score': score2, 'win': win2},
+                    'sources': sources}
+
+        data = {
+            'league_name': 'Nutt Sacks', 'season': 2025,
+            'rounds': [
+                [
+                    # Order matters: siblings that merge into the same next-round
+                    # slot must sit adjacent to each other here (see the reorder
+                    # pass in _build_playoff_bracket_data) -- GOAT's bye next to
+                    # its actual semifinal opponent's game, not grouped with RINO.
+                    bye(1, 'GOAT', 0),
+                    game(4, 'LaPorta Potty', 123.8, False, 5, 'Danger Rangers', 149.7, True, [3, 4]),
+                    bye(2, 'RINO', 1),
+                    game(3, 'Team Josh Allen', 149.8, False, 6, 'Swift Nation (Travis version)', 170.6, True, [2, 5]),
+                ],
+                [
+                    game(1, 'GOAT', 155.1, True, 5, 'Danger Rangers', 127.6, False, [0, 1]),
+                    game(2, 'RINO', 101.5, False, 6, 'Swift Nation (Travis version)', 116.7, True, [2, 3]),
+                ],
+                [
+                    game(1, 'GOAT', 124.3, True, 6, 'Swift Nation (Travis version)', 50.0, False, [0, 1]),
+                ],
+            ],
+            'champion': {'seed': 1, 'name': 'GOAT', 'logo_path': lp['GOAT']},
+        }
+        buf = render_playoff_bracket_card(data)
+        assert buf.getbuffer().nbytes > 0, "render produced an empty buffer"
+        with open("playoffs_card_demo.png", "wb") as f:
+            f.write(buf.read())
+        print("OK: wrote playoffs_card_demo.png")
+
+    asyncio.run(demo_playoffs())
 
     async def demo_player():
         images = await get_images(player_ids=[4361741], team_abbrs=['sf'])

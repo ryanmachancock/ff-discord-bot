@@ -12,8 +12,14 @@ import os
 import io
 import hashlib
 import asyncio
+import urllib.parse
 import aiohttp
 from PIL import Image
+from svglib.svglib import svg2rlg
+from reportlab.graphics import renderPM
+from dotenv import load_dotenv
+
+load_dotenv()
 
 CACHE_DIR = os.path.join(os.path.dirname(__file__), "cache", "images")
 PLAYER_DIR = os.path.join(CACHE_DIR, "players")
@@ -22,6 +28,13 @@ GENERIC_DIR = os.path.join(CACHE_DIR, "generic")
 
 HEADSHOT_URL = "https://a.espncdn.com/i/headshots/nfl/players/full/{id}.png"
 TEAM_LOGO_URL = "https://a.espncdn.com/i/teamlogos/nfl/500/{abbr}.png"
+
+# Some custom fantasy team logos are hosted on ESPN's authenticated
+# image API (mystique-api.fantasy.espn.com) rather than its public static
+# CDN, and 401 without the same league session cookies used for the main
+# API. Harmless to attach only when the request is actually going to an
+# espn.com host -- other sites just won't recognize these cookie names.
+ESPN_COOKIES = {"SWID": os.getenv("ESPN_SWID"), "espn_s2": os.getenv("ESPN_S2")}
 
 os.makedirs(PLAYER_DIR, exist_ok=True)
 os.makedirs(TEAM_DIR, exist_ok=True)
@@ -66,13 +79,32 @@ async def get_team_logo(session, team_abbr) -> str | None:
     return await _resolve(session, TEAM_LOGO_URL.format(abbr=abbr), cache_path)
 
 
+def _rasterize_svg(data: bytes) -> bytes | None:
+    """A decent fraction of custom fantasy team logos are SVGs, which Pillow
+    can't decode at all -- svglib+reportlab render the common case (flat
+    shapes/icons, which team logos are) to a real raster image. Not a full
+    SVG implementation (complex filters/gradients may not render right),
+    but good enough that we tried it before giving up. Returns None on any
+    failure so the caller falls back to the normal miss path."""
+    try:
+        drawing = svg2rlg(io.BytesIO(data))
+        if drawing is None:
+            return None
+        buf = io.BytesIO()
+        renderPM.drawToFile(drawing, buf, fmt="PNG")
+        return buf.getvalue()
+    except Exception:
+        return None
+
+
 async def _resolve_url(session, url):
     """Like _resolve(), but for an arbitrary URL (custom fantasy team logos
     are hosted anywhere -- ESPN CDN, redbubble, pinimg, hand-drawn SVGs...).
     Cached by a hash of the URL since there's no stable ID to key on.
-    Anything Pillow can't decode (SVG, a broken/non-image response) is
-    treated as a miss and cached negatively, same as a real 404 -- callers
-    always get a real raster image or a clean None, never a crash."""
+    Anything that's neither a Pillow-readable raster nor an SVG we can
+    rasterize (a broken/non-image response) is treated as a miss and cached
+    negatively, same as a real 404 -- callers always get a real raster
+    image or a clean None, never a crash."""
     key = hashlib.sha1(url.encode("utf-8")).hexdigest()
     cache_path = os.path.join(GENERIC_DIR, f"{key}.png")
     if os.path.exists(cache_path):
@@ -81,8 +113,9 @@ async def _resolve_url(session, url):
     if os.path.exists(miss_marker):
         return None
 
+    cookies = ESPN_COOKIES if urllib.parse.urlsplit(url).hostname.endswith("espn.com") else None
     try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=5), cookies=cookies) as resp:
             if resp.status != 200:
                 open(miss_marker, "wb").close()
                 return None
@@ -93,10 +126,19 @@ async def _resolve_url(session, url):
     try:
         img = Image.open(io.BytesIO(data))
         img.load()
-        img.convert("RGBA").save(cache_path, format="PNG")
     except Exception:
-        open(miss_marker, "wb").close()
-        return None
+        rasterized = _rasterize_svg(data)
+        if rasterized is None:
+            open(miss_marker, "wb").close()
+            return None
+        try:
+            img = Image.open(io.BytesIO(rasterized))
+            img.load()
+        except Exception:
+            open(miss_marker, "wb").close()
+            return None
+
+    img.convert("RGBA").save(cache_path, format="PNG")
     return cache_path
 
 
@@ -146,11 +188,13 @@ if __name__ == "__main__":
 
         logos = await get_logos_by_url([
             "https://a.espncdn.com/i/teamlogos/nfl/500/sf.png",  # real raster, should resolve
-            "https://g.espncdn.com/lm-static/ffl/images/default_logos/1.svg",  # SVG, should miss cleanly
+            "https://g.espncdn.com/lm-static/ffl/images/default_logos/1.svg",  # SVG, should rasterize
+            "https://g.espncdn.com/lm-static/ffl/images/default_logos/does-not-exist-999.svg",  # real 404, should miss cleanly
         ])
-        raster_url, svg_url = list(logos.keys())
+        raster_url, svg_url, broken_url = list(logos.keys())
         assert logos[raster_url] and os.path.exists(logos[raster_url]), "raster logo URL should resolve"
-        assert logos[svg_url] is None, "SVG should fall back to None, not crash"
+        assert logos[svg_url] and os.path.exists(logos[svg_url]), "SVG should now rasterize to a real image"
+        assert logos[broken_url] is None, "a real 404 should still miss cleanly, not crash"
         print("OK:", result, logos)
 
     asyncio.run(demo())

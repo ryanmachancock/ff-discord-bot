@@ -145,12 +145,21 @@ adds to every line — always budgeted against, never added back in by hand.
 
 ## Where things stand (2026-09-07)
 
-Every live data command already renders natively (Components V2 Container
-or classic Embed) — there is no Pillow-image path left in any real command.
-`image_render.py`'s render_* functions are only still used by the `/testteam`
-and `/teststandings` prototype commands, which are a deliberate, undecided
-visual A/B and out of scope for a style-consistency pass.
+Every command renders natively (Components V2 Container or classic Embed).
+There is no Pillow-image path anywhere in the bot: `image_render.py`, and
+the `/testteam`/`/teststandings`/`/testgrid` prototype commands that were
+its only callers, were deleted outright (the image-style A/B was decided
+against). `image_cache.py` (`get_images`/`get_logos_by_url`) still exists
+and is still used — that's small per-player headshots and team logos shown
+as a `discord.ui.Thumbnail`/`Section` accessory inside real commands
+(`/player`, `/team`, `/waiver`, `/sleeper`), not a rendered card.
 
-See `docs/command_style_handoff.md` for the specific punch list of which
-commands have been brought up to the `/scoreboard` / `/matchup` bar already
-and which still need a look.
+Every command in the bot has been reviewed against the `/scoreboard` /
+`/matchup` style bar at least once; `/compare`, `/compare_cross_league`,
+and `/trade` all needed real fixes to get there (see bot.py's inline
+comments on `_compare_embed` and `/trade`'s `trade_table` for what broke
+and why). `/compare`'s table keeps a header row repeating both team names
+on purpose — real user feedback overrode the "don't duplicate the header"
+instinct below: unlike `/matchup`, `/compare`'s rows are bare label/number
+pairs with nothing else to anchor a column to, so dropping the header left
+the table ambiguous on its own.

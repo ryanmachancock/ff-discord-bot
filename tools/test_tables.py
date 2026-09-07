@@ -24,7 +24,7 @@ Covers, in order:
      object: _roster_table, _matchup_table, _compare_embed.
 
 No pytest/unittest -- plain functions and asserts, run in sequence from
-__main__, matching image_render.py's test_teststandings_legibility style.
+__main__.
 """
 import os
 import sys
@@ -272,18 +272,21 @@ def test_matchup_table():
 
 
 def test_compare_embed():
-    """_compare_embed (/compare and /compare_cross_league): a genuinely
-    long team name in the header must appear verbatim, never truncated,
-    and the embedded table must still line up even though it's wrapped
-    inside a discord.Embed description alongside plain markdown."""
+    """_compare_embed (/compare and /compare_cross_league): one row per
+    team (PF/PA/PPG/PROJ as columns, like /standings' TEAM column), not
+    one row per stat with both team names sharing a header -- so a real
+    outlier name (LONG_TEAM_NAME, 30 chars) must now fit on a single line
+    with no overflow at all, and an even more extreme synthetic name must
+    still never truncate even when it does overflow."""
     data = {
         'team1': {'name': LONG_TEAM_NAME, 'record': '8-3'},
         'team2': {'name': 'Tyler is Fine', 'record': '5-6', 'league': 'Dynasty'},
         'series_note': "Alpha leads the season series 2-1",
+        'current_week': 5,
         'rows': [
-            {'label': 'PPG', 'left_val': '112.4', 'right_val': '104.9'},
-            {'label': 'Win %', 'left_val': '72.7%', 'right_val': '45.5%'},
-            {'label': 'Streak', 'left_val': 'W3', 'right_val': 'L1'},
+            {'abbrev': 'PPG', 'left_val': '112.4', 'right_val': '104.9'},
+            {'abbrev': 'WIN%', 'left_val': '72.7', 'right_val': '45.5'},
+            {'abbrev': 'STRK', 'left_val': 'W3', 'right_val': 'L1'},
         ],
     }
     embed = bot._compare_embed(data)
@@ -292,8 +295,19 @@ def test_compare_embed():
     assert LONG_TEAM_NAME in desc, "full outlier team name must appear verbatim"
 
     lines = _table_lines_from(desc)
-    width = _assert_uniform_width(lines, "_compare_embed")
-    print(f"OK: _compare_embed -- outlier team name preserved, {len(lines)} table lines all width {width}")
+    _assert_uniform_width(lines, "_compare_embed (realistic outlier)")
+    assert any(LONG_TEAM_NAME in l and "112.4" in l for l in lines), \
+        "a realistic 30-char outlier name should fit on the SAME line as its own stats now, not overflow onto its own bare line"
+
+    # An even more extreme name must still never truncate, even though it
+    # does overflow onto its own line at this length.
+    extreme_name = "The " + LONG_TEAM_NAME * 2
+    data2 = {**data, 'team1': {'name': extreme_name, 'record': '8-3'}}
+    desc2 = bot._compare_embed(data2).description
+    assert "…" not in desc2
+    assert extreme_name in desc2, "even an extreme outlier name must appear verbatim, never truncated"
+    width = _assert_uniform_width(_table_lines_from(desc2), "_compare_embed (extreme outlier)")
+    print(f"OK: _compare_embed -- realistic outlier fits inline, extreme outlier still never truncates, width {width}")
 
 
 TESTS = [

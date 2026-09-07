@@ -12,6 +12,7 @@ secrets.json
 user_leagues.json
 league_data.json
 user_data.json
+docs/
 
 # Downloaded player headshots / team logos (fetched on demand, not source)
 cache/

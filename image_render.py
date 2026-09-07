@@ -42,15 +42,27 @@ import math
 import itertools
 from PIL import Image, ImageDraw, ImageFont
 
+from config.discord_display import BARE_ATTACHMENT_WIDTH, BARE_ATTACHMENT_HEIGHT, MIN_SCREEN_FONT
+
 SCALE = 2  # render at 2x the CSS mockup's logical pixels for a crisp PNG
 CARD_W = 640 * SCALE
-# Discord fits inline attachment previews inside a ~400x300 box. Our cards are
-# tall (many stacked rows), so the ~300px HEIGHT cap is what actually governs
-# the shrink for nearly all of them -- not width. Shrinking CARD_W (tried and
+# Discord fits inline attachment previews inside a bounding box -- actually
+# measured (not guessed) at ~514x352 CSS px for a bare attachment, see
+# config/discord_display.py for how and when. Our cards are tall (many
+# stacked rows), so the ~352px HEIGHT cap is what actually governs the
+# shrink for nearly all of them -- not width. Shrinking CARD_W (tried and
 # reverted) only raises the font/canvas ratio on the width axis, which has no
 # effect when height is the binding constraint: it just increases name
 # truncation for zero visible size gain. Making cards legible without a click
-# requires reducing their total pixel HEIGHT (shorter rows/header), not width.
+# requires reducing their total pixel HEIGHT (shorter rows/header), not width
+# -- see _solve_standings_layout for a card that actually solves for this
+# instead of guessing at row counts.
+
+CARD_W_WIDE = round(CARD_W * 1.5)  # the "landscape" width shared by every
+# card whose content is naturally wide (side-by-side columns, a multi-round
+# bracket) instead of a tall single stack -- keeping these on one shared
+# constant is what makes /help, /welcome, and /playoffs read as the same
+# family instead of three arbitrarily-sized images.
 
 
 def px(v):
@@ -1221,7 +1233,7 @@ def render_playoff_bracket_card(data: dict) -> io.BytesIO:
     f_champ_label = _font('bold', px(10))
     f_champ_name = _font('impact', px(16))
 
-    HEADER_H = px(64)
+    HEADER_H = px(78)
     TOP_PAD = px(30)
     BOTTOM_PAD = px(20)
     SLOT_H = px(64)      # vertical spacing between adjacent round-0 slots
@@ -1232,8 +1244,14 @@ def render_playoff_bracket_card(data: dict) -> io.BytesIO:
     LINE_COLOR = SECTION_HDR_BORDER
 
     n_rounds = len(rounds)
-    col_x = [px(22) + i * (COL_W + COL_GAP) for i in range(n_rounds)]
-    champ_x = col_x[-1] + COL_W + COL_GAP if n_rounds else px(22)
+    # Center the bracket horizontally inside the shared CARD_W_WIDE canvas
+    # (same width /help and /welcome use) instead of sizing the canvas to
+    # exactly fit the tree -- that's what made this card a one-off size
+    # instead of matching the rest of the "wide" card family.
+    content_w = px(22) + n_rounds * COL_W + max(0, n_rounds - 1) * COL_GAP + COL_GAP + CHAMPION_COL_W + px(22) if n_rounds else px(44)
+    x_off = max(0, (CARD_W_WIDE - content_w) // 2)
+    col_x = [x_off + px(22) + i * (COL_W + COL_GAP) for i in range(n_rounds)]
+    champ_x = col_x[-1] + COL_W + COL_GAP if n_rounds else x_off + px(22)
 
     # ---- pass 1: compute each slot's vertical center, bottom-up isn't
     # needed since round 0's order already reflects the real bracket shape
@@ -1253,20 +1271,20 @@ def render_playoff_bracket_card(data: dict) -> io.BytesIO:
 
     content_bottom = TOP_PAD + len(rounds[0]) * SLOT_H if rounds else TOP_PAD
     total_h = HEADER_H + content_bottom + BOTTOM_PAD
-    total_w = champ_x + CHAMPION_COL_W + px(22)
+    total_w = max(CARD_W_WIDE, champ_x + CHAMPION_COL_W + px(22) + x_off)
 
     img = Image.new("RGB", (round(total_w), round(total_h)), ROSTER_BG)
     _turf_stripes(img, (0, 0, round(total_w), HEADER_H), TURF_C1, TURF_C2, px(42))
     draw = ImageDraw.Draw(img)
 
-    logo_r = px(19)
-    logo_cx, logo_cy = px(22) + logo_r, HEADER_H // 2
+    logo_r = px(23)
+    logo_cx, logo_cy = px(24) + logo_r, HEADER_H // 2
     _circle_image(img, None, logo_cx, logo_cy, logo_r, border_color=(255, 255, 255, 150), border_w=px(2),
                   fallback_text=data['league_name'])
-    text_x = logo_cx + logo_r + px(10)
-    draw.text((text_x, HEADER_H // 2 - px(17)), data['league_name'].upper(), font=f_league_name, fill=WHITE)
+    text_x = logo_cx + logo_r + px(14)
+    draw.text((text_x, HEADER_H // 2 - px(20)), data['league_name'].upper(), font=f_league_name, fill=WHITE)
     meta = f"PLAYOFF BRACKET  ·  {data['season']}"
-    draw.text((text_x, HEADER_H // 2 + px(4)), meta, font=f_league_meta, fill=TEAM_META)
+    draw.text((text_x, HEADER_H // 2 + px(10)), meta, font=f_league_meta, fill=TEAM_META)
 
     def score_color(win):
         if win is None:
@@ -2118,7 +2136,7 @@ def render_reference_card(data: dict) -> io.BytesIO:
     rows = [s if isinstance(s, list) else [s] for s in data['sections']]
     footer = data.get('footer')
 
-    card_w = round(CARD_W * 1.5)
+    card_w = CARD_W_WIDE
 
     f_title = _font('impact', px(26))
     f_subtitle = _font('bold', px(12))
@@ -2170,6 +2188,499 @@ def render_reference_card(data: dict) -> io.BytesIO:
 
     if footer:
         draw.text((card_w / 2, y + FOOTER_H / 2), footer, font=f_footer, fill=PLAYER_SUB_GRAY, anchor="mm")
+
+    return _finalize(img)
+
+
+# ---------------------------------------------------------- dark mock test --
+# Colors below are converted (not eyeballed) from the oklch() values in an
+# external design mock (a Claude-generated artifact of alternate Discord
+# message concepts) so /testteam can A/B this flat, no-photo, data-forward
+# style against the real render_team_card in Discord itself.
+DARK_BG = (24, 27, 31)
+DARK_BORDER = (38, 41, 46)
+DARK_DIVIDER = (48, 51, 56)
+DARK_TEXT = (238, 242, 249)
+DARK_META = (136, 144, 156)
+DARK_META_DIM = (107, 114, 126)
+DARK_ZEBRA = (30, 33, 37)
+DARK_ACCENT = (52, 211, 153)
+
+
+def render_league_banner(league_name: str) -> io.BytesIO:
+    """Just the turf-striped header row (logo + 'FANTASY LEAGUE' title), no
+    body content -- for a hybrid embed (e.g. /teststandings) that wants the
+    branded header graphic as embed.image while the actual data lives in the
+    embed's own text, not baked into the picture."""
+    HEADER_H = px(70)
+    f_title = _font('impact', px(28))
+    pad = px(24)
+
+    img = Image.new("RGB", (CARD_W, HEADER_H), ROSTER_BG)
+    _turf_stripes(img, (0, 0, CARD_W, HEADER_H), TURF_C1, TURF_C2, px(48))
+    draw = ImageDraw.Draw(img)
+
+    logo_r = px(23)
+    logo_cx, logo_cy = pad + logo_r, HEADER_H // 2
+    _circle_image(img, None, logo_cx, logo_cy, logo_r, border_color=(255, 255, 255, 150), border_w=px(2), fallback_text=league_name)
+    text_x = logo_cx + logo_r + px(16)
+    draw.text((text_x, HEADER_H // 2 - px(16)), "FANTASY LEAGUE", font=f_title, fill=WHITE)
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return buf
+
+
+def render_team_card_dark(data: dict) -> io.BytesIO:
+    """Same data contract as render_team_card -- an alternate visual style
+    for A/B comparison via /testteam, not a replacement. Deliberately drops
+    headshots/logos (the mock it's based on is text/data-only, no photos)
+    and skips the white _finalize() border, since a dark card is meant to
+    blend into Discord's own dark chrome rather than contrast against it."""
+    starters = data['starters']
+    bench_count = data.get('bench_count', 0)
+
+    f_label = _font('bold', px(10))
+    f_name = _font('bold', px(16))
+    f_meta = _font('regular', px(11))
+    f_row_slot = _font('bold', px(9))
+    f_row_name = _font('bold', px(12))
+    f_row_sub = _font('regular', px(10))
+    f_row_pts = _font('impact', px(15))
+    f_row_proj = _font('regular', px(9.5))
+    f_total_label = _font('bold', px(11))
+    f_total_pts = _font('impact', px(20))
+    f_footer = _font('regular', px(10))
+
+    PAD = px(20)
+    ROW_H = px(34)
+    HEADER_H = px(70)
+    TOTAL_ROW_H = px(40)
+    FOOTER_H = px(28)
+
+    total_h = HEADER_H + len(starters) * ROW_H + TOTAL_ROW_H + FOOTER_H
+    img = Image.new("RGB", (CARD_W, total_h), DARK_BG)
+    draw = ImageDraw.Draw(img)
+    draw.rounded_rectangle((0, 0, CARD_W - 1, total_h - 1), radius=px(10), outline=DARK_BORDER, width=max(1, px(1)))
+
+    label = f"WEEK {data['current_week']}  ·  TEAM ROSTER"
+    draw.text((PAD, px(16)), label, font=f_label, fill=DARK_META)
+    name_y = px(34)
+    draw.text((PAD, name_y), data['team_name'], font=f_name, fill=DARK_TEXT)
+    nw = _tw(draw, data['team_name'], f_name)
+    meta = f"   {data['record']}  ·  Rank {data['rank']} of {data['total_teams']}"
+    draw.text((PAD + nw, name_y + px(4)), meta, font=f_meta, fill=DARK_META)
+
+    y = HEADER_H
+    draw.line((PAD, y, CARD_W - PAD, y), fill=DARK_DIVIDER, width=max(1, px(1)))
+
+    for i, row in enumerate(starters):
+        if i % 2 == 1:
+            draw.rectangle((px(1), y, CARD_W - px(1), y + ROW_H), fill=DARK_ZEBRA)
+        cy = y + ROW_H / 2
+
+        draw.text((PAD, cy - px(5)), row['slot'], font=f_row_slot, fill=DARK_META_DIM)
+
+        name_x = PAD + px(38)
+        draw.text((name_x, cy - px(8)), row['name'], font=f_row_name, fill=DARK_TEXT)
+        status_str = f" {row['status']}" if row.get('status') else ""
+        sub = f"{row['position']} · {row['opp_abbr']}{status_str}"
+        draw.text((name_x, cy + px(5)), sub, font=f_row_sub, fill=DARK_META_DIM)
+
+        proj_str = f"({row['proj']:.1f})"
+        pw = _tw(draw, proj_str, f_row_proj)
+        draw.text((CARD_W - PAD - pw, cy + px(5)), proj_str, font=f_row_proj, fill=DARK_META_DIM)
+
+        pts_str = f"{row['actual']:.1f}"
+        ptw = _tw(draw, pts_str, f_row_pts)
+        pts_color = DARK_ACCENT if row['actual'] >= row['proj'] else DARK_TEXT
+        draw.text((CARD_W - PAD - ptw, cy - px(10)), pts_str, font=f_row_pts, fill=pts_color)
+
+        y += ROW_H
+
+    draw.line((PAD, y, CARD_W - PAD, y), fill=DARK_DIVIDER, width=max(1, px(1)))
+    ty = y + TOTAL_ROW_H / 2
+    draw.text((PAD, ty - px(7)), "STARTERS TOTAL", font=f_total_label, fill=DARK_META)
+    total_str = f"{data['starters_total_actual']:.1f}"
+    tw = _tw(draw, total_str, f_total_pts)
+    draw.text((CARD_W - PAD - tw, ty - px(11)), total_str, font=f_total_pts, fill=DARK_ACCENT)
+    y += TOTAL_ROW_H
+
+    footer = f"{bench_count} Bench Players  ·  /bench {data['team_name']}"
+    fw = _tw(draw, footer, f_footer)
+    draw.text(((CARD_W - fw) / 2, y + FOOTER_H / 2 - px(6)), footer, font=f_footer, fill=DARK_META_DIM)
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return buf
+
+
+def assert_legible(canvas_w, canvas_h, font_px, box_w=BARE_ATTACHMENT_WIDTH,
+                    box_h=BARE_ATTACHMENT_HEIGHT, min_font=MIN_SCREEN_FONT):
+    """Preflight check for every image card: raises if this canvas/font
+    combination would render below min_font CSS px on screen once Discord
+    scales the finished PNG down to fit its display box. Run this before
+    rendering, not after -- a card that quietly regresses back to
+    illegible is exactly the bug that started this rebuild."""
+    scale = min(box_w / canvas_w, box_h / canvas_h)
+    onscreen = font_px * scale
+    if onscreen < min_font:
+        raise ValueError(
+            f"Card would render at {onscreen:.1f}px on screen (canvas "
+            f"{canvas_w:.0f}x{canvas_h:.0f}, font {font_px:.0f}px, scale "
+            f"{scale:.3f}, box {box_w}x{box_h}) -- below MIN_SCREEN_FONT="
+            f"{min_font}px. Reduce row/column count or shrink the non-name "
+            f"column widths, don't just raise the font size (scale absorbs "
+            f"that for a fixed layout, see image_render.py's SCALE comment)."
+        )
+    return scale
+
+
+def _solve_standings_layout(team_names, n_playoff, box_w=BARE_ATTACHMENT_WIDTH,
+                             box_h=BARE_ATTACHMENT_HEIGHT, min_font=MIN_SCREEN_FONT):
+    """Enumerates column counts (1-4) for a standings-shaped list and picks
+    whichever maximizes on-screen font size for THIS roster, measured with
+    real PIL font metrics rather than a guessed character count. For a
+    fixed layout, rendering at a bigger font_px does not change the
+    on-screen result at all -- Discord just scales the bigger canvas back
+    down proportionally (scale = box / canvas, on-screen = font_px * scale,
+    and canvas grows linearly with font_px, so font_px cancels out). The
+    only way to increase on-screen size is a layout that needs less canvas
+    per row of content, which is what this actually searches over.
+
+    Once a column count wins, the name-column width is solved precisely:
+    wide enough that most real team names show in full, capped at exactly
+    the width where the font would drop below min_font, rather than
+    truncating harder than necessary just because one outlier name is long.
+    """
+    REF = 100  # arbitrary reference font size for measuring metrics; cancels out below
+    font = _font('bold', REF)
+    n = len(team_names)
+
+    rank_w = font.getlength("12")
+    logo_d = REF * 1.0
+    record_w = font.getlength("10-4") * 1.15
+    streak_w = font.getlength("W10") + REF * 0.5
+    gap = REF * 0.3
+    row_h = REF * 2.5
+    header_h = REF * 4.2
+    section_label_h = REF * 0.9  # only spent when cols==2 (playoff/lottery split)
+    inter_col_gap = REF * 0.8
+    fixed_col_w = rank_w + gap + logo_d + gap + record_w + gap + streak_w
+    name_w_full = max(font.getlength(t) for t in team_names)
+    has_split = 0 < n_playoff < n
+
+    best = None
+    for cols in (1, 2, 3, 4):
+        if cols == 2 and has_split:
+            rows = max(n_playoff, n - n_playoff)
+        else:
+            rows = math.ceil(n / cols)
+        canvas_h = header_h + (section_label_h if (cols == 2 and has_split) else 0) + rows * row_h
+        canvas_w = cols * (fixed_col_w + name_w_full) + inter_col_gap * (cols - 1)
+        onscreen = REF * min(box_w / canvas_w, box_h / canvas_h)
+        if best is None or onscreen > best['onscreen']:
+            best = {'cols': cols, 'rows': rows, 'canvas_h': canvas_h, 'onscreen': onscreen}
+
+    cols, rows, canvas_h = best['cols'], best['rows'], best['canvas_h']
+
+    # Solve the name-width budget that just clears min_font, rather than
+    # the (narrower, more aggressively truncated) budget that would
+    # squeeze out the absolute max font size -- once the floor is cleared,
+    # more visible name beats a couple of extra px of font.
+    height_scale = box_h / canvas_h
+    target_scale = min(min_font / REF, height_scale)
+    canvas_w_at_floor = box_w / target_scale
+    col_w_at_floor = (canvas_w_at_floor - inter_col_gap * (cols - 1)) / cols
+    name_w_budget = max(0.0, col_w_at_floor - fixed_col_w)
+
+    name_w = min(name_w_budget, name_w_full)
+    canvas_w = cols * (fixed_col_w + name_w) + inter_col_gap * (cols - 1)
+    scale = min(box_w / canvas_w, box_h / canvas_h)
+
+    render_scale = (2 * box_h) / canvas_h  # ~2x the display box for retina crispness
+    f = render_scale
+    return {
+        'cols': cols, 'rows_per_col': rows, 'split': cols == 2 and has_split,
+        'font_px': REF * f,
+        'rank_w': rank_w * f, 'logo_d': logo_d * f, 'record_w': record_w * f,
+        'streak_w': streak_w * f, 'gap': gap * f, 'row_h': row_h * f,
+        'header_h': header_h * f, 'section_label_h': section_label_h * f,
+        'inter_col_gap': inter_col_gap * f, 'name_w_budget': name_w * f,
+        'canvas_w': canvas_w * f, 'canvas_h': canvas_h * f,
+        'onscreen_font': scale * REF,
+    }
+
+
+def render_teststandings_card(data: dict) -> io.BytesIO:
+    """Prototype for /teststandings. Unlike the first two attempts at this
+    (bigger fonts on a wider canvas; a taller canvas), this one actually
+    solves for legibility instead of guessing: _solve_standings_layout picks
+    the column count and name-truncation width that maximize real on-screen
+    font size for this exact roster against the MEASURED Discord display
+    box (config/discord_display.py), and assert_legible below is a hard
+    preflight check, not a hope.
+
+    For our real 12-team league this lands on 2 columns, split into a
+    playoff section and a lottery/consolation section -- both because it
+    wins on legibility and because it tells a better story than one long
+    list. Delivered as a bare attachment on purpose: measurement showed
+    the bare-attachment display box is LARGER than an embed's set_image box
+    in both dimensions, which is the opposite of the original assumption
+    that wrapping in an embed would help.
+
+    Data contract:
+    {
+      'league_name': str, 'week_label': str,
+      'playoff_team_count': int, 'playoff_gb': float or None,
+      'teams': [{'rank': int, 'name': str, 'record': str, 'streak': str,
+                 'logo_path': str or None}, ...],  # already sorted by rank
+    }
+    """
+    teams = data['teams']
+    n_playoff = data.get('playoff_team_count') or 0
+    L = _solve_standings_layout([t['name'] for t in teams], n_playoff)
+    assert_legible(L['canvas_w'], L['canvas_h'], L['font_px'])
+
+    def r(v):
+        return round(v)
+
+    f_league_name = _font('impact', r(L['font_px'] * 1.25))
+    f_week_label = _font('bold', r(L['font_px'] * 0.55))
+    f_rank = _font('impact', r(L['font_px'] * 0.7))
+    f_team_name = _font('bold', r(L['font_px']))
+    f_record = _font('bold', r(L['font_px'] * 0.8))
+    f_streak = _font('bold', r(L['font_px'] * 0.6))
+    f_section = _font('bold', r(L['font_px'] * 0.55))
+
+    CW, CH = r(L['canvas_w']), r(L['canvas_h'])
+    HEADER_H, ROW_H, SECTION_H = r(L['header_h']), r(L['row_h']), r(L['section_label_h'])
+    pad = r(L['gap'] * 2)
+
+    img = Image.new("RGB", (CW, CH), ROSTER_BG)
+    _turf_stripes(img, (0, 0, CW, HEADER_H), TURF_C1, TURF_C2, r(L['font_px'] * 1.5))
+    draw = ImageDraw.Draw(img)
+
+    draw.text((pad, HEADER_H // 2 - r(L['font_px'] * 0.75)), data['league_name'].upper(), font=f_league_name, fill=WHITE)
+    draw.text((pad, HEADER_H // 2 + r(L['font_px'] * 0.3)), data['week_label'].upper(), font=f_week_label, fill=TEAM_META)
+
+    col_w = (CW - r(L['inter_col_gap']) * (L['cols'] - 1)) / L['cols']
+    logo_r = r(L['logo_d'] / 2)
+    name_w = r(L['name_w_budget'])
+
+    def draw_column(col_teams, x0, y0, label=None):
+        y = y0
+        if label:
+            draw.text((x0, y), label.upper(), font=f_section, fill=SECTION_HDR_GREEN)
+            y += SECTION_H
+        x_rank = x0
+        x_logo_cx = x_rank + r(L['rank_w']) + r(L['gap']) + logo_r
+        x_name = x_logo_cx + logo_r + r(L['gap'])
+        col_right = x0 + col_w
+        streak_r_ = col_right
+        record_r_ = streak_r_ - r(L['streak_w']) - r(L['gap'])
+        name_right = record_r_ - r(L['record_w']) - r(L['gap'])
+        for i, t in enumerate(col_teams):
+            row_y = y + i * ROW_H
+            if i % 2 == 1:
+                draw.rectangle((x0, row_y, col_right, row_y + ROW_H), fill=ROSTER_ZEBRA)
+
+            rank_str = str(t['rank'])
+            draw.text((x_rank, row_y + ROW_H // 2 - r(L['font_px'] * 0.4)), rank_str, font=f_rank, fill=PTS_MUTED)
+
+            _circle_image(img, t.get('logo_path'), x_logo_cx, row_y + ROW_H // 2, logo_r,
+                          border_color=HEADSHOT_BORDER, border_w=max(1, r(L['gap'] * 0.15)), fallback_text=t['name'])
+
+            name_txt = _ellipsize(draw, t['name'], f_team_name, min(name_w, name_right - x_name))
+            draw.text((x_name, row_y + ROW_H // 2 - r(L['font_px'] * 0.45)), name_txt, font=f_team_name, fill=PTS_DARK)
+
+            recw = _tw(draw, t['record'], f_record)
+            draw.text((record_r_ - recw, row_y + ROW_H // 2 - r(L['font_px'] * 0.35)), t['record'], font=f_record, fill=PTS_DARK)
+
+            streak = t['streak']
+            is_win = streak.upper().startswith('W')
+            s_bg, s_fg = (STREAK_W_BG, STREAK_W_FG) if is_win else (STREAK_L_BG, STREAK_L_FG)
+            stw = _tw(draw, streak, f_streak)
+            s_w, s_h = r(stw + L['font_px'] * 0.5), r(L['font_px'] * 0.85)
+            s_x, s_y = streak_r_ - s_w, row_y + ROW_H // 2 - s_h // 2
+            draw.rounded_rectangle((s_x, s_y, s_x + s_w, s_y + s_h), radius=r(L['gap'] * 0.4), fill=s_bg)
+            draw.text((s_x + (s_w - stw) / 2, s_y + r(L['font_px'] * 0.15)), streak, font=f_streak, fill=s_fg)
+
+    # Column x-offsets deliberately span the FULL canvas width with no outer
+    # margin (col 1 starts at x=0, the last column's right edge lands
+    # exactly on CW) -- that's what _solve_standings_layout's canvas_w
+    # assumed when it solved for name_w_budget. Adding an outer pad here
+    # without adding it to the solver's math would silently shrink the
+    # columns below what was solved for and clip the rightmost one.
+    if L['split']:
+        playoff_teams, lottery_teams = teams[:n_playoff], teams[n_playoff:]
+        draw_column(playoff_teams, 0, HEADER_H, label="Playoff Line")
+        draw_column(lottery_teams, col_w + r(L['inter_col_gap']), HEADER_H, label="Lottery / Consolation")
+    else:
+        # Fall back to a single flowing column (or however many the solver
+        # picked) when there's no clean playoff/consolation split to tell.
+        per_col = math.ceil(len(teams) / L['cols'])
+        for c in range(L['cols']):
+            chunk = teams[c * per_col:(c + 1) * per_col]
+            draw_column(chunk, c * (col_w + r(L['inter_col_gap'])), HEADER_H)
+
+    return _finalize(img)
+
+
+def test_teststandings_legibility():
+    """Regression check: a 12-team roster (including the real league's
+    worst-case long name) must still solve to an on-screen font at or above
+    MIN_SCREEN_FONT. Run directly (`python image_render.py`) or import and
+    call from a real test runner -- no framework needed for one assertion."""
+    names = [
+        "CeeDeez Nutz", "Team SoloMid", "Danger Rangers", "Swift Nation (Travis version)",
+        "Poot Emporium Sevens", "RINO", "Hawg Ball", "GOAT", "Team Josh Allen",
+        "Foot Ball", "LaPorta Potty", "Tyler's Mediocre team",
+    ]
+    data = {
+        'league_name': 'Nutt Sacks', 'week_label': 'Week 1 · Regular Season',
+        'playoff_team_count': 6, 'playoff_gb': 1.5,
+        'teams': [{'rank': i + 1, 'name': n, 'record': f"{10 - i}-{i + 4}",
+                   'streak': "W3" if i % 2 == 0 else "L2", 'logo_path': None}
+                  for i, n in enumerate(names)],
+    }
+    L = _solve_standings_layout(names, data['playoff_team_count'])
+    scale = assert_legible(L['canvas_w'], L['canvas_h'], L['font_px'])
+    assert L['onscreen_font'] >= MIN_SCREEN_FONT, f"solver picked a layout below the floor: {L['onscreen_font']:.1f}px"
+    assert L['cols'] == 2, f"expected the 2-column split to win for 12 teams, got {L['cols']}"
+    # Full render must not raise (catches drawing-time errors the solver math can't see).
+    render_teststandings_card(data)
+    print(f"OK: {L['cols']} cols, on-screen font {L['onscreen_font']:.1f}px (scale {scale:.3f}), "
+          f"canvas {L['canvas_w']:.0f}x{L['canvas_h']:.0f}")
+
+
+def render_testteam_card(data: dict) -> io.BytesIO:
+    """Prototype for /testteam -- same "bigger type, fewer columns, wider
+    logical canvas" test as render_teststandings_card, applied to the
+    roster card: the OPP column is dropped entirely and status folds into
+    a small chip next to the player's name instead of its own sub-line.
+    Not wired into /team.
+
+    Data contract:
+    {
+      'team_name': str, 'record': str, 'rank': int, 'total_teams': int,
+      'current_week': int, 'logo_path': str or None,
+      'starters': [ROW, ...], 'bench': [ROW, ...],
+      'starters_total_actual': float, 'starters_total_proj': float,
+    }
+    ROW = {'slot': str, 'name': str, 'headshot_path': str or None,
+           'is_logo': bool, 'status': 'Q'/'O'/None,
+           'actual': float, 'proj': float}
+    """
+    TW = px(800)
+    starters = data['starters']
+    bench = data['bench']
+
+    f_team_name = _font('impact', px(40))
+    f_meta = _font('bold', px(18))
+    f_record = _font('impact', px(34))
+    f_section = _font('bold', px(16))
+    f_slot = _font('bold', px(14))
+    f_name = _font('bold', px(26))
+    f_tag = _font('bold', px(14))
+    f_pts = _font('impact', px(28))
+    f_proj = _font('regular', px(16))
+    f_total_label = _font('bold', px(18))
+    f_total_val = _font('impact', px(32))
+    f_total_val_sm = _font('regular', px(18))
+
+    HEADER_H = px(130)
+    SECTION_H = px(46)
+    ROW_H = px(84)
+    TOTAL_H = px(56)
+
+    total_h = HEADER_H + SECTION_H + ROW_H * len(starters) + TOTAL_H
+    if bench:
+        total_h += SECTION_H + ROW_H * len(bench)
+
+    img = Image.new("RGB", (TW, total_h), ROSTER_BG)
+    _turf_stripes(img, (0, 0, TW, HEADER_H), TURF_C1, TURF_C2, px(56))
+    draw = ImageDraw.Draw(img)
+
+    pad = px(32)
+    logo_r = px(38)
+    _circle_image(img, data.get('logo_path'), pad + logo_r, HEADER_H // 2, logo_r,
+                  border_color=(255, 255, 255, 150), border_w=px(2), fallback_text=data['team_name'], fallback_bg=FALLBACK_BG)
+    text_x = pad + logo_r * 2 + px(20)
+    draw.text((text_x, HEADER_H // 2 - px(30)), data['team_name'].upper(), font=f_team_name, fill=WHITE)
+    meta = f"RANK {data['rank']} OF {data['total_teams']}  ·  WEEK {data['current_week']}"
+    draw.text((text_x, HEADER_H // 2 + px(14)), meta, font=f_meta, fill=TEAM_META)
+    rw = _tw(draw, data['record'], f_record)
+    draw.text((TW - pad - rw, HEADER_H // 2 - px(20)), data['record'], font=f_record, fill=WHITE)
+
+    def section_header(y, label):
+        draw.text((pad, y + SECTION_H // 2 - px(11)), label.upper(), font=f_section, fill=SECTION_HDR_GREEN)
+        _dashed_hline(draw, 0, TW, y + SECTION_H, SECTION_HDR_BORDER, width=max(1, px(1)))
+
+    slot_col_w = px(80)
+    headshot_r = px(30)
+    name_x = pad + slot_col_w + headshot_r * 2 + px(20)
+
+    def draw_row(y, row, faded=False):
+        F = (lambda c: _fade(c)) if faded else (lambda c: c)
+        slot = row['slot']
+        sw = _tw(draw, slot, f_slot)
+        chip_w, chip_h = sw + px(16), px(30)
+        cx0, cy0 = pad, y + ROW_H // 2 - chip_h // 2
+        draw.rounded_rectangle((cx0, cy0, cx0 + chip_w, cy0 + chip_h), radius=px(5), fill=F(POS_BADGE_BG))
+        draw.text((cx0 + px(8), cy0 + px(5)), slot, font=f_slot, fill=F(POS_BADGE_FG))
+
+        hs_cx = pad + slot_col_w + headshot_r
+        _circle_image(img, row.get('headshot_path'), hs_cx, y + ROW_H // 2, headshot_r,
+                      border_color=F(HEADSHOT_BORDER), border_w=max(1, px(1)),
+                      fallback_text=row['name'], contain=row.get('is_logo', False), bg=F(HEADSHOT_BG))
+
+        name_txt = _ellipsize(draw, row['name'], f_name, TW - name_x - px(160))
+        draw.text((name_x, y + ROW_H // 2 - px(24)), name_txt, font=f_name, fill=F(PTS_DARK))
+        nx = name_x + _tw(draw, name_txt, f_name) + px(10)
+        if row.get('status') == 'Q':
+            _chip(draw, nx, y + ROW_H // 2 - px(20), "Q", f_tag, F(STATUS_Q_FG), F(STATUS_Q_BG), pad_x=px(7), pad_y=px(4), radius=px(4))
+        elif row.get('status') == 'O':
+            _chip(draw, nx, y + ROW_H // 2 - px(20), "O", f_tag, F(STATUS_OUT_FG), F(STATUS_OUT_BG), pad_x=px(7), pad_y=px(4), radius=px(4))
+
+        pts_actual = f"{row['actual']:.1f}"
+        pts_proj = f"proj {row['proj']:.1f}"
+        pw = _tw(draw, pts_actual, f_pts)
+        draw.text((TW - pad - pw, y + ROW_H // 2 - px(24)), pts_actual, font=f_pts, fill=F(PTS_DARK))
+        pjw = _tw(draw, pts_proj, f_proj)
+        draw.text((TW - pad - pjw, y + ROW_H // 2 + px(8)), pts_proj, font=f_proj, fill=F(PTS_MUTED))
+
+    y = HEADER_H
+    section_header(y, "Starting Lineup")
+    y += SECTION_H
+    for i, row in enumerate(starters):
+        if i % 2 == 1:
+            draw.rectangle((0, y, TW, y + ROW_H), fill=ROSTER_ZEBRA)
+        draw_row(y, row)
+        y += ROW_H
+
+    draw.rectangle((0, y, TW, y + TOTAL_H), fill=TOTAL_ROW_BG)
+    draw.rectangle((0, y, TW, y + max(1, px(2))), fill=SECTION_HDR_GREEN)
+    draw.text((pad, y + TOTAL_H // 2 - px(11)), "STARTERS TOTAL", font=f_total_label, fill=SECTION_HDR_GREEN)
+    total_actual = f"{data['starters_total_actual']:.1f}"
+    total_proj = f" / proj {data['starters_total_proj']:.1f}"
+    taw = _tw(draw, total_actual, f_total_val)
+    tpw = _tw(draw, total_proj, f_total_val_sm)
+    tx = TW - pad - taw - tpw
+    draw.text((tx, y + px(12)), total_actual, font=f_total_val, fill=PTS_DARK)
+    draw.text((tx + taw, y + px(18)), total_proj, font=f_total_val_sm, fill=(159, 202, 168))
+    y += TOTAL_H
+
+    if bench:
+        section_header(y, "Bench")
+        y += SECTION_H
+        for i, row in enumerate(bench):
+            if i % 2 == 1:
+                draw.rectangle((0, y, TW, y + ROW_H), fill=ROSTER_ZEBRA)
+            draw_row(y, row, faded=True)
+            y += ROW_H
 
     return _finalize(img)
 
@@ -2674,3 +3185,4 @@ if __name__ == "__main__":
     asyncio.run(demo_power())
     asyncio.run(demo_pulse())
     asyncio.run(demo_league_info())
+    test_teststandings_legibility()

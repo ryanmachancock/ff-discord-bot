@@ -90,14 +90,17 @@ For **private leagues**, you'll need to get your ESPN authentication cookies:
 
 ## 📋 Commands Reference
 
-All data commands render a visual card (a Pillow-drawn PNG) rather than plain text, so results stay readable and on-brand no matter how much data they carry.
+Data commands render natively in Discord (bordered monospace tables inside
+Components V2 Containers or classic Embeds) rather than a hand-drawn image,
+so results stay readable, load instantly, and never truncate a name or
+value no matter how much data they carry. See `CLAUDE.md` for the visual
+style standard these commands are held to.
 
 ### 🎯 Core Team Commands
 
 | Command | Description | Parameters |
 |---------|-------------|------------|
-| `/team` | Visual roster card for a team, with Prev/Next buttons to browse teams and weeks | `team_name` |
-| `/bench` | View a team's bench -- or compare two benches side by side | `team1`, `team2` (optional) |
+| `/team` | Visual roster card for a team (starters and bench), with Prev/Next buttons to browse teams and weeks | `team_name` |
 | `/compare` | Visual season-long comparison of two teams | `team1`, `team2` |
 | `/player` | Visual player card with season stats | `player_name` |
 
@@ -163,16 +166,17 @@ All data commands render a visual card (a Pillow-drawn PNG) rather than plain te
 
 ## 🆕 Recent Improvements
 
-### Visual Card Redesign
-- **Rendered cards, not embeds** - Every data command draws a PNG (turf header, headshots/logos, status tags) instead of a Discord embed, so layout stays consistent no matter how much data it carries
+### Native Rendering, Never Truncated
+- **Bordered tables, not images** - Tabular data (rosters, standings, matchups, scoreboards) renders as aligned monospace tables through a shared layout system (`_table_row`/`_frame_table` in `bot.py`), not a hand-drawn PNG, so it loads instantly and stays sharp at any Discord zoom level
+- **Nothing ever truncates** - Even a genuine outlier (an unusually long team or player name) always renders in full; the layout system gives it its own line rather than cutting it off with an ellipsis
 - **Smart Autocomplete** - Team-name commands share one cached autocomplete lookup for instant suggestions
-- **Real playoff bracket** - `/playoffs` draws an actual tree bracket with connector lines, byes, and the reigning champion, built from real recorded matchups (not a hardcoded seeding formula)
+- **Real playoff bracket** - `/playoffs` renders an actual bracket with connector lines, byes, and the reigning champion, built from real recorded matchups (not a hardcoded seeding formula)
 
 ### Performance Optimizations
 - **Background Refresh** - Data pre-loads every 3 minutes for instant responses
 - **Smart Caching** - 5-minute TTL cache reduces ESPN API calls by 80%
+- **Non-blocking ESPN calls** - Box-score lookups run off the main event loop, so one slow ESPN request can't stall the whole bot for every other server
 - **Better Error Handling** - Helpful error messages with suggestions instead of technical errors
-- **Character Validation** - Automatic truncation prevents Discord message limit violations
 
 ### New Analytics Commands
 - **`/insights`** - Weekly performance dashboard with hot/cold teams and trends

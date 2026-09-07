@@ -1,8 +1,10 @@
 print("Starting Fantasy Football bot...")
 
 import os
+import re
 import asyncio
 import statistics
+from datetime import datetime
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -13,8 +15,9 @@ from tabulate import tabulate
 import json
 import time
 from typing import Dict, Any, Optional
-from image_render import render_team_card, render_standings_card, render_matchup_card, render_scoreboard_card, render_player_card, render_player_list_card, render_compare_card, render_trade_card, render_stat_tiles_card, render_power_rankings_card, render_league_pulse_card, render_league_info_card, render_bench_card, render_playoff_bracket_card, render_reference_card
 from image_cache import get_images, get_logos_by_url
+from image_render import render_teststandings_card, render_testteam_card
+from config.discord_display import CODE_BLOCK_MAX_CHARS, EMBED_CODE_BLOCK_MAX_CHARS, EMBED_THUMBNAIL_CODE_BLOCK_MAX_CHARS
 
 # Shared visual style so every command's embeds look like one bot instead of
 # ~15 unrelated ad-hoc colors. BRAND = normal content, the rest are for
@@ -596,6 +599,73 @@ class LeagueManager:
 
         return matches
 
+class ScoreHistory:
+    """Lightweight persisted score-over-time log, used to draw sparklines on
+    /matchup and /scoreboard. This bot has no cron/scheduled-task infra, so
+    rather than add a background loop, samples are recorded opportunistically
+    inside _safe_box_scores -- any command that already fetches box scores
+    (matchup, scoreboard, team, compare) contributes a data point for free.
+    A per-team/week throttle keeps repeated command calls from flooding the
+    log with near-duplicate samples."""
+    SAMPLE_INTERVAL_SECONDS = 600  # ponytail: fixed 10-min throttle, make configurable if that's ever wrong
+    MAX_SAMPLES = 50  # a week's worth of 10-min samples is well under this
+
+    def __init__(self):
+        self.data_file = 'score_history.json'
+        self.load_data()
+
+    def load_data(self):
+        try:
+            with open(self.data_file, 'r') as f:
+                self.data = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            self.data = {}
+
+    def save_data(self):
+        with open(self.data_file, 'w') as f:
+            json.dump(self.data, f)
+
+    def record(self, league_id, year, week, team_id, score):
+        key = f"{league_id}_{year}_{week}"
+        samples = self.data.setdefault(key, {}).setdefault(str(team_id), [])
+        now = time.time()
+        if samples and now - samples[-1][0] < self.SAMPLE_INTERVAL_SECONDS:
+            return
+        samples.append([now, score])
+        del samples[:-self.MAX_SAMPLES]
+        self.save_data()
+
+    def get(self, league_id, year, week, team_id):
+        key = f"{league_id}_{year}_{week}"
+        return [s for _, s in self.data.get(key, {}).get(str(team_id), [])]
+
+
+score_history = ScoreHistory()
+
+_SPARK_CHARS = "▁▂▃▄▅▆▇█"
+
+
+def _sparkline(values):
+    """Tiny Unicode-block trend chart -- same character family as the
+    existing block-bar progress meters, so it's already proven to render
+    correctly in Discord's code-block font. Needs at least 2 points to show
+    a shape; returns '' otherwise so callers can just omit it.
+
+    An all-zero pregame score history (every sample taken before kickoff)
+    would otherwise render as a row of the lowest bar character, which is
+    visually indistinguishable from blank underscores -- reads as broken
+    UI, not data. Suppress that case; a genuine flat *non-zero* trend still
+    shows, using a mid-height bar instead of the lowest one so it reads as
+    "flat" rather than "empty"."""
+    if len(values) < 2:
+        return ""
+    lo, hi = min(values), max(values)
+    if hi == lo:
+        return "" if hi == 0 else _SPARK_CHARS[3] * len(values)
+    span = hi - lo
+    return "".join(_SPARK_CHARS[min(7, int((v - lo) / span * 7))] for v in values)
+
+
 # Initialize league manager
 league_manager = LeagueManager()
 
@@ -713,16 +783,6 @@ class MyClient(discord.Client):
 
 intents = discord.Intents.default()
 client = MyClient(intents=intents)
-
-def get_league_name(user_id=None):
-    """Get the league name for a user"""
-    if user_id:
-        user_data = league_manager.data['users'].get(str(user_id), {})
-        default_league_key = user_data.get('default_league')
-        if default_league_key and default_league_key in league_manager.data['leagues']:
-            return league_manager.data['leagues'][default_league_key]['name']
-    # Fallback to default
-    return "Fantasy League"
 
 def get_league(user_id=None, league_key=None, timeout_retries=API_RETRY_ATTEMPTS):
     """Initialize and return league instance with caching and timeout handling"""
@@ -908,7 +968,7 @@ async def detailed_stats(interaction: discord.Interaction):
             return
 
         current_week = getattr(league, 'current_week', 1)
-        box_scores = _safe_box_scores(league, current_week)
+        box_scores = await _safe_box_scores(league, current_week)
 
         teams_analysis = []
         week_proj_by_team = {}
@@ -939,13 +999,27 @@ async def detailed_stats(interaction: discord.Interaction):
 
         top_proj = max(teams_analysis, key=lambda t: t['week_proj'])
 
-        card_data = {
-            'league_name': get_league_name(user_id=interaction.user.id),
-            'total_points': total_points, 'avg_ppg': avg_ppg, 'rankings': rankings,
-            'footer_label': f"Top Week {current_week} Proj", 'footer_value': f"{top_proj['name']} \u00b7 {top_proj['week_proj']:.1f}",
-        }
-        image_buf = render_power_rankings_card(card_data)
-        await interaction.followup.send(file=discord.File(fp=image_buf, filename="power_rankings.png"))
+        # This table is a classic discord.Embed description, not a
+        # Components V2 Container, so it budgets against
+        # EMBED_CODE_BLOCK_MAX_CHARS (56), not the wider Container-only
+        # CODE_BLOCK_MAX_CHARS (65) -- see config/discord_display.py.
+        FIXED = (3, 5, 5, 4)  # RK, REC, PPG, PWR
+        name_w = min(_flex_width(EMBED_CODE_BLOCK_MAX_CHARS, *FIXED), max(len(r['name']) for r in rankings))
+        header = _table_row([("RK", 3), ("TEAM", name_w), ("REC", 5), ("PPG", 5), ("PWR", 4)])[0]
+        rows = []
+        for r in rankings:
+            rows.extend(_table_row([
+                (str(r['rank']), 3),
+                (r['name'], name_w, '<', True),
+                (r['record'], 5),
+                (f"{r['ppg']:.1f}", 5),
+                (f"{r['power']:.2f}", 4),
+            ]))
+        table = _frame_table([header], rows)
+
+        embed = discord.Embed(color=EMBED_COLOR_BRAND, description=f"**Power Rankings**  \u00b7  Top 5\n{table}")
+        embed.set_footer(text=f"Top Week {current_week} Proj: {top_proj['name']} \u00b7 {top_proj['week_proj']:.1f}  \u00b7  League Total {total_points:,.1f}  \u00b7  Avg {avg_ppg:.1f} PPG")
+        await interaction.followup.send(embed=embed)
     except Exception as e:
         print(f"Detailed stats command error: {e}")
         await safe_interaction_response(interaction, f"\u274c Error generating power rankings: {e}", ephemeral=True)
@@ -984,7 +1058,12 @@ async def ping(interaction: discord.Interaction):
 
 _box_scores_cache = {}
 
-def _safe_box_scores(league, week):
+# ponytail: in-memory only (never persisted, cleared on every restart). If it
+# needs to survive restarts, back it with the same JSON-file pattern the real
+# league-registration storage already uses.
+_watchlist = {}
+
+async def _safe_box_scores(league, week):
     """league.box_scores() indexes ESPN's raw JSON with data[team]['rosterForCurrentScoringPeriod']
     (espn_api/football/box_score.py) instead of .get() -- early in a new season,
     before ESPN has populated a scoring-period roster for every team (e.g. before
@@ -1000,7 +1079,19 @@ def _safe_box_scores(league, week):
     same week's data fresh. A completed week's scores never change again, so
     those are cached indefinitely; the current/live week gets a short window
     (scores update mid-game) long enough to absorb a burst of clicks without
-    going stale for more than half a minute."""
+    going stale for more than half a minute.
+
+    league.box_scores() itself calls espn_api's `requests`-based (not
+    aiohttp) HTTP client -- a real, blocking network call with no async
+    story of its own. Called directly, that freezes the ENTIRE bot's
+    event loop for the whole round trip: not just this one interaction,
+    but every other command, in every other server, and Discord's own
+    gateway heartbeat, until ESPN responds. That's what actually made
+    /team's nav feel slow on a cache miss (e.g. switching to a week
+    nobody's viewed yet) -- not just this one click waiting, but the
+    whole bot stalling. asyncio.to_thread runs it on a worker thread
+    instead, so the event loop stays free to keep handling everything
+    else while ESPN responds."""
     cache_key = f"box_scores_{league.league_id}_{league.year}_{week}"
     cached = _box_scores_cache.get(cache_key)
     if cached:
@@ -1008,17 +1099,22 @@ def _safe_box_scores(league, week):
         if is_final or time.time() - timestamp < 20:
             return data
     try:
-        data = league.box_scores(week=week)
+        data = await asyncio.to_thread(league.box_scores, week=week)
     except KeyError:
         data = []
     is_final = week < getattr(league, 'current_week', 1)
     _box_scores_cache[cache_key] = (data, time.time(), is_final)
+    for m in data:
+        if m.home_team:
+            score_history.record(league.league_id, league.year, week, m.home_team.team_id, float(m.home_score or 0))
+        if m.away_team:
+            score_history.record(league.league_id, league.year, week, m.away_team.team_id, float(m.away_score or 0))
     return data
 
 
 async def _build_roster_rows(league, team, current_week):
     """Real per-week actual/projected points, slotting, and injury status for
-    one team's full roster -- shared by /team (starters) and /bench (bench).
+    one team's full roster -- /team shows both halves in one card.
     Returns (starter_rows, bench_rows).
 
     team.roster's player.stats dict comes back empty once the season isn't
@@ -1026,7 +1122,7 @@ async def _build_roster_rows(league, team, current_week):
     reliable source for this week's actual/projected points AND gives a real
     pro_opponent field the plain roster objects don't have."""
     box_score = next(
-        (m for m in _safe_box_scores(league, current_week)
+        (m for m in await _safe_box_scores(league, current_week)
          if (m.home_team and m.home_team.team_id == team.team_id) or
             (m.away_team and m.away_team.team_id == team.team_id)),
         None
@@ -1063,12 +1159,7 @@ async def _build_roster_rows(league, team, current_week):
     starters = sorted([p for p in lineup if display_slot(p) != 'BE'], key=sort_key)
     bench = [p for p in lineup if display_slot(p) == 'BE']
 
-    player_ids = [p.playerId for p in starters + bench if p.position not in ('D/ST', 'DST', 'DEF')]
-    team_abbrs = [p.proTeam.lower() for p in starters + bench if p.position in ('D/ST', 'DST', 'DEF') and p.proTeam]
-    images = await get_images(player_ids=player_ids, team_abbrs=team_abbrs)
-
     def build_row(player):
-        is_dst = player.position in ('D/ST', 'DST', 'DEF')
         if box_score:
             actual = float(getattr(player, 'points', 0) or 0)
             proj = float(getattr(player, 'projected_points', 0) or 0)
@@ -1084,8 +1175,6 @@ async def _build_roster_rows(league, team, current_week):
             'name': player.name,
             'team_abbr': player.proTeam or '',
             'opp_abbr': getattr(player, 'pro_opponent', '') or '',
-            'headshot_path': images['teams'].get(player.proTeam.lower()) if is_dst and player.proTeam else images['players'].get(player.playerId),
-            'is_logo': is_dst,
             'status': get_status(player),
             'actual': actual,
             'proj': proj,
@@ -1103,6 +1192,9 @@ async def _build_team_card_data(league, team, week):
     wins, losses = getattr(team, 'wins', 0), getattr(team, 'losses', 0)
     sorted_teams = sorted(league.teams, key=lambda t: (getattr(t, 'wins', 0), getattr(t, 'points_for', 0)), reverse=True)
     rank = next((i + 1 for i, t in enumerate(sorted_teams) if t.team_id == team.team_id), 0)
+
+    logos = await get_logos_by_url([team.logo_url])
+    logo_path = logos.get(team.logo_url)
 
     owner_data = getattr(team, 'owners', None) or getattr(team, 'owner', None)
     owner_name = "N/A"
@@ -1126,6 +1218,9 @@ async def _build_team_card_data(league, team, week):
     if not owner_name or owner_name == "N/A" or len(str(owner_name)) > 50:
         owner_name = "Unknown Owner"
 
+    games_played = wins + losses + getattr(team, 'ties', 0)
+    season_scores = list(getattr(team, 'scores', [])[:games_played])
+
     return {
         'team_name': team.team_name,
         'owner_name': owner_name,
@@ -1137,20 +1232,286 @@ async def _build_team_card_data(league, team, week):
         'proj_record_note': None,
         'live_games_count': 0,
         'starters': starter_rows,
-        'bench_count': len(bench_rows),
+        'bench': bench_rows,
+        'logo_path': logo_path,
+        'season_scores': season_scores,
         'starters_total_actual': sum(r['actual'] for r in starter_rows),
         'starters_total_proj': sum(r['proj'] for r in starter_rows),
     }
+
+
+# Every bordered table in the bot shares this frame: a full ─/│ box with
+# no corner glyphs (┌┐└┘├┤ don't render in Discord's code-block font -- a
+# box built with real corner characters came out with missing edges, see
+# _matchup_table's original discovery). The "corners" are just a dash line
+# and a pipe column meeting at the same character position on adjacent
+# rows, which reads as a solid frame anyway.
+TABLE_BORDER_OVERHEAD = 4  # "│ " + " │" added to every line by _frame_table
+
+_ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
+
+
+def _visible_len(s):
+    """Length ignoring ANSI color escapes -- an ```ansi block's colored
+    rows (see standings' streak column) are longer in raw characters than
+    they are on screen, so padding/width math must measure this instead
+    of len() or colored rows drift out of alignment with plain ones."""
+    return len(_ANSI_RE.sub('', s))
+
+
+def _frame_table(*groups, lang=""):
+    """Wrap groups of already-formatted, equal-purpose table lines (e.g.
+    [header], [row, row, ...], [total]) in the shared bordered-table frame,
+    with a plain dash rule inserted between each group. Every table-
+    building function in the bot should size its own columns to leave
+    room for TABLE_BORDER_OVERHEAD before calling this. Pass lang="ansi"
+    for a table using ANSI color escapes (e.g. standings' streak column)."""
+    all_lines = [l for g in groups for l in g]
+    content_width = max(_visible_len(l) for l in all_lines)
+    rule = "─" * content_width
+    border = "─" * (content_width + 4)
+
+    def frame(line):
+        pad = " " * (content_width - _visible_len(line))
+        return f"│ {line}{pad} │"
+
+    body = []
+    for i, g in enumerate(groups):
+        if i > 0:
+            body.append(frame(rule))
+        body.extend(frame(l) for l in g)
+    return f"```{lang}\n" + "\n".join([border, *body, border]) + "\n```"
+
+
+# --- Standardized row layout -------------------------------------------
+#
+# Every table in the bot renders rows through _table_row instead of each
+# command hand-rolling its own column-width arithmetic and wrap-to-a-
+# second-line logic. That hand-rolling is what caused this session's real
+# bugs, twice over:
+#   1. scoreboard's border wrapped because a hand-counted FIXED_OVERHEAD
+#      comment (`1 + 6 + 1 + SPARK_W + ...`) silently undercounted the
+#      real format string by one character -- a comment and the code it
+#      describes can drift apart with no error. _flex_width below sums
+#      real column widths instead, so there's nothing to drift.
+#   2. compare's header (and the first version of _wrap_name_row) glued
+#      two columns together with zero gap ("Dak PrescottNYG") whenever a
+#      column's content was longer than its own padding width -- `:<{w}}`
+#      adds no space once the content already exceeds w. _table_row joins
+#      every column with an explicit separator, inserted regardless of
+#      overflow, so gluing is structurally impossible.
+# Both bug classes are eliminated by construction here, not by being more
+# careful next time.
+
+def _table_row(cells, sep=" "):
+    """One table row as 1+ physical lines. `cells` is a list of
+    (text, width), (text, width, align), (text, width, align, flex), or
+    (text, width, align, flex, repeat) tuples -- align defaults to '<',
+    flex and repeat to False. Every column boundary is joined by `sep`,
+    inserted explicitly between cells, never folded into a column's own
+    padding width, so two columns can never glue together no matter
+    which ones overflow.
+
+    Each flex column that overflows its width gets its OWN dedicated
+    physical line, with every other column blank on that line -- never
+    ellipsized (per explicit "there shouldn't be any truncation"
+    feedback), and never sharing a line with another column's content.
+    This matters when TWO flex cells in the same row overflow at once
+    (e.g. both teams' names in one scoreboard row): putting both raw
+    names on one shared line made that line far wider than the table's
+    normal rows, long enough to blow past Discord's own code-block
+    width cap and get hard-wrapped mid-row by Discord itself -- which
+    is what a broken-looking border in production actually was.
+
+    Fixing just that isn't enough on its own, though: _frame_table sizes
+    the WHOLE table's border to the single widest line among every row
+    (`content_width = max(_visible_len(l) for l in all_lines)`), so even
+    ONE overflow line that's too wide drags every border line in the
+    whole table past Discord's cap and wraps the border itself, not
+    just that row. Padding an overflow line out to the OTHER columns'
+    normal widths (blank filler before/after the name, to keep it
+    lined up under its column) was exactly what made these lines too
+    wide -- a name of e.g. 22 chars sitting in a column budgeted for
+    14 could still end up on a padded line topping 65 real characters
+    even though the name itself was nowhere near that long. So an
+    overflow line carries ONLY the overflowing cell's raw text plus any
+    repeat=True cells (see below) -- no filler for the columns that
+    have nothing to say on that line. That line's width is then bounded
+    by the name's own length, not by how many empty columns happen to
+    sit next to it, which is what actually keeps it under the cap for
+    any realistic name.
+
+    A short, never-wrapping cell (e.g. a "│" divider between two
+    independent flex columns) needs to look continuous down every
+    physical line or the border reads as broken exactly on the rows
+    where a name overflowed. Pass repeat=True for that: it's rendered
+    on every physical line, overflow lines included, instead of only
+    the last one -- its own width is negligible so it doesn't reopen
+    the wrapping problem above."""
+    parsed = [(c[0], c[1], c[2] if len(c) > 2 else '<', c[3] if len(c) > 3 else False, c[4] if len(c) > 4 else False) for c in cells]
+    overflow_idxs = [i for i, (t, w, a, f, r) in enumerate(parsed) if f and len(t) > w]
+
+    def blank(w, a):
+        return f"{'':{a}{w}}"
+
+    def normal(t, w, a):
+        return f"{t:{a}{w}}"
+
+    lines = []
+    for oi in overflow_idxs:
+        lines.append(sep.join(
+            t for i, (t, w, a, f, r) in enumerate(parsed) if i == oi or r
+        ))
+    lines.append(sep.join(
+        normal(t, w, a) if r else (blank(w, a) if i in overflow_idxs else normal(t, w, a))
+        for i, (t, w, a, f, r) in enumerate(parsed)
+    ))
+    return lines
+
+
+def _flex_width(budget, *fixed_widths, sep=" ", flex_cols=1):
+    """Characters available for the flex column(s) in a row, given the
+    table's total character budget (CODE_BLOCK_MAX_CHARS or one of its
+    embed-context siblings, config/discord_display.py) and the OTHER
+    columns' actual widths -- summed here from real numbers, never
+    hand-counted in a comment. Subtracts TABLE_BORDER_OVERHEAD and one
+    `sep`-width gap for every column boundary automatically."""
+    n_cols = len(fixed_widths) + flex_cols
+    n_seps = max(n_cols - 1, 0)
+    return budget - sum(fixed_widths) - n_seps * len(sep) - TABLE_BORDER_OVERHEAD
+
+
+def _test_table_row():
+    """Smoke test for the bug classes _table_row exists to prevent. Run
+    at bot startup (see __main__) so a regression fails loudly instead
+    of silently shipping."""
+    long_name = "Swift Nation (Travis version)"
+    # a repeat=True divider must appear on EVERY physical line, even the
+    # one where a flex column overflowed -- the default (blank until the
+    # last line) is right for row data, but a "│" divider that vanishes
+    # on exactly the rows where a name overflowed reads as a broken
+    # border (this was a real bug: matchup's divider disappeared on any
+    # row where either team's player name was too long).
+    divider_lines = _table_row([("Short", 6, '<', True), ("│", 1, '<', False, True), (long_name, 6, '<', True)])
+    assert len(divider_lines) == 2, "one side overflows, so this row should be 2 physical lines"
+    assert all("│" in l for l in divider_lines), f"divider must repeat on every line, got {divider_lines!r}"
+    # never truncates
+    lines = _table_row([(long_name, 6, '<', True), ("22.1", 6, '>')])
+    joined = "".join(lines)
+    assert long_name in joined, "full name must appear somewhere"
+    assert "…" not in joined, "must never ellipsize"
+    # never glues: the overflow line holds nothing but the name and
+    # trailing blank padding from the other (non-overflowing) column --
+    # never another column's real content butted up against it
+    overflow_line = next(l for l in lines if long_name in l)
+    assert overflow_line.rstrip() == long_name, f"overflow line should be just the name, got {overflow_line!r}"
+    # short content still gets a real gap, not fused padding
+    assert _table_row([("AB", 6, '<', True), ("1.0", 4, '>')]) == ["AB      1.0"]
+    # _flex_width sums real widths, not a hand-counted constant
+    assert _flex_width(65, 5, 6, 6, sep=" ", flex_cols=1) == 65 - 5 - 6 - 6 - 3 - TABLE_BORDER_OVERHEAD
+    # two flex cells overflowing in the SAME row (e.g. both scoreboard
+    # teams have long names) must each get their own line, not share one
+    # -- sharing produced a single line long enough to blow past
+    # Discord's own code-block width cap and get hard-wrapped mid-row,
+    # which is what a broken scoreboard border in production actually
+    # was (looked fine locally since nothing here enforces the real
+    # per-line char budget, only that the two names never land together)
+    other_long = "Tyler's Mediocre team"
+    dual_lines = _table_row([(long_name, 6, '<', True), ("│", 1, '<', False, True), (other_long, 6, '<', True)])
+    assert len(dual_lines) == 3, f"two independent overflows should be 3 physical lines, got {dual_lines!r}"
+    assert not any(long_name in l and other_long in l for l in dual_lines), \
+        "two overflowing names must never share a physical line"
+    assert all("│" in l for l in dual_lines), f"divider must repeat on every line, got {dual_lines!r}"
+
+
+def _roster_table(rows):
+    """SLOT/PLAYER/OPP/PTS/PROJ/ST table shared by the starters and bench
+    sections of /team -- same row shape either way. Name column width is
+    measured from CODE_BLOCK_MAX_CHARS, not a guessed cap, same fix
+    _matchup_table got: the truncation length should come from real
+    display-width measurements (config/discord_display.py), so a name
+    only truncates when it's a genuine outlier, not just because 20 was
+    picked once and never revisited."""
+    if not rows:
+        return "_Empty_"
+    # /team's embed has BOTH a thumbnail (team logo) and a field (bench),
+    # which narrows the real code-block width further than a plain embed
+    # -- budgets against EMBED_THUMBNAIL_CODE_BLOCK_MAX_CHARS (44), not
+    # EMBED_CODE_BLOCK_MAX_CHARS (56) or CODE_BLOCK_MAX_CHARS (65). See
+    # config/discord_display.py.
+    #
+    # Column widths sized to their REAL content, not round numbers: SLOT
+    # tops out at "FLEX"/"D/ST" (4), OPP at 3-letter team codes, PTS/PROJ
+    # at "999.9" (5), ST at 2-letter status codes. The old (5,6,7,7,3)
+    # wasted 2-4 unused chars in every column, which starved this budget's
+    # already-tight name column down to 7 -- so literally every player
+    # name overflowed onto its own line, not just genuine outliers. That's
+    # the actual bug: this table looked broken not because _table_row was
+    # wrong, but because these columns left it almost nothing to work with.
+    FIXED = (4, 3, 5, 5, 2)  # SLOT, OPP, PTS, PROJ, ST
+    name_w = min(_flex_width(EMBED_THUMBNAIL_CODE_BLOCK_MAX_CHARS, *FIXED), max(len(r['name']) for r in rows))
+    header = _table_row([("SLOT", 4), ("PLAYER", name_w), ("OPP", 3), ("PTS", 5), ("PROJ", 5), ("ST", 2)])[0]
+    lines = []
+    for r in rows:
+        lines.extend(_table_row([
+            (r['slot'], 4),
+            (r['name'], name_w, '<', True),
+            (r['opp_abbr'], 3),
+            (f"{r['actual']:.1f}", 5),
+            (f"{r['proj']:.1f}", 5),
+            (r['status'] or '', 2),
+        ]))
+    return _frame_table([header], lines)
+
+
+def _team_embed(data):
+    starters_table = _roster_table(data['starters'])
+    bench = data['bench']
+
+    season_spark = _sparkline(data['season_scores'])
+    week_line = f"-# Week {data['current_week']} Roster"
+    if season_spark:
+        week_line += f"   ·   Season {season_spark}"
+
+    embed = discord.Embed(color=EMBED_COLOR_BRAND, description=(
+        f"**{data['team_name']}**  ·  {data['owner_name']}  ·  {data['record']}  ·  Rank {data['rank']} of {data['total_teams']}\n"
+        f"{week_line}\n"
+        f"{starters_table}"
+    ))
+    embed.add_field(name=f"Bench ({len(bench)})", value=_roster_table(bench), inline=False)
+    embed.set_footer(text=f"Starters Total: {data['starters_total_actual']:.1f} (proj {data['starters_total_proj']:.1f})")
+
+    logo_file = None
+    if data['logo_path']:
+        logo_file = discord.File(data['logo_path'], filename=os.path.basename(data['logo_path']))
+        embed.set_thumbnail(url=f"attachment://{logo_file.filename}")
+    return embed, logo_file
+
+
+async def _prefetch_all_team_logos(league):
+    """Warm the local logo cache for every team in the league, fired in
+    the background from /team's initial call (asyncio.create_task, not
+    awaited) -- so clicking TeamNavView's arrows to a team you haven't
+    viewed yet doesn't pay for a fresh image download+upload on that
+    click, which is what made nav feel slow. Best-effort: any failure
+    here just means that team's logo gets fetched on demand later
+    instead, same as before this existed."""
+    try:
+        await get_logos_by_url([t.logo_url for t in league.teams if getattr(t, 'logo_url', None)])
+    except Exception:
+        pass
 
 
 class TeamNavView(View):
     """Prev/Next arrows for team (ordered best-to-worst by record, mirroring
     the visible RANK X OF Y already on the card) and week (capped at the
     league's current week -- future weeks aren't reliably populated yet).
-    Each row's middle button is a disabled label showing what's currently
-    displayed, so the whole control reads as "arrows around the current
-    thing" without needing any caption; boundary arrows disable themselves
-    rather than wrapping around."""
+
+    Just 4 plain arrow buttons, one row each for team/week -- no middle
+    "Rank 2 / 12" / "Wk 1 / 1" label buttons. Those used to exist, but
+    they were pure duplication (the card's own body text already says
+    "Rank 2 of 12") and made the control twice as bulky as it needed to
+    be. Boundary arrows disable themselves rather than wrapping around."""
 
     def __init__(self, user_id, league, team_order, team_idx, week):
         super().__init__(timeout=1800)
@@ -1163,50 +1524,36 @@ class TeamNavView(View):
         self._sync()
 
     def _sync(self):
-        # Short, fixed-format "N / total" counters instead of the raw team
-        # name -- a long name (e.g. "Swift Nation (Travis version)") made
-        # this button far wider than the week row's, throwing the two rows
-        # out of balance. The team name is already the headline of the card
-        # image itself; this row only needs to say where you are in the list.
         self.prev_team.disabled = self.team_idx == 0
         self.next_team.disabled = self.team_idx == len(self.team_order) - 1
-        self.team_label.label = f"Rank {self.team_idx + 1} / {len(self.team_order)}"
         self.prev_week.disabled = self.week <= 1
         self.next_week.disabled = self.week >= self.max_week
-        self.week_label.label = f"Wk {self.week} / {self.max_week}"
 
     async def _render(self, interaction: discord.Interaction):
         await interaction.response.defer()
         team = next(t for t in self.league.teams if t.team_name == self.team_order[self.team_idx])
         card_data = await _build_team_card_data(self.league, team, self.week)
-        image_buf = render_team_card(card_data)
+        embed, logo_file = _team_embed(card_data)
         self._sync()
-        await interaction.edit_original_response(attachments=[discord.File(fp=image_buf, filename="team_card.png")], view=self)
+        attachments = [logo_file] if logo_file else []
+        await interaction.edit_original_response(embed=embed, attachments=attachments, view=self)
 
-    @discord.ui.button(emoji="◀", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(label="◀ Team", style=discord.ButtonStyle.secondary, row=0)
     async def prev_team(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.team_idx -= 1
         await self._render(interaction)
 
-    @discord.ui.button(label="Team", style=discord.ButtonStyle.secondary, disabled=True, row=0)
-    async def team_label(self, interaction: discord.Interaction, button: discord.ui.Button):
-        pass
-
-    @discord.ui.button(emoji="▶", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(label="Team ▶", style=discord.ButtonStyle.secondary, row=0)
     async def next_team(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.team_idx += 1
         await self._render(interaction)
 
-    @discord.ui.button(emoji="◀", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="◀ Week", style=discord.ButtonStyle.secondary, row=1)
     async def prev_week(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.week -= 1
         await self._render(interaction)
 
-    @discord.ui.button(label="Week", style=discord.ButtonStyle.secondary, disabled=True, row=1)
-    async def week_label(self, interaction: discord.Interaction, button: discord.ui.Button):
-        pass
-
-    @discord.ui.button(emoji="▶", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="Week ▶", style=discord.ButtonStyle.secondary, row=1)
     async def next_week(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.week += 1
         await self._render(interaction)
@@ -1225,6 +1572,8 @@ async def team(interaction: discord.Interaction, team_name: str):
             await safe_interaction_response(interaction, "❌ No league found. Use `/register_league` to add your ESPN Fantasy League first, or contact an admin if you want to use the default league.", ephemeral=True)
             return
 
+        asyncio.create_task(_prefetch_all_team_logos(league))
+
         team = next((t for t in league.teams if t.team_name.lower() == team_name.lower()), None)
         if not team:
             partial_matches = [t for t in league.teams if team_name.lower() in t.team_name.lower()]
@@ -1242,16 +1591,158 @@ async def team(interaction: discord.Interaction, team_name: str):
 
         current_week = getattr(league, 'current_week', 1)
         card_data = await _build_team_card_data(league, team, current_week)
-        image_buf = render_team_card(card_data)
+        embed, logo_file = _team_embed(card_data)
 
         ranked_teams = sorted(league.teams, key=lambda t: (getattr(t, 'wins', 0), getattr(t, 'points_for', 0)), reverse=True)
         team_order = [t.team_name for t in ranked_teams]
         view = TeamNavView(interaction.user.id, league, team_order, team_order.index(team.team_name), current_week)
 
-        await interaction.followup.send(file=discord.File(fp=image_buf, filename="team_card.png"), view=view)
+        if logo_file:
+            await interaction.followup.send(embed=embed, file=logo_file, view=view)
+        else:
+            await interaction.followup.send(embed=embed, view=view)
     except Exception as e:
         print(f"Team command error: {e}")
         await safe_interaction_response(interaction, f"❌ Error creating team card: {e}", ephemeral=True)
+
+
+async def _testteam_data(league, team, week):
+    """Data for render_testteam_card. _build_roster_rows (the shared helper
+    /team itself uses) dropped headshot lookups entirely when /team stopped
+    rendering photos -- rather than touch that shared helper for this
+    prototype, the same lineup is re-walked here just to fetch headshots."""
+    starter_rows, bench_rows = await _build_roster_rows(league, team, week)
+
+    box_score = next(
+        (m for m in await _safe_box_scores(league, week)
+         if (m.home_team and m.home_team.team_id == team.team_id) or
+            (m.away_team and m.away_team.team_id == team.team_id)),
+        None
+    )
+    lineup = (box_score.home_lineup if box_score.home_team.team_id == team.team_id else box_score.away_lineup) if box_score else team.roster
+    by_name = {p.name: p for p in lineup}
+
+    player_ids = [p.playerId for p in lineup if p.position not in ('D/ST', 'DST')]
+    dst_abbrs = [p.proTeam for p in lineup if p.position in ('D/ST', 'DST') and p.proTeam]
+    images = await get_images(player_ids=player_ids, team_abbrs=dst_abbrs)
+
+    def enrich(rows):
+        out = []
+        for r in rows:
+            p = by_name.get(r['name'])
+            is_dst = bool(p and p.position in ('D/ST', 'DST'))
+            headshot = (images['teams'].get(p.proTeam) if is_dst else images['players'].get(p.playerId)) if p else None
+            out.append({**r, 'headshot_path': headshot, 'is_logo': is_dst})
+        return out
+
+    starters = enrich(starter_rows)
+    bench = enrich(bench_rows)
+
+    wins, losses = getattr(team, 'wins', 0), getattr(team, 'losses', 0)
+    sorted_teams = sorted(league.teams, key=lambda t: (getattr(t, 'wins', 0), getattr(t, 'points_for', 0)), reverse=True)
+    rank = next((i + 1 for i, t in enumerate(sorted_teams) if t.team_id == team.team_id), 0)
+
+    logos = await get_logos_by_url([team.logo_url])
+
+    return {
+        'team_name': team.team_name,
+        'record': f"{wins}-{losses}",
+        'rank': rank,
+        'total_teams': len(league.teams),
+        'current_week': week,
+        'logo_path': logos.get(team.logo_url),
+        'starters': starters,
+        'bench': bench,
+        'starters_total_actual': sum(r['actual'] for r in starters),
+        'starters_total_proj': sum(r['proj'] for r in starters),
+    }
+
+
+@client.tree.command(name="testteam", description="[TEST] Image-style roster prototype -- bigger type, fewer columns.")
+@app_commands.describe(team_name="The exact name of the team as it appears in ESPN.")
+@app_commands.autocomplete(team_name=team_name_autocomplete)
+async def testteam(interaction: discord.Interaction, team_name: str):
+    if not await safe_defer(interaction):
+        return
+    try:
+        league = get_league(user_id=interaction.user.id)
+        if not league:
+            await safe_interaction_response(interaction, "❌ No league found. Use `/register_league` to add your ESPN Fantasy League first, or contact an admin if you want to use the default league.", ephemeral=True)
+            return
+
+        team = next((t for t in league.teams if t.team_name.lower() == team_name.lower()), None)
+        if not team:
+            await interaction.followup.send(f"Team '{team_name}' not found.")
+            return
+        if not team.roster:
+            await safe_interaction_response(interaction, f"❌ {team.team_name} has no roster yet -- this league hasn't drafted for the {league.year} season.", ephemeral=True)
+            return
+
+        current_week = getattr(league, 'current_week', 1)
+        data = await _testteam_data(league, team, current_week)
+        buf = render_testteam_card(data)
+        await interaction.followup.send(file=discord.File(buf, filename="testteam.png"))
+    except Exception as e:
+        print(f"Testteam command error: {e}")
+        await safe_interaction_response(interaction, f"❌ Error creating team card: {e}", ephemeral=True)
+
+
+# ============================================================================
+# Shared helpers for the native Discord embeds/Components V2 commands below
+# (discord.py 2.6 -- LayoutView/Container/TextDisplay/Section/ActionRow are
+# all real message components, not an image, so buttons on them genuinely
+# work).
+# ============================================================================
+
+def _record_str(t):
+    r = f"{t.wins}-{t.losses}"
+    return r + (f"-{t.ties}" if getattr(t, 'ties', 0) else '')
+
+
+async def _scoreboard_container(league, week, user_id):
+    box_scores = await _safe_box_scores(league, week)
+    container = discord.ui.Container(accent_colour=EMBED_COLOR_BRAND)
+    container.add_item(discord.ui.TextDisplay(f"🔴 **LIVE**  ·  Week {week} Scoreboard  ·  updated {datetime.now().strftime('%I:%M %p')}"))
+    container.add_item(discord.ui.Separator())
+
+    games = []
+    for m in box_scores:
+        if not m.home_team or not m.away_team:
+            continue
+        games.append({
+            'name1': m.home_team.team_name, 'score1': float(m.home_score),
+            'name2': m.away_team.team_name, 'score2': float(m.away_score),
+        })
+
+    if games:
+        # Stacked one-team-per-line layout, not side-by-side: cramming
+        # two team names PLUS both scores onto one line left so little
+        # room per name that any real outlier (a long joke team name)
+        # either had to truncate -- ruled out -- or get special-cased
+        # overflow handling that kept producing a visually broken-looking
+        # table no matter how it was tuned (names glued to dividers,
+        # rows losing their blank-line spacing, two names splitting
+        # across lines with no visual grouping). One name per line gives
+        # each name the whole row's budget instead of splitting it two
+        # ways, so a real name essentially never needs special handling
+        # at all -- simpler and structurally safer, not just prettier.
+        name_w = _flex_width(CODE_BLOCK_MAX_CHARS, 6, flex_cols=1)  # 6 = score column
+        groups = []
+        for g in games:
+            groups.append(
+                _table_row([(g['name1'], name_w, '<', True), (f"{g['score1']:.1f}", 6, '>')]) +
+                _table_row([(g['name2'], name_w, '<', True), (f"{g['score2']:.1f}", 6, '>')])
+            )
+        container.add_item(discord.ui.TextDisplay(_frame_table(*groups)))
+    else:
+        container.add_item(discord.ui.TextDisplay("_No matchups found for this week (bye week or off-season)._"))
+
+    row = discord.ui.ActionRow()
+    refresh_btn = discord.ui.Button(label="🔄 Refresh", style=discord.ButtonStyle.secondary)
+    row.add_item(refresh_btn)
+    container.add_item(row)
+    return container, refresh_btn
+
 
 def _player_position_stats(player):
     """Position-specific stat tiles, pulled from the real season breakdown.
@@ -1346,7 +1837,6 @@ async def player(interaction: discord.Interaction, player_name: str):
             team_abbrs=[found_player.proTeam.lower()] if found_player.proTeam else [],
         )
         headshot_path = images['teams'].get(found_player.proTeam.lower()) if is_dst else images['players'].get(found_player.playerId)
-        team_logo_path = images['teams'].get(found_player.proTeam.lower())
 
         status_map = {'QUESTIONABLE': 'Questionable', 'OUT': 'Out', 'DOUBTFUL': 'Doubtful', 'INJURY_RESERVE': 'Injury Reserve'}
         status = status_map.get(getattr(found_player, 'injuryStatus', None), 'Active')
@@ -1354,7 +1844,7 @@ async def player(interaction: discord.Interaction, player_name: str):
         current_week = getattr(league, 'current_week', 1)
         highlight_label = highlight_text = None
         try:
-            box_score = next((m for m in _safe_box_scores(league, current_week)
+            box_score = next((m for m in await _safe_box_scores(league, current_week)
                                if m.home_team and m.home_team.team_id == player_team.team_id or m.away_team and m.away_team.team_id == player_team.team_id), None)
             if box_score:
                 lineup = box_score.home_lineup if box_score.home_team.team_id == player_team.team_id else box_score.away_lineup
@@ -1367,16 +1857,40 @@ async def player(interaction: discord.Interaction, player_name: str):
             print(f"Player highlight lookup failed: {e}")
 
         games_played = round(found_player.total_points / found_player.avg_points) if found_player.avg_points else 0
-        card_data = {
-            'name': found_player.name, 'position': found_player.position, 'pro_team': found_player.proTeam or 'FA',
-            'status': status, 'headshot_path': headshot_path, 'team_logo_path': team_logo_path,
-            'ppg': found_player.avg_points, 'total_points': found_player.total_points, 'games_played': games_played,
-            'highlight_label': highlight_label, 'highlight_text': highlight_text,
-            'stats': _player_position_stats(found_player),
-            'fantasy_team': player_team.team_name, 'roster_slot': getattr(found_player, 'lineupSlot', None),
-        }
-        image_buf = render_player_card(card_data)
-        await interaction.followup.send(file=discord.File(fp=image_buf, filename="player.png"))
+        stats = _player_position_stats(found_player)
+        stat_line1 = "  ·  ".join(f"{s['label']} **{s['value']}**" for s in stats[:3])
+        stat_line2 = "  ·  ".join(f"{s['label']} **{s['value']}**" for s in stats[3:])
+
+        body = (
+            f"### {found_player.name}\n"
+            f"{found_player.position} · {found_player.proTeam or 'FA'} · {status}\n\n"
+            f"**PPG:** {found_player.avg_points:.1f}   **Total:** {found_player.total_points:.1f}   **Games:** {games_played}\n"
+        )
+        if highlight_text:
+            body += f"\n**{highlight_label}:** {highlight_text}\n"
+        if stat_line1:
+            body += f"\n{stat_line1}"
+        if stat_line2:
+            body += f"\n{stat_line2}"
+        body += f"\n\n-# {player_team.team_name}"
+
+        thumb_file = discord.File(headshot_path, filename=os.path.basename(headshot_path)) if headshot_path else None
+
+        class PlayerView(discord.ui.LayoutView):
+            def __init__(self):
+                super().__init__(timeout=1800)
+                container = discord.ui.Container(accent_colour=EMBED_COLOR_BRAND)
+                if thumb_file:
+                    section = discord.ui.Section(discord.ui.TextDisplay(body), accessory=discord.ui.Thumbnail(f"attachment://{thumb_file.filename}"))
+                    container.add_item(section)
+                else:
+                    container.add_item(discord.ui.TextDisplay(body))
+                self.add_item(container)
+
+        if thumb_file:
+            await interaction.followup.send(view=PlayerView(), file=thumb_file)
+        else:
+            await interaction.followup.send(view=PlayerView())
     except Exception as e:
         print(f"Player command error: {e}")
         await safe_interaction_response(interaction, f"❌ Error creating player card: {e}", ephemeral=True)
@@ -1421,7 +1935,7 @@ def _h2h_series(team_a, team_b):
 
 async def _build_compare_card(league, team1_obj, team2_obj, user_id, league1_name=None, league2_name=None):
     current_week = getattr(league, 'current_week', 1)
-    box_scores = _safe_box_scores(league, current_week)
+    box_scores = await _safe_box_scores(league, current_week)
 
     def week_proj(team_obj):
         bs = next(
@@ -1442,8 +1956,6 @@ async def _build_compare_card(league, team1_obj, team2_obj, user_id, league1_nam
     games2 = team2_obj.wins + team2_obj.losses + getattr(team2_obj, 'ties', 0)
     ppg1 = team1_obj.points_for / games1 if games1 else 0
     ppg2 = team2_obj.points_for / games2 if games2 else 0
-
-    logos = await get_logos_by_url([team1_obj.logo_url, team2_obj.logo_url])
 
     series_note, warn = None, False
     if league1_name is None:  # same league -- a real head-to-head series is meaningful
@@ -1466,9 +1978,9 @@ async def _build_compare_card(league, team1_obj, team2_obj, user_id, league1_nam
 
     return {
         'team1': {'name': team1_obj.team_name, 'owner': _team_owner_name(team1_obj), 'record': _team_record_str(team1_obj),
-                  'logo_path': logos.get(team1_obj.logo_url), 'league': league1_name},
+                  'league': league1_name},
         'team2': {'name': team2_obj.team_name, 'owner': _team_owner_name(team2_obj), 'record': _team_record_str(team2_obj),
-                  'logo_path': logos.get(team2_obj.logo_url), 'league': league2_name},
+                  'league': league2_name},
         'series_note': series_note, 'series_note_warn': warn,
         'rows': [
             row('Points For', team1_obj.points_for, team2_obj.points_for),
@@ -1477,6 +1989,38 @@ async def _build_compare_card(league, team1_obj, team2_obj, user_id, league1_nam
             row(f"Week {current_week} Proj", proj1, proj2),
         ],
     }
+
+
+def _compare_embed(data):
+    """Single aligned monospace table shared by /compare and
+    /compare_cross_league -- one column per team, instead of two separate
+    embed fields that never actually lined up with each other."""
+    t1, t2 = data['team1'], data['team2']
+    name1 = t1['name'] + (f" ({t1['league']})" if t1.get('league') else "")
+    name2 = t2['name'] + (f" ({t2['league']})" if t2.get('league') else "")
+
+    # Both value columns share one width (col_w), so the budget for it is
+    # whatever's left of EMBED_CODE_BLOCK_MAX_CHARS (this is a classic
+    # discord.Embed, not a Container -- see config/discord_display.py)
+    # after the label column and the border -- summed by _flex_width from
+    # real widths, not a hand-counted constant.
+    label_w = max(len(r['label']) for r in data['rows']) + 2
+    col_w = min(_flex_width(EMBED_CODE_BLOCK_MAX_CHARS, label_w, flex_cols=2) // 2,
+                max(len(t1['name']), len(t2['name']), 6))
+
+    # No header row: both team names are already in header_line right above
+    # the table (see below), and there's no generic column label (like
+    # /matchup's "PTS") worth a header line here -- same fix /matchup's
+    # header row got, taken one step further since blanking the cells
+    # would've just left a pointless empty line.
+    rows = []
+    for r in data['rows']:
+        rows.extend(_table_row([(r['label'], label_w), (r['left_val'], col_w), (r['right_val'], col_w)]))
+    table = _frame_table(rows)
+
+    header_line = f"**{name1}**  `{t1['record']}`  vs  **{name2}**  `{t2['record']}`"
+    desc = (f"-# {data['series_note']}\n" if data['series_note'] else "") + f"{header_line}\n{table}"
+    return discord.Embed(color=EMBED_COLOR_BRAND, description=desc)
 
 
 @client.tree.command(name="compare", description="Visual season-long comparison of two teams.")
@@ -1502,8 +2046,7 @@ async def compare(interaction: discord.Interaction, team1: str, team2: str):
             return
 
         card_data = await _build_compare_card(league, team1_obj, team2_obj, interaction.user.id)
-        image_buf = render_compare_card(card_data)
-        await interaction.followup.send(file=discord.File(fp=image_buf, filename="compare.png"))
+        await interaction.followup.send(embed=_compare_embed(card_data))
     except Exception as e:
         print(f"Compare command error: {e}")
         await safe_interaction_response(interaction, f"\u274c Error comparing teams: {e}", ephemeral=True)
@@ -1530,65 +2073,157 @@ async def standings(interaction: discord.Interaction):
             wins, losses, ties = team.wins, team.losses, getattr(team, 'ties', 0)
             games = wins + losses + ties
             win_pct = (wins + ties * 0.5) / games if games else 0.0
-            teams_data.append({
-                'team': team, 'wins': wins, 'losses': losses, 'ties': ties,
-                'pf': team.points_for, 'pa': team.points_against, 'win_pct': win_pct,
-            })
+            teams_data.append({'team': team, 'wins': wins, 'losses': losses, 'ties': ties, 'pf': team.points_for, 'win_pct': win_pct})
         teams_data.sort(key=lambda t: (t['win_pct'], t['pf']), reverse=True)
 
-        logos = await get_logos_by_url([t['team'].logo_url for t in teams_data])
-
-        def record_str(t):
-            r = f"{t['wins']}-{t['losses']}"
-            return r + f"-{t['ties']}" if t['ties'] else r
-
-        def owner_name(team):
-            owners = getattr(team, 'owners', None)
-            if owners:
-                first = owners[0]
-                if isinstance(first, dict):
-                    return first.get('firstName') or first.get('displayName') or 'Unknown'
-                return str(first)
-            return 'Unknown'
-
+        # Name column width comes from the real measured code-block budget
+        # (config/discord_display.py), not a guessed-then-tuned cap. This
+        # table is a classic discord.Embed, so it budgets against
+        # EMBED_CODE_BLOCK_MAX_CHARS (56), not the Container-only
+        # CODE_BLOCK_MAX_CHARS (65). Names longer than the budget don't
+        # truncate -- they get their own line via _table_row instead
+        # (e.g. "Swift Nation (Travis version)"), per explicit feedback
+        # that truncation isn't acceptable even for outliers.
+        FIXED = (3, 5, 7, 4)  # RK, W-L, PF, STRK
+        name_w = min(_flex_width(EMBED_CODE_BLOCK_MAX_CHARS, *FIXED), max(len(t['team'].team_name) for t in teams_data))
+        header = _table_row([("RK", 3), ("TEAM", name_w), ("W-L", 5), ("PF", 7), ("STRK", 4)])[0]
         rows = []
         for i, t in enumerate(teams_data):
             team = t['team']
+            record = f"{t['wins']}-{t['losses']}" + (f"-{t['ties']}" if t['ties'] else '')
             streak_type = getattr(team, 'streak_type', None)
             streak_len = getattr(team, 'streak_length', 0)
             streak = f"{'W' if streak_type == 'WIN' else 'L'}{streak_len}" if streak_type else "-"
-            rows.append({
-                'rank': i + 1, 'name': team.team_name, 'owner': owner_name(team),
-                'record': record_str(t), 'pf': t['pf'], 'pa': t['pa'], 'streak': streak,
-                'logo_path': logos.get(team.logo_url),
-            })
-
-        playoff_gb = None
-        if 0 < playoff_team_count < len(teams_data):
-            leader, chaser = teams_data[playoff_team_count - 1], teams_data[playoff_team_count]
-            playoff_gb = ((leader['wins'] - chaser['wins']) + (chaser['losses'] - leader['losses'])) / 2
+            rows.extend(_table_row([
+                (str(i + 1), 3),
+                (team.team_name, name_w, '<', True),
+                (record, 5),
+                (f"{t['pf']:.1f}", 7),
+                (streak, 4),
+            ]))
+        # No color-coding the streak (used to be an ansi fence with red/
+        # green escape codes) -- combining a ```ansi fence with the full
+        # border broke badly in Discord's renderer: the raw text was
+        # correct, but highlight.js's ansi grammar ate the border pipes
+        # and inflated line spacing when mixed with color spans. A plain
+        # fence with the shared border is consistent with every other
+        # table in the bot and actually renders correctly.
+        table = _frame_table([header], rows)
 
         if reg_season_count and current_week > reg_season_count:
-            header_right_label, header_right_sub = "FINAL", f"{reg_season_count} Games Played"
+            week_label = f"Final · {reg_season_count} Games Played"
         else:
-            header_right_label, header_right_sub = f"WK {current_week}", "Regular Season"
+            week_label = f"Week {current_week} · Regular Season"
 
-        rec_rule = next((r for r in settings.scoring_format if r.get('abbr') == 'REC'), None)
-        rec_pts = rec_rule['points'] if rec_rule else 0
-        scoring_label = "Full PPR" if rec_pts == 1 else "Half PPR" if rec_pts == 0.5 else "Standard" if rec_pts == 0 else f"{rec_pts:g} PPR"
+        footer_text = None
+        if 0 < playoff_team_count < len(teams_data):
+            leader, chaser = teams_data[playoff_team_count - 1], teams_data[playoff_team_count]
+            gb = ((leader['wins'] - chaser['wins']) + (chaser['losses'] - leader['losses'])) / 2
+            footer_text = f"Playoff cutoff: {playoff_team_count} teams · {chaser['team'].team_name} is {gb:.1f} games back"
 
-        card_data = {
-            'league_name': get_league_name(user_id=interaction.user.id),
-            'team_count': len(teams_data), 'scoring_label': scoring_label,
-            'header_right_label': header_right_label, 'header_right_sub': header_right_sub,
-            'playoff_team_count': playoff_team_count, 'playoff_gb': playoff_gb,
-            'teams': rows,
-        }
-        image_buf = render_standings_card(card_data)
-        await interaction.followup.send(file=discord.File(fp=image_buf, filename="standings.png"))
+        embed = discord.Embed(color=EMBED_COLOR_BRAND, description=f"**{week_label}**\n{table}")
+        if footer_text:
+            embed.set_footer(text=footer_text)
+        await interaction.followup.send(embed=embed)
     except Exception as e:
         print(f"Standings command error: {e}")
-        await safe_interaction_response(interaction, f"❌ Error creating standings card: {e}", ephemeral=True)
+        await safe_interaction_response(interaction, f"❌ Error creating standings: {e}", ephemeral=True)
+
+
+async def _teststandings_data(league):
+    """Data for render_teststandings_card -- same sort/streak logic /standings
+    already uses, plus team logos (the image version has room to actually
+    show them)."""
+    current_week = getattr(league, 'current_week', 1)
+    settings = league.settings
+    reg_season_count = getattr(settings, 'reg_season_count', 0)
+    playoff_team_count = getattr(settings, 'playoff_team_count', 0)
+
+    teams_data = []
+    for team in league.teams:
+        wins, losses, ties = team.wins, team.losses, getattr(team, 'ties', 0)
+        games = wins + losses + ties
+        win_pct = (wins + ties * 0.5) / games if games else 0.0
+        teams_data.append({'team': team, 'wins': wins, 'losses': losses, 'ties': ties, 'pf': team.points_for, 'win_pct': win_pct})
+    teams_data.sort(key=lambda t: (t['win_pct'], t['pf']), reverse=True)
+
+    logos = await get_logos_by_url([t['team'].logo_url for t in teams_data])
+
+    teams = []
+    for i, t in enumerate(teams_data):
+        team = t['team']
+        record = f"{t['wins']}-{t['losses']}" + (f"-{t['ties']}" if t['ties'] else '')
+        streak_type = getattr(team, 'streak_type', None)
+        streak_len = getattr(team, 'streak_length', 0)
+        streak = f"{'W' if streak_type == 'WIN' else 'L'}{streak_len}" if streak_type else "-"
+        teams.append({'rank': i + 1, 'name': team.team_name, 'record': record, 'streak': streak,
+                      'logo_path': logos.get(team.logo_url)})
+
+    playoff_gb = None
+    if 0 < playoff_team_count < len(teams_data):
+        leader, chaser = teams_data[playoff_team_count - 1], teams_data[playoff_team_count]
+        playoff_gb = ((leader['wins'] - chaser['wins']) + (chaser['losses'] - leader['losses'])) / 2
+
+    if reg_season_count and current_week > reg_season_count:
+        week_label = f"Final · {reg_season_count} Games Played"
+    else:
+        week_label = f"Week {current_week} · Regular Season"
+
+    return {
+        'league_name': "Fantasy League",
+        'week_label': week_label,
+        'playoff_team_count': playoff_team_count,
+        'playoff_gb': playoff_gb,
+        'teams': teams,
+    }
+
+
+@client.tree.command(name="teststandings", description="[TEST] Image-style standings prototype -- bigger type, fewer columns.")
+async def teststandings(interaction: discord.Interaction):
+    if not await safe_defer(interaction):
+        return
+    try:
+        league = get_league(user_id=interaction.user.id)
+        if not league:
+            await safe_interaction_response(interaction, "❌ No league found. Use `/register_league` to add your ESPN Fantasy League first, or contact an admin if you want to use the default league.", ephemeral=True)
+            return
+        data = await _teststandings_data(league)
+        buf = render_teststandings_card(data)
+        await interaction.followup.send(file=discord.File(buf, filename="teststandings.png"))
+    except Exception as e:
+        print(f"Teststandings command error: {e}")
+        await safe_interaction_response(interaction, f"❌ Error creating standings: {e}", ephemeral=True)
+
+
+@client.tree.command(name="testgrid", description="[TEST] Posts a calibration grid to measure Discord's inline image display size.")
+async def testgrid(interaction: discord.Interaction):
+    """Throwaway diagnostic -- posts a wide grid AND a tall grid, each both
+    as a bare attachment and as an embed set_image, so the actual rendered
+    <img> dimensions (read from the DOM) give two aspect ratios per delivery
+    path -- enough to solve for both the max-width and max-height of
+    whatever bounding box Discord is fitting the image into. Delete once
+    discord_display.py's constants are measured."""
+    if not await safe_defer(interaction):
+        return
+    base = r"C:\Users\RYANHA~1\AppData\Local\Temp\claude\C--Users-Ryan-Hancock-projects-discord-bots-ff-discord-bot\6ee4203e-6eeb-4561-8832-850ef535664a\scratchpad"
+    wide_path = base + r"\grid_2000x1000.png"
+    tall_path = base + r"\grid_1000x2000.png"
+    try:
+        await interaction.followup.send(content="**Wide, bare attachment:**", file=discord.File(wide_path, filename="wide_bare.png"))
+        embed1 = discord.Embed(title="Wide, embed set_image:")
+        embed1.set_image(url="attachment://wide_embed.png")
+        await interaction.channel.send(embed=embed1, file=discord.File(wide_path, filename="wide_embed.png"))
+        await interaction.channel.send(content="**Tall, bare attachment:**", file=discord.File(tall_path, filename="tall_bare.png"))
+        embed2 = discord.Embed(title="Tall, embed set_image:")
+        embed2.set_image(url="attachment://tall_embed.png")
+        await interaction.channel.send(embed=embed2, file=discord.File(tall_path, filename="tall_embed.png"))
+    except Exception as e:
+        print(f"Testgrid command error: {e}")
+        await safe_interaction_response(interaction, f"❌ Error: {e}", ephemeral=True)
+
+
+
+
 
 
 async def _build_playoff_bracket_data(league):
@@ -1626,10 +2261,9 @@ async def _build_playoff_bracket_data(league):
     ranked = sorted(league.teams, key=lambda t: (win_pct(t), t.points_for), reverse=True)
     playoff_teams = ranked[:playoff_team_count]
     seed_of = {t.team_id: i + 1 for i, t in enumerate(playoff_teams)}
-    logos = await get_logos_by_url([t.logo_url for t in playoff_teams])
 
     def slot_team(t):
-        return {'seed': seed_of[t.team_id], 'name': t.team_name, 'logo_path': logos.get(t.logo_url)}
+        return {'seed': seed_of[t.team_id], 'name': t.team_name}
 
     matchup_periods = getattr(settings, 'matchup_periods', None)
     last_week = max((int(k) for k in matchup_periods.keys()), default=reg_season_count) if matchup_periods else reg_season_count
@@ -1640,7 +2274,7 @@ async def _build_playoff_bracket_data(league):
     champion = None
 
     for week in range(reg_season_count + 1, last_week + 1):
-        week_box_scores = _safe_box_scores(league, week)
+        week_box_scores = await _safe_box_scores(league, week)
         games_by_team = {}
         for m in week_box_scores:
             if m.home_team and m.away_team and m.home_team.team_id in alive and m.away_team.team_id in alive:
@@ -1752,12 +2386,38 @@ async def playoffs(interaction: discord.Interaction):
             await safe_interaction_response(interaction, "❌ The playoff bracket hasn't been seeded yet -- check back once Week 1 of the playoffs has been scheduled.", ephemeral=True)
             return
 
-        card_data = {
-            'league_name': get_league_name(user_id=interaction.user.id), 'season': league.year,
-            'rounds': rounds, 'champion': champion,
-        }
-        image_buf = render_playoff_bracket_card(card_data)
-        await interaction.followup.send(file=discord.File(fp=image_buf, filename="playoffs.png"))
+        def round_label(i, total):
+            remaining = total - i
+            if remaining == 1:
+                return "Championship"
+            if remaining == 2:
+                return "Semifinals"
+            if remaining == 3:
+                return "Quarterfinals"
+            return f"Round {i + 1}"
+
+        lines = []
+        for i, round_slots in enumerate(rounds):
+            lines.append(f"**{round_label(i, len(rounds))}**")
+            for slot in round_slots:
+                if slot['type'] == 'bye':
+                    t = slot['team']
+                    lines.append(f"  ({t['seed']}) {t['name']} — BYE")
+                else:
+                    t1, t2 = slot['team1'], slot['team2']
+                    if slot['status'] == 'final':
+                        s1 = f"**{t1['score']:.1f}**" if t1['win'] else f"{t1['score']:.1f}"
+                        s2 = f"**{t2['score']:.1f}**" if t2['win'] else f"{t2['score']:.1f}"
+                    else:
+                        s1 = s2 = "-"
+                    lines.append(f"  ({t1['seed']}) {t1['name']} {s1}  vs  {s2} ({t2['seed']}) {t2['name']}")
+            lines.append("")
+        bracket_text = "\n".join(lines).strip()
+        if champion:
+            bracket_text += f"\n\n\U0001f3c6 **Champion:** {champion['name']}"
+
+        embed = discord.Embed(color=EMBED_COLOR_BRAND, description=f"**Playoff Bracket**  ·  {league.year}\n\n{bracket_text}")
+        await interaction.followup.send(embed=embed)
     except Exception as e:
         print(f"Playoffs command error: {e}")
         await safe_interaction_response(interaction, f"❌ Error creating playoff bracket: {e}", ephemeral=True)
@@ -1814,23 +2474,21 @@ async def stats(interaction: discord.Interaction):
             return f"{team.wins}-{team.losses}"
 
         tiles = [
-            {'label': 'Most Consistent', 'team': most_consistent['name'], 'value': f"\u03c3 {most_consistent['std_dev']:.1f}", 'sub': None},
-            {'label': 'Most Volatile', 'team': most_volatile['name'], 'value': f"\u03c3 {most_volatile['std_dev']:.1f}", 'sub': None},
-            {'label': 'Best Single Week', 'team': best_week[1], 'value': f"{best_week[0]:.1f}", 'sub': 'pts'},
-            {'label': 'Worst Single Week', 'team': worst_week[1], 'value': f"{worst_week[0]:.1f}", 'sub': 'pts'},
-            {'label': 'Most Efficient', 'team': most_efficient['name'], 'value': f"{most_efficient['efficiency']:.3f}", 'sub': 'win/1000pf'},
+            ('Most Consistent', most_consistent['name'], f"\u03c3 {most_consistent['std_dev']:.1f}"),
+            ('Most Volatile', most_volatile['name'], f"\u03c3 {most_volatile['std_dev']:.1f}"),
+            ('Best Single Week', best_week[1], f"{best_week[0]:.1f} pts"),
+            ('Worst Single Week', worst_week[1], f"{worst_week[0]:.1f} pts"),
+            ('Most Efficient', most_efficient['name'], f"{most_efficient['efficiency']:.3f} win/1000pf"),
         ]
         if unluckiest:
-            tiles.append({'label': 'Unluckiest', 'team': unluckiest['name'], 'value': f"{unluckiest['points_for']:.1f} PF", 'sub': record_of(unluckiest['name'])})
-        tiles.append({'label': 'Toughest Schedule', 'team': toughest['name'], 'value': f"{toughest['points_against']:.1f}", 'sub': 'PA'})
-        tiles.append({'label': 'Easiest Schedule', 'team': easiest['name'], 'value': f"{easiest['points_against']:.1f}", 'sub': 'PA'})
+            tiles.append(('Unluckiest', unluckiest['name'], f"{unluckiest['points_for']:.1f} PF \u00b7 {record_of(unluckiest['name'])}"))
+        tiles.append(('Toughest Schedule', toughest['name'], f"{toughest['points_against']:.1f} PA"))
+        tiles.append(('Easiest Schedule', easiest['name'], f"{easiest['points_against']:.1f} PA"))
 
-        card_data = {
-            'title': 'League Stats', 'league_name': get_league_name(user_id=interaction.user.id),
-            'subtitle': 'Full Season', 'tiles': tiles,
-        }
-        image_buf = render_stat_tiles_card(card_data)
-        await interaction.followup.send(file=discord.File(fp=image_buf, filename="stats.png"))
+        embed = discord.Embed(color=EMBED_COLOR_BRAND, description="-# League Stats \u00b7 Full Season")
+        for label, team, value in tiles:
+            embed.add_field(name=label, value=f"**{team}**\n{value}", inline=True)
+        await interaction.followup.send(embed=embed)
     except Exception as e:
         print(f"Stats command error: {e}")
         await safe_interaction_response(interaction, f"\u274c Error fetching stats: {e}", ephemeral=True)
@@ -1872,34 +2530,195 @@ async def sleeper(interaction: discord.Interaction, position: str = None):
             candidates.append({'player': p, 'proj': proj, 'avg': avg, 'owned': owned, 'score': score})
 
         candidates.sort(key=lambda c: c['score'], reverse=True)
-        top = candidates[:5]
+        top5 = candidates[:5]
 
-        if not top:
+        if not top5:
             await interaction.followup.send("No sleeper candidates found with current criteria.")
             return
 
-        images = await get_images(player_ids=[c['player'].playerId for c in top], team_abbrs=[])
-        players = [{
-            'rank': i + 1, 'name': c['player'].name, 'position': c['player'].position,
-            'sub': f"{c['player'].proTeam} \u00b7 {c['owned']:.1f}% owned",
-            'headshot_path': images['players'].get(c['player'].playerId),
-            'metric1_val': f"{c['proj']:.1f}", 'metric1_label': 'proj',
-            'metric2_val': f"{c['avg']:.1f}", 'metric2_label': 'avg',
-            'tag': None, 'tag_type': None,
-        } for i, c in enumerate(top)]
+        top_pick = top5[0]
+        player = top_pick['player']
+        images = await get_images(player_ids=[player.playerId], team_abbrs=[])
+        headshot = images['players'].get(player.playerId)
+        thumb_file = discord.File(headshot, filename=os.path.basename(headshot)) if headshot else None
 
-        avg_owned = sum(c['owned'] for c in top) / len(top)
-        card_data = {
-            'title': 'Sleeper Picks', 'league_name': get_league_name(user_id=interaction.user.id),
-            'subtitle': f"{position.upper()} Only" if position else "All Positions",
-            'header_right_val': f"{avg_owned:.1f}%", 'header_right_sub': 'avg owned',
-            'players': players, 'footer_label': None, 'footer_value': None,
-        }
-        image_buf = render_player_list_card(card_data)
-        await interaction.followup.send(file=discord.File(fp=image_buf, filename="sleepers.png"))
+        body = (
+            f"### #1 \u00b7 {player.name}\n"
+            f"{player.position} \u00b7 {player.proTeam or 'FA'} \u00b7 {top_pick['owned']:.1f}% owned\n\n"
+            f"**Proj. Points:** {top_pick['proj']:.1f}\n"
+            f"**Season Avg:** {top_pick['avg']:.1f}"
+        )
+
+        rest = top5[1:]
+        rest_table = None
+        if rest:
+            FIXED = (3, 4, 5, 5, 5)  # #, POS, OWN%, PROJ, AVG
+            name_w = min(_flex_width(CODE_BLOCK_MAX_CHARS, *FIXED), max(len(c['player'].name) for c in rest))
+            header = _table_row([("#", 3), ("PLAYER", name_w), ("POS", 4), ("OWN%", 5), ("PROJ", 5), ("AVG", 5)])[0]
+            rows = []
+            for i, c in enumerate(rest, start=2):
+                p = c['player']
+                rows.extend(_table_row([
+                    (str(i), 3),
+                    (p.name, name_w, '<', True),
+                    (p.position, 4),
+                    (f"{c['owned']:.1f}", 5),
+                    (f"{c['proj']:.1f}", 5),
+                    (f"{c['avg']:.1f}", 5),
+                ]))
+            rest_table = _frame_table([header], rows)
+
+        pos_label = f"{position.upper()} Only" if position else "All Positions"
+
+        class SleeperView(discord.ui.LayoutView):
+            def __init__(self):
+                super().__init__(timeout=1800)
+                container = discord.ui.Container(accent_colour=EMBED_COLOR_BRAND)
+                container.add_item(discord.ui.TextDisplay(f"-# \U0001f4a4 TOP SLEEPER PICK \u00b7 {pos_label}"))
+                if thumb_file:
+                    section = discord.ui.Section(discord.ui.TextDisplay(body), accessory=discord.ui.Thumbnail(f"attachment://{thumb_file.filename}"))
+                    container.add_item(section)
+                else:
+                    container.add_item(discord.ui.TextDisplay(body))
+                if rest_table:
+                    container.add_item(discord.ui.Separator())
+                    container.add_item(discord.ui.TextDisplay(rest_table))
+                self.add_item(container)
+
+        if thumb_file:
+            await interaction.followup.send(view=SleeperView(), file=thumb_file)
+        else:
+            await interaction.followup.send(view=SleeperView())
     except Exception as e:
         print(f"Sleeper command error: {e}")
         await safe_interaction_response(interaction, f"\u274c Error finding sleepers: {e}", ephemeral=True)
+
+async def _matchup_lineups(league, team1_obj, team2, current_week):
+    """Shared lookup for /matchup: finds this week's box score for team1
+    (or the team1-vs-team2 box score if team2 is given), and returns the
+    two lineups home/away-normalized to (team1, team2) order."""
+    box_scores = await _safe_box_scores(league, current_week)
+    team2_obj = None
+    if team2:
+        team2_obj = next((t for t in league.teams if t.team_name.lower() == team2.lower()), None)
+        if not team2_obj:
+            return None, None, None, None
+        box_score = next((m for m in box_scores if {getattr(m.home_team, 'team_id', None), getattr(m.away_team, 'team_id', None)} == {team1_obj.team_id, team2_obj.team_id}), None)
+    else:
+        box_score = next((m for m in box_scores if (m.home_team and m.home_team.team_id == team1_obj.team_id) or (m.away_team and m.away_team.team_id == team1_obj.team_id)), None)
+        if box_score:
+            team2_obj = box_score.away_team if box_score.home_team.team_id == team1_obj.team_id else box_score.home_team
+    if not box_score or not team2_obj:
+        return None, None, None, None
+    team1_is_home = box_score.home_team.team_id == team1_obj.team_id
+    lineup1 = box_score.home_lineup if team1_is_home else box_score.away_lineup
+    lineup2 = box_score.away_lineup if team1_is_home else box_score.home_lineup
+    return box_score, team2_obj, lineup1, lineup2
+
+
+def _matchup_dslot(p):
+    slot = getattr(p, 'slot_position', '') or ''
+    if slot in ('D/ST', 'DST'):
+        return 'D/ST'
+    return 'FLEX' if '/' in slot else (slot or p.position)
+
+
+_MATCHUP_SLOT_ORDER = {'QB': 0, 'RB': 1, 'WR': 2, 'TE': 3, 'FLEX': 4, 'D/ST': 5, 'K': 6}
+
+
+def _matchup_display_name(p):
+    """Display name for the interleaved matchup table -- the real full
+    name, just with the redundant ' D/ST' suffix stripped since the POS
+    column already says D/ST. No forced initial-abbreviation: the table's
+    column widths are sized (see _matchup_table) to fit real names as
+    given, and only ellipsize the specific names that are genuine outliers
+    for that matchup, instead of chopping every name down to save space
+    nobody needed."""
+    if _matchup_dslot(p) == 'D/ST':
+        name = p.name
+        for suffix in (' D/ST', ' DST'):
+            if name.endswith(suffix):
+                return name[:-len(suffix)]
+        return name
+    return p.name
+
+
+def _matchup_table(starters1, starters2, pregame):
+    """One aligned table, one row per starting slot, both teams side by
+    side, framed via the shared _frame_table border. The vertical divider
+    in the middle reads as a versus line between the two teams.
+
+    Each side's name column is sized from its own real names (full names,
+    not force-abbreviated), splitting whatever's left of
+    CODE_BLOCK_MAX_CHARS after the fixed slot/points/divider columns --
+    measured from an actual rendered code block (config/discord_display.py),
+    not a guessed-then-tuned-until-it-stopped-wrapping cap like the
+    earlier version of this table used. If both sides' names already fit
+    inside that budget, nothing gets truncated at all."""
+    def value(p):
+        return float(getattr(p, 'projected_points', 0) or 0) if pregame else float(getattr(p, 'points', 0) or 0)
+
+    names1 = [_matchup_display_name(p) for p in starters1]
+    names2 = [_matchup_display_name(p) for p in starters2]
+
+    # Fixed columns: "SLOT " (5+1) + name + " " + "PTS.P" (6) + " │ " (3) + name + " " + "PTS.P" (6)
+    FIXED_OVERHEAD = 23
+    name_budget = CODE_BLOCK_MAX_CHARS - FIXED_OVERHEAD - TABLE_BORDER_OVERHEAD
+    # Sized from the PLAYER names only, not name1/name2 (the team names) --
+    # team names are never rendered in this table's own columns anymore
+    # (see header_lines below), so budgeting room for them here would
+    # just make the table wider than the data it actually shows needs.
+    natural1 = max(len(n) for n in names1)
+    natural2 = max(len(n) for n in names2)
+    if natural1 + natural2 <= name_budget:
+        w1, w2 = natural1, natural2
+    else:
+        w1 = max(6, round(name_budget * natural1 / (natural1 + natural2)))
+        w2 = max(6, name_budget - w1)
+
+    def row_lines(slot_label, n1, v1_str, n2, v2_str, lead1=' ', lead2=' '):
+        """One matchup row (header/data/total all go through this) as
+        1+ physical lines via the shared _table_row primitive: two
+        independent flex name columns (either can overflow to its own
+        line without affecting the other) plus a literal "│" divider
+        cell -- sep=" " on both sides of it reproduces the original
+        " │ " gap exactly, and because _table_row always joins columns
+        through an explicit separator (never fused into a padding
+        width), the divider can never end up glued to either name."""
+        return _table_row([
+            (slot_label, 5),
+            (f"{lead1}{n1}", w1 + 1, '<', True),
+            (v1_str, 6, '>'),
+            ("│", 1, '<', False, True),
+            (f"{lead2}{n2}", w2 + 1, '<', True),
+            (v2_str, 6, '>'),
+        ])
+
+    # The header row leaves the name columns blank rather than repeating
+    # name1/name2 -- both full team names are already shown in the
+    # message's own header line right above this table (see the
+    # /matchup command), so putting them here too was pure duplication.
+    # It was also the actual source of a broken-looking table: a TEAM
+    # name is often longer than the PLAYER-name budget these columns are
+    # sized for (real player rows below rarely overflow; team names
+    # almost always did), so this was the row that broke most often --
+    # for data that was already fully visible one line up.
+    header_lines = row_lines("POS", "", "PTS", "", "PTS")
+
+    rows = []
+    total1 = total2 = 0.0
+    for p1, p2, n1, n2 in zip(starters1, starters2, names1, names2):
+        slot = _matchup_dslot(p1)
+        v1, v2 = value(p1), value(p2)
+        total1 += v1
+        total2 += v2
+        lead1 = '>' if (not pregame and v1 > v2) else ' '
+        lead2 = '>' if (not pregame and v2 > v1) else ' '
+        rows.extend(row_lines(slot, n1, f"{v1:.1f}", n2, f"{v2:.1f}", lead1, lead2))
+    total_line = row_lines("", "TOTAL", f"{total1:.1f}", "TOTAL", f"{total2:.1f}")
+
+    return _frame_table(header_lines, rows, total_line)
+
 
 @client.tree.command(name="matchup", description="Head-to-head visual matchup card for this week.")
 @app_commands.describe(team1="First team name", team2="Second team name (optional - will try to find current matchup)")
@@ -1924,163 +2743,103 @@ async def matchup(interaction: discord.Interaction, team1: str, team2: str = Non
             return
 
         current_week = getattr(league, 'current_week', 1)
-        box_scores = _safe_box_scores(league, current_week)
-
-        box_score = None
-        team2_obj = None
-        if team2:
-            team2_obj = next((t for t in league.teams if t.team_name.lower() == team2.lower()), None)
-            if not team2_obj:
-                await interaction.followup.send(f"Team '{team2}' not found.")
-                return
-            box_score = next((m for m in box_scores if {getattr(m.home_team, 'team_id', None), getattr(m.away_team, 'team_id', None)} == {team1_obj.team_id, team2_obj.team_id}), None)
-        else:
-            box_score = next((m for m in box_scores if (m.home_team and m.home_team.team_id == team1_obj.team_id) or (m.away_team and m.away_team.team_id == team1_obj.team_id)), None)
-            if box_score:
-                team2_obj = box_score.away_team if box_score.home_team.team_id == team1_obj.team_id else box_score.home_team
-
-        if not box_score or not team2_obj:
+        box_score, team2_obj, lineup1, lineup2 = await _matchup_lineups(league, team1_obj, team2, current_week)
+        if not box_score:
             await interaction.followup.send(f"Could not find a matchup for {team1_obj.team_name} in week {current_week}. Specify both teams: `/matchup {team1} TeamName`")
             return
 
         team1_is_home = box_score.home_team.team_id == team1_obj.team_id
-        lineup1 = box_score.home_lineup if team1_is_home else box_score.away_lineup
-        lineup2 = box_score.away_lineup if team1_is_home else box_score.home_lineup
-        score1 = box_score.home_score if team1_is_home else box_score.away_score
-        score2 = box_score.away_score if team1_is_home else box_score.home_score
+        score1 = float(box_score.home_score if team1_is_home else box_score.away_score)
+        score2 = float(box_score.away_score if team1_is_home else box_score.home_score)
+        proj1 = sum(float(getattr(p, 'projected_points', 0) or 0) for p in lineup1 if _matchup_dslot(p) != 'BE')
+        proj2 = sum(float(getattr(p, 'projected_points', 0) or 0) for p in lineup2 if _matchup_dslot(p) != 'BE')
 
-        slot_order = {'QB': 0, 'RB': 1, 'WR': 2, 'TE': 3, 'FLEX': 4, 'D/ST': 5, 'K': 6}
+        starters1 = sorted([p for p in lineup1 if _matchup_dslot(p) != 'BE'], key=lambda p: _MATCHUP_SLOT_ORDER.get(_matchup_dslot(p), 99))
+        starters2 = sorted([p for p in lineup2 if _matchup_dslot(p) != 'BE'], key=lambda p: _MATCHUP_SLOT_ORDER.get(_matchup_dslot(p), 99))
+        bench1 = [p for p in lineup1 if _matchup_dslot(p) == 'BE']
+        bench2 = [p for p in lineup2 if _matchup_dslot(p) == 'BE']
 
-        def display_slot(p):
-            slot = getattr(p, 'slot_position', '') or ''
-            if slot == 'BE':
-                return 'BE'
-            if slot in ('D/ST', 'DST'):
-                return 'D/ST'
-            if '/' in slot:
-                return 'FLEX'
-            return slot or p.position
-
-        starters1 = sorted([p for p in lineup1 if display_slot(p) != 'BE'], key=lambda p: slot_order.get(display_slot(p), 99))
-        starters2 = sorted([p for p in lineup2 if display_slot(p) != 'BE'], key=lambda p: slot_order.get(display_slot(p), 99))
-        bench1 = [p for p in lineup1 if display_slot(p) == 'BE']
-        bench2 = [p for p in lineup2 if display_slot(p) == 'BE']
-
-        # Bench players aren't rendered on this card anymore (see /bench), so
-        # only fetch headshots for starters.
-        all_players = starters1 + starters2
-        player_ids = [p.playerId for p in all_players if p.position not in ('D/ST', 'DST', 'DEF')]
-        team_abbrs = [p.proTeam.lower() for p in all_players if p.position in ('D/ST', 'DST', 'DEF') and p.proTeam]
-        images = await get_images(player_ids=player_ids, team_abbrs=team_abbrs)
-        logos = await get_logos_by_url([team1_obj.logo_url, team2_obj.logo_url])
-
-        def side(p, win=None):
-            if p is None:
-                return {'name': '', 'position': '', 'headshot_path': None, 'is_logo': False,
-                        'pts': 0.0, 'proj': 0.0, 'win': None}
-            is_dst = p.position in ('D/ST', 'DST', 'DEF')
-            return {
-                'name': p.name, 'position': p.position,
-                'headshot_path': images['teams'].get(p.proTeam.lower()) if is_dst and p.proTeam else images['players'].get(p.playerId),
-                'is_logo': is_dst,
-                'pts': float(getattr(p, 'points', 0) or 0), 'proj': float(getattr(p, 'projected_points', 0) or 0),
-                'win': win,
-            }
-
-        starter_rows = []
-        for p1, p2 in zip(starters1, starters2):
-            pts1, pts2 = float(getattr(p1, 'points', 0) or 0), float(getattr(p2, 'points', 0) or 0)
-            starter_rows.append({'slot': display_slot(p1), 'left': side(p1, pts1 > pts2), 'right': side(p2, pts2 > pts1)})
-
-        gp_values = [getattr(p, 'game_played', 0) for p in lineup1]
-        if gp_values and all(v == 100 for v in gp_values):
-            status = "Final"
-        elif any(v > 0 for v in gp_values):
-            status = "Live"
+        pregame = score1 == 0 and score2 == 0
+        if pregame:
+            headline = f"proj {proj1:.1f} — {proj2:.1f}"
+            accent = EMBED_COLOR_BRAND
         else:
-            status = "Upcoming"
+            headline = f"🔴 LIVE · {score1:.1f} — {score2:.1f} · proj {proj1:.1f}/{proj2:.1f}"
+            diff = abs(score1 - score2)
+            accent = 0x2ECC71 if diff <= 10 else (0x99A1A6 if diff >= 30 else EMBED_COLOR_BRAND)
 
-        def record_str(t):
-            r = f"{t.wins}-{t.losses}"
-            return r + (f"-{t.ties}" if getattr(t, 'ties', 0) else '')
+        # Momentum sparklines -- built from score_history's opportunistic
+        # samples (see _safe_box_scores), so they only show up once enough
+        # samples have accumulated over the week; empty until then.
+        spark1 = _sparkline(score_history.get(league.league_id, league.year, current_week, team1_obj.team_id))
+        spark2 = _sparkline(score_history.get(league.league_id, league.year, current_week, team2_obj.team_id))
+        spark_parts = []
+        if spark1:
+            spark_parts.append(f"{team1_obj.team_name} {spark1}")
+        if spark2:
+            spark_parts.append(f"{team2_obj.team_name} {spark2}")
+        spark_line = f"-# {'  ·  '.join(spark_parts)}\n" if spark_parts else ""
 
-        def owner_name(t):
-            owners = getattr(t, 'owners', None)
-            if owners:
-                first = owners[0]
-                return (first.get('firstName') or first.get('displayName') or 'Unknown') if isinstance(first, dict) else str(first)
-            return 'Unknown'
+        table = _matchup_table(starters1, starters2, pregame)
+        header = (
+            f"-# Week {current_week} · {team1_obj.team_name} ({_record_str(team1_obj)}) vs {team2_obj.team_name} ({_record_str(team2_obj)})\n"
+            f"### {headline}\n"
+            f"{spark_line}"
+            f"{table}"
+        )
 
-        card_data = {
-            'team1': {'name': team1_obj.team_name, 'owner': owner_name(team1_obj), 'record': record_str(team1_obj),
-                      'score': float(score1), 'logo_path': logos.get(team1_obj.logo_url)},
-            'team2': {'name': team2_obj.team_name, 'owner': owner_name(team2_obj), 'record': record_str(team2_obj),
-                      'score': float(score2), 'logo_path': logos.get(team2_obj.logo_url)},
-            'header_sub': f"{status} · Week {current_week}",
-            'starters': starter_rows, 'bench_count1': len(bench1), 'bench_count2': len(bench2),
-            'totals': {'left': sum(r['left']['pts'] for r in starter_rows), 'right': sum(r['right']['pts'] for r in starter_rows)},
-        }
-        image_buf = render_matchup_card(card_data)
-        await interaction.followup.send(file=discord.File(fp=image_buf, filename="matchup.png"))
+        class MatchupView(discord.ui.LayoutView):
+            def __init__(self):
+                super().__init__(timeout=1800)
+                container = discord.ui.Container(accent_colour=accent)
+                container.add_item(discord.ui.TextDisplay(header))
+
+                row = discord.ui.ActionRow()
+                bench_btn = discord.ui.Button(label="Bench", style=discord.ButtonStyle.secondary)
+                lineup_btn = discord.ui.Button(label="Set Lineup", style=discord.ButtonStyle.secondary)
+                chat_btn = discord.ui.Button(label="Chat", style=discord.ButtonStyle.secondary)
+
+                async def on_bench(i: discord.Interaction):
+                    if not bench1 and not bench2:
+                        await i.response.send_message("Both benches are empty.", ephemeral=True)
+                        return
+                    bench_table = _matchup_table(bench1, bench2, pregame)
+
+                    class BenchView(discord.ui.LayoutView):
+                        def __init__(self):
+                            super().__init__(timeout=1800)
+                            bench_container = discord.ui.Container(accent_colour=accent)
+                            bench_container.add_item(discord.ui.TextDisplay(bench_table))
+                            self.add_item(bench_container)
+
+                    await i.response.send_message(view=BenchView(), ephemeral=True)
+
+                async def on_lineup(i: discord.Interaction):
+                    await i.response.send_message(
+                        "⚠️ This bot has read-only ESPN access -- lineup changes have to be made in the ESPN app.",
+                        ephemeral=True)
+
+                async def on_chat(i: discord.Interaction):
+                    try:
+                        thread = await i.message.create_thread(name=f"{team1_obj.team_name} vs {team2_obj.team_name} - Week {current_week}")
+                        await i.response.send_message(f"Opened {thread.mention}", ephemeral=True)
+                    except discord.HTTPException as e:
+                        await i.response.send_message(f"Couldn't open a thread here: {e}", ephemeral=True)
+
+                bench_btn.callback = on_bench
+                lineup_btn.callback = on_lineup
+                chat_btn.callback = on_chat
+                row.add_item(bench_btn)
+                row.add_item(lineup_btn)
+                row.add_item(chat_btn)
+                container.add_item(row)
+                self.add_item(container)
+
+        await interaction.followup.send(view=MatchupView())
     except Exception as e:
         print(f"Matchup command error: {e}")
-        await safe_interaction_response(interaction, f"❌ Error creating matchup card: {e}", ephemeral=True)
+        await safe_interaction_response(interaction, f"❌ Error creating matchup: {e}", ephemeral=True)
 
-@client.tree.command(name="bench", description="View a team's bench -- or compare two benches side by side.")
-@app_commands.describe(team1="First team name", team2="Second team name (optional -- compares both benches if given)")
-@app_commands.autocomplete(team1=team_name_autocomplete, team2=team_name_autocomplete)
-async def bench(interaction: discord.Interaction, team1: str, team2: str = None):
-    if not await safe_defer(interaction):
-        return
-
-    try:
-        league = get_league(user_id=interaction.user.id)
-        if not league:
-            await safe_interaction_response(interaction, "❌ No league found. Use `/register_league` to add your ESPN Fantasy League first, or contact an admin if you want to use the default league.", ephemeral=True)
-            return
-
-        team1_obj = next((t for t in league.teams if t.team_name.lower() == team1.lower()), None)
-        if not team1_obj:
-            await interaction.followup.send(f"Team '{team1}' not found.")
-            return
-
-        if not team1_obj.roster:
-            await safe_interaction_response(interaction, f"❌ {team1_obj.team_name} has no roster yet -- this league hasn't drafted for the {league.year} season.", ephemeral=True)
-            return
-
-        current_week = getattr(league, 'current_week', 1)
-        _, bench1_rows = await _build_roster_rows(league, team1_obj, current_week)
-
-        if not team2:
-            logos = await get_logos_by_url([team1_obj.logo_url])
-            card_data = {
-                'team1': {'name': team1_obj.team_name, 'owner': _team_owner_name(team1_obj), 'record': _team_record_str(team1_obj),
-                          'logo_path': logos.get(team1_obj.logo_url)},
-                'bench1': bench1_rows,
-            }
-        else:
-            team2_obj = next((t for t in league.teams if t.team_name.lower() == team2.lower()), None)
-            if not team2_obj:
-                await interaction.followup.send(f"Team '{team2}' not found.")
-                return
-            if not team2_obj.roster:
-                await safe_interaction_response(interaction, f"❌ {team2_obj.team_name} has no roster yet -- this league hasn't drafted for the {league.year} season.", ephemeral=True)
-                return
-            _, bench2_rows = await _build_roster_rows(league, team2_obj, current_week)
-            logos = await get_logos_by_url([team1_obj.logo_url, team2_obj.logo_url])
-            card_data = {
-                'team1': {'name': team1_obj.team_name, 'owner': _team_owner_name(team1_obj), 'record': _team_record_str(team1_obj),
-                          'logo_path': logos.get(team1_obj.logo_url)},
-                'team2': {'name': team2_obj.team_name, 'owner': _team_owner_name(team2_obj), 'record': _team_record_str(team2_obj),
-                          'logo_path': logos.get(team2_obj.logo_url)},
-                'bench1': bench1_rows, 'bench2': bench2_rows,
-            }
-
-        image_buf = render_bench_card(card_data)
-        await interaction.followup.send(file=discord.File(fp=image_buf, filename="bench.png"))
-    except Exception as e:
-        print(f"Bench command error: {e}")
-        await safe_interaction_response(interaction, f"❌ Error creating bench card: {e}", ephemeral=True)
 
 @client.tree.command(name="waiver", description="Analyze waiver wire for top pickup recommendations.")
 @app_commands.describe(
@@ -2127,46 +2886,102 @@ async def waiver(interaction: discord.Interaction, position: str = None, min_own
 
         candidates.sort(key=lambda c: c['proj'], reverse=True)
         top10 = candidates[:10]
-        top = top10[:5]
+        top5 = top10[:5]
 
         gem = next((c for c in top10 if c['owned'] <= 10 and c['proj'] >= 80), None)
         popular_ids = {c['player'].playerId for c in top10 if c['owned'] >= 25}
+
+        def tag_for(c):
+            if gem and c['player'].playerId == gem['player'].playerId:
+                return 'GEM'
+            return 'POP' if c['player'].playerId in popular_ids else ''
 
         pos_counts = {}
         for c in top10:
             pos_counts.setdefault(c['player'].position, []).append(c)
         deepest = max(pos_counts, key=lambda p: len(pos_counts[p])) if pos_counts else None
         scarcest = min(pos_counts, key=lambda p: len(pos_counts[p])) if pos_counts else None
-        footer_value = None
-        if deepest and scarcest and deepest != scarcest:
-            footer_value = f"{deepest} deep \u00b7 {scarcest} scarce"
+        depth_note = f"{deepest} deep \u00b7 {scarcest} scarce" if deepest and scarcest and deepest != scarcest else None
 
-        images = await get_images(player_ids=[c['player'].playerId for c in top], team_abbrs=[])
-        players = []
-        for i, c in enumerate(top):
-            p = c['player']
-            tag, tag_type = None, None
-            if gem and p.playerId == gem['player'].playerId:
-                tag, tag_type = 'Hidden Gem', 'gem'
-            elif p.playerId in popular_ids:
-                tag, tag_type = 'Popular', 'popular'
-            players.append({
-                'rank': i + 1, 'name': p.name, 'position': p.position,
-                'sub': f"{p.proTeam} \u00b7 {c['owned']:.1f}% owned",
-                'headshot_path': images['players'].get(p.playerId),
-                'metric1_val': f"{c['proj']:.1f}", 'metric1_label': 'proj',
-                'metric2_val': None, 'metric2_label': None,
-                'tag': tag, 'tag_type': tag_type,
-            })
+        top_pick = top5[0]
+        player = top_pick['player']
+        images = await get_images(player_ids=[player.playerId], team_abbrs=[])
+        headshot = images['players'].get(player.playerId)
+        thumb_file = discord.File(headshot, filename=os.path.basename(headshot)) if headshot else None
 
-        card_data = {
-            'title': 'Waiver Targets', 'league_name': get_league_name(user_id=interaction.user.id),
-            'subtitle': f"{min_owned}-{max_owned}% Owned", 'header_right_val': None, 'header_right_sub': None,
-            'players': players,
-            'footer_label': 'Deepest / Scarcest Position' if footer_value else None, 'footer_value': footer_value,
-        }
-        image_buf = render_player_list_card(card_data)
-        await interaction.followup.send(file=discord.File(fp=image_buf, filename="waiver.png"))
+        pick_tag = tag_for(top_pick)
+        pick_tag_line = "\U0001f48e Hidden Gem\n" if pick_tag == 'GEM' else ("\U0001f525 Popular Pick\n" if pick_tag == 'POP' else "")
+        body = (
+            f"### #1 \u00b7 {player.name}\n"
+            f"{player.position} \u00b7 {player.proTeam or 'FA'} \u00b7 Free Agent\n"
+            f"{pick_tag_line}\n"
+            f"**Rostered:** {top_pick['owned']:.1f}%\n"
+            f"**Proj. Points:** {top_pick['proj']:.1f}"
+        )
+
+        rest = top5[1:]
+        rest_table = None
+        if rest:
+            FIXED = (3, 4, 5, 5, 3)  # #, POS, OWN%, PROJ, TAG
+            name_w = min(_flex_width(CODE_BLOCK_MAX_CHARS, *FIXED), max(len(c['player'].name) for c in rest))
+            header = _table_row([("#", 3), ("PLAYER", name_w), ("POS", 4), ("OWN%", 5), ("PROJ", 5), ("TAG", 3)])[0]
+            rows = []
+            for i, c in enumerate(rest, start=2):
+                p = c['player']
+                rows.extend(_table_row([
+                    (str(i), 3),
+                    (p.name, name_w, '<', True),
+                    (p.position, 4),
+                    (f"{c['owned']:.1f}", 5),
+                    (f"{c['proj']:.1f}", 5),
+                    (tag_for(c), 3),
+                ]))
+            rest_table = _frame_table([header], rows)
+
+        class WaiverView(discord.ui.LayoutView):
+            def __init__(self):
+                super().__init__(timeout=1800)
+                container = discord.ui.Container(accent_colour=EMBED_COLOR_BRAND)
+                container.add_item(discord.ui.TextDisplay(f"-# \U0001f4c8 TOP WAIVER TARGET \u00b7 {min_owned}-{max_owned}% Owned"))
+                if thumb_file:
+                    section = discord.ui.Section(discord.ui.TextDisplay(body), accessory=discord.ui.Thumbnail(f"attachment://{thumb_file.filename}"))
+                    container.add_item(section)
+                else:
+                    container.add_item(discord.ui.TextDisplay(body))
+                if rest_table:
+                    container.add_item(discord.ui.Separator())
+                    container.add_item(discord.ui.TextDisplay(rest_table))
+                if depth_note:
+                    container.add_item(discord.ui.TextDisplay(f"-# {depth_note}"))
+                container.add_item(discord.ui.Separator())
+
+                row = discord.ui.ActionRow()
+                watch_btn = discord.ui.Button(label="Add to Watchlist", style=discord.ButtonStyle.success)
+                order_btn = discord.ui.Button(label="View Waiver Order", style=discord.ButtonStyle.secondary)
+
+                async def on_watch(i: discord.Interaction):
+                    _watchlist.setdefault(i.user.id, set()).add(player.name)
+                    await i.response.send_message(f"\u2705 Added **{player.name}** to your watchlist.", ephemeral=True)
+
+                async def on_order(i: discord.Interaction):
+                    order = sorted(league.teams, key=lambda t: getattr(t, 'waiver_rank', 999))
+                    if not any(getattr(t, 'waiver_rank', None) for t in order):
+                        await i.response.send_message("\u26a0\ufe0f This league/ESPN response doesn't expose waiver priority order via espn_api.", ephemeral=True)
+                        return
+                    lines = [f"{getattr(t, 'waiver_rank', '?')}. {t.team_name}" for t in order]
+                    await i.response.send_message("**Waiver Order**\n" + "\n".join(lines), ephemeral=True)
+
+                watch_btn.callback = on_watch
+                order_btn.callback = on_order
+                row.add_item(watch_btn)
+                row.add_item(order_btn)
+                container.add_item(row)
+                self.add_item(container)
+
+        if thumb_file:
+            await interaction.followup.send(view=WaiverView(), file=thumb_file)
+        else:
+            await interaction.followup.send(view=WaiverView())
     except Exception as e:
         print(f"Waiver command error: {e}")
         await safe_interaction_response(interaction, f"\u274c Error analyzing waiver wire: {e}", ephemeral=True)
@@ -2250,88 +3065,75 @@ async def trade(interaction: discord.Interaction, team1: str, team2: str, team1_
             if status and status not in ('ACTIVE', 'NORMAL'):
                 injury_notes.append(f"Injury Risk: {p.name} is {status.replace('_', ' ').title()}")
 
-        logos = await get_logos_by_url([team1_obj.logo_url])
-        card_data = {
-            'team1_name': team1_obj.team_name, 'team2_name': team2_obj.team_name,
-            'team1_logo': logos.get(team1_obj.logo_url),
-            'send': send_rows, 'receive': receive_rows,
-            'send_total': send_total, 'receive_total': receive_total,
-            'fairness_label': fairness_label, 'trade_type': trade_type,
-            'injury_notes': injury_notes,
-        }
-        image_buf = render_trade_card(card_data)
-        await interaction.followup.send(file=discord.File(fp=image_buf, filename="trade.png"))
+        def trade_table(rows1, rows2):
+            """One combined table, both sides side by side with a '|'
+            divider -- same shape as /matchup's card, not two separate
+            inline embed fields. Inline fields render in a box far
+            narrower than a full-width embed description (discovered
+            live this session: EMBED_CODE_BLOCK_MAX_CHARS was measured
+            from a full-width description and doesn't hold for a 50%-
+            width inline field, so the old two-inline-field layout wrapped
+            its border on real trades). A single full-width table sidesteps
+            that render context entirely -- and, since this card is now a
+            Components V2 Container instead of a classic Embed (same
+            reason /matchup moved off Embed), it gets CODE_BLOCK_MAX_CHARS'
+            wider 65-char budget instead of the Embed's 56, which is what
+            actually keeps two real player names from overflowing on
+            nearly every row the way they did at 56."""
+            n = max(len(rows1), len(rows2))
+            blank = {'name': '', 'position': '', 'avg': None}
+            rows1 = rows1 + [blank] * (n - len(rows1))
+            rows2 = rows2 + [blank] * (n - len(rows2))
+
+            natural1 = max((len(r['name']) for r in rows1), default=0)
+            natural2 = max((len(r['name']) for r in rows2), default=0)
+            FIXED = (4, 5, 1, 4, 5)  # POS, AVG, divider, POS, AVG
+            name_budget = _flex_width(CODE_BLOCK_MAX_CHARS, *FIXED, flex_cols=2)
+            if natural1 + natural2 <= name_budget:
+                w1, w2 = max(natural1, 1), max(natural2, 1)
+            else:
+                w1 = max(6, round(name_budget * natural1 / (natural1 + natural2)))
+                w2 = max(6, name_budget - w1)
+
+            def row_lines(n1, pos1, avg1, n2, pos2, avg2):
+                return _table_row([
+                    (n1, w1, '<', True), (pos1, 4), (avg1, 5, '>'),
+                    ("\u2502", 1, '<', False, True),
+                    (n2, w2, '<', True), (pos2, 4), (avg2, 5, '>'),
+                ])
+
+            header = row_lines("", "POS", "AVG", "", "POS", "AVG")
+            body = []
+            for r1, r2 in zip(rows1, rows2):
+                avg1 = f"{r1['avg']:.1f}" if r1['avg'] is not None else ""
+                avg2 = f"{r2['avg']:.1f}" if r2['avg'] is not None else ""
+                body.extend(row_lines(r1['name'], r1['position'], avg1, r2['name'], r2['position'], avg2))
+            return _frame_table(header, body)
+
+        header_line = f"**{team1_obj.team_name} Sends**  vs  **{team2_obj.team_name} Sends**"
+        table = trade_table(send_rows, receive_rows)
+        body = (
+            f"-# {fairness_label} \u00b7 {trade_type}\n"
+            f"{header_line}\n"
+            f"{table}\n"
+            f"**Avg PPG Traded:** {send_total:.1f}  vs  {receive_total:.1f}"
+        )
+        if injury_notes:
+            body += "\n-# " + " \u00b7 ".join(injury_notes)
+
+        class TradeView(discord.ui.LayoutView):
+            def __init__(self):
+                super().__init__(timeout=1800)
+                container = discord.ui.Container(accent_colour=EMBED_COLOR_BRAND)
+                container.add_item(discord.ui.TextDisplay(body))
+                self.add_item(container)
+
+        await interaction.followup.send(view=TradeView())
     except Exception as e:
         print(f"Trade command error: {e}")
         await safe_interaction_response(interaction, f"\u274c Error analyzing trade: {e}", ephemeral=True)
 
-async def _build_scoreboard_card(league, user_id):
-    """Shared by /scoreboard and its Refresh button."""
-    current_week = getattr(league, 'current_week', 1)
-    box_scores = _safe_box_scores(league, current_week)
-
-    def record_str(t):
-        r = f"{t.wins}-{t.losses}"
-        return r + (f"-{t.ties}" if getattr(t, 'ties', 0) else '')
-
-    def owner_name(t):
-        owners = getattr(t, 'owners', None)
-        if owners:
-            first = owners[0]
-            return (first.get('firstName') or first.get('displayName') or 'Unknown') if isinstance(first, dict) else str(first)
-        return 'Unknown'
-
-    logo_urls = [t.logo_url for t in league.teams]
-    logos = await get_logos_by_url(logo_urls)
-
-    matchups = []
-    for m in box_scores:
-        if not m.home_team or not m.away_team:
-            continue  # bye week
-        gp = [getattr(p, 'game_played', 0) for p in m.home_lineup]
-        if gp and all(v == 100 for v in gp):
-            status, score1, score2 = 'final', float(m.home_score), float(m.away_score)
-        elif any(v > 0 for v in gp):
-            status, score1, score2 = 'live', float(m.home_score), float(m.away_score)
-        else:
-            status, score1, score2 = 'tbd', None, None
-
-        win1 = None if score1 is None else score1 > score2
-        matchups.append({
-            'left': {'name': m.home_team.team_name, 'owner': owner_name(m.home_team), 'record': record_str(m.home_team),
-                     'score': score1, 'win': win1, 'logo_path': logos.get(m.home_team.logo_url)},
-            'right': {'name': m.away_team.team_name, 'owner': owner_name(m.away_team), 'record': record_str(m.away_team),
-                      'score': score2, 'win': None if win1 is None else not win1, 'logo_path': logos.get(m.away_team.logo_url)},
-            'status': status, 'clock': None,  # real live-game clock isn't wired up yet -- see project memory
-        })
-
-    rec_rule = next((r for r in league.settings.scoring_format if r.get('abbr') == 'REC'), None)
-    rec_pts = rec_rule['points'] if rec_rule else 0
-    scoring_label = "Full PPR" if rec_pts == 1 else "Half PPR" if rec_pts == 0.5 else "Standard" if rec_pts == 0 else f"{rec_pts:g} PPR"
-
-    return {
-        'league_name': get_league_name(user_id=user_id),
-        'matchup_count': len(matchups), 'scoring_label': scoring_label,
-        'live_games_count': sum(1 for m in matchups if m['status'] == 'live'),
-        'week_label': f"Week {current_week}", 'matchups': matchups,
-    }
-
-
-class ScoreboardRefreshView(View):
-    def __init__(self, user_id):
-        super().__init__(timeout=1800)  # 30 minutes -- a scoreboard from an hour ago isn't useful to refresh
-        self.user_id = user_id
-
-    @discord.ui.button(label="Refresh", emoji="🔄", style=discord.ButtonStyle.secondary)
-    async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer()
-        league = get_league(user_id=self.user_id)
-        card_data = await _build_scoreboard_card(league, self.user_id)
-        image_buf = render_scoreboard_card(card_data)
-        await interaction.edit_original_response(attachments=[discord.File(fp=image_buf, filename="scoreboard.png")], view=self)
-
-
-@client.tree.command(name="scoreboard", description="Visual scoreboard for all of this week's matchups.")
+@client.tree.command(name="scoreboard", description="Live scoreboard for all of this week's matchups.")
 async def scoreboard(interaction: discord.Interaction):
     if not await safe_defer(interaction):
         return
@@ -2342,9 +3144,26 @@ async def scoreboard(interaction: discord.Interaction):
             await safe_interaction_response(interaction, "❌ No league found. Use `/register_league` to add your ESPN Fantasy League first, or contact an admin if you want to use the default league.", ephemeral=True)
             return
 
-        card_data = await _build_scoreboard_card(league, interaction.user.id)
-        image_buf = render_scoreboard_card(card_data)
-        await interaction.followup.send(file=discord.File(fp=image_buf, filename="scoreboard.png"), view=ScoreboardRefreshView(interaction.user.id))
+        current_week = getattr(league, 'current_week', 1)
+
+        # _scoreboard_container is async (the ESPN box-score fetch it does
+        # runs on a worker thread now, see _safe_box_scores), and a
+        # LayoutView's __init__ can't be async -- so it's built ahead of
+        # time, here and again in on_refresh, and just handed to the view.
+        class ScoreboardView(discord.ui.LayoutView):
+            def __init__(self, container, refresh_btn):
+                super().__init__(timeout=1800)  # 30 minutes -- a scoreboard from an hour ago isn't useful to refresh
+
+                async def on_refresh(i: discord.Interaction):
+                    await i.response.defer()
+                    new_container, new_btn = await _scoreboard_container(league, current_week, interaction.user.id)
+                    await i.edit_original_response(view=ScoreboardView(new_container, new_btn))
+
+                refresh_btn.callback = on_refresh
+                self.add_item(container)
+
+        container, refresh_btn = await _scoreboard_container(league, current_week, interaction.user.id)
+        await interaction.followup.send(view=ScoreboardView(container, refresh_btn))
     except Exception as e:
         print(f"Scoreboard command error: {e}")
         await safe_interaction_response(interaction, f"❌ Error creating scoreboard: {e}", ephemeral=True)
@@ -2752,8 +3571,7 @@ async def compare_cross_league(interaction: discord.Interaction, team1: str, tea
         # (rarely) if the two leagues are on different week numbers.
         card_data = await _build_compare_card(league1_obj, team1_obj, team2_obj, interaction.user.id,
                                                league1_name=league1_name, league2_name=league2_name)
-        image_buf = render_compare_card(card_data)
-        await interaction.followup.send(file=discord.File(fp=image_buf, filename="compare.png"))
+        await interaction.followup.send(embed=_compare_embed(card_data))
     except Exception as e:
         print(f"Compare cross-league command error: {e}")
         await safe_interaction_response(interaction, f"\u274c Error comparing teams: {e}", ephemeral=True)
@@ -2839,13 +3657,12 @@ async def league_info(interaction: discord.Interaction):
                 label = 'BE' if slot == 'BE' else label
                 roster_composition.append(f"{count} {label}")
 
-        card_data = {
-            'league_name': get_league_name(user_id=interaction.user.id),
-            'team_count': len(league.teams), 'season': league.year, 'week_label': f"Week {current_week}",
-            'info_rows': info_rows, 'roster_composition': roster_composition,
-        }
-        image_buf = render_league_info_card(card_data)
-        await interaction.followup.send(file=discord.File(fp=image_buf, filename="league_info.png"))
+        embed = discord.Embed(color=EMBED_COLOR_BRAND, description=f"-# {len(league.teams)} Teams \u00b7 {league.year} Season \u00b7 Week {current_week}")
+        for row in info_rows:
+            embed.add_field(name=row['label'], value=row['value'], inline=True)
+        if roster_composition:
+            embed.add_field(name="Roster Composition", value=", ".join(roster_composition), inline=False)
+        await interaction.followup.send(embed=embed)
     except Exception as e:
         print(f"League info error: {e}")
         await safe_interaction_response(interaction, f"\u274c Error getting league info: {e}", ephemeral=True)
@@ -2876,16 +3693,41 @@ async def insights(interaction: discord.Interaction):
 
         season_leader = max(teams_data, key=lambda t: t['total_points'])
 
-        card_data = {
-            'league_name': get_league_name(user_id=interaction.user.id), 'week_label': f"Week {current_week}",
-            'league_avg_ppg': league_avg_ppg, 'hot': hot, 'cold': cold,
-            'footer_label': 'Season Points Leader', 'footer_value': f"{season_leader['name']} \u00b7 {season_leader['total_points']:.1f}",
-        }
-        image_buf = render_league_pulse_card(card_data)
-        await interaction.followup.send(file=discord.File(fp=image_buf, filename="insights.png"))
+        # This is a classic discord.Embed description, so it budgets
+        # against EMBED_CODE_BLOCK_MAX_CHARS (56), not the Container-only
+        # CODE_BLOCK_MAX_CHARS (65).
+        FIXED = (5, 5, 1)  # PPG, DIFF, emoji
+        name_w = min(_flex_width(EMBED_CODE_BLOCK_MAX_CHARS, *FIXED), max(len(t['name']) for t in hot + cold))
+
+        def insight_lines(t, emoji):
+            return _table_row([(t['name'], name_w, '<', True), (f"{t['ppg']:.1f}", 5), (f"{t['diff']:+.1f}", 5), (emoji, 1)])
+
+        header = _table_row([("TEAM", name_w), ("PPG", 5), ("DIFF", 5)])[0]
+        hot_rows = [line for t in hot for line in insight_lines(t, "\ud83d\udd25")]
+        cold_rows = [line for t in cold for line in insight_lines(t, "\ud83e\uddca")]
+        table = _frame_table([header], hot_rows, cold_rows)
+
+        embed = discord.Embed(color=EMBED_COLOR_BRAND, description=f"-# Week {current_week} \u00b7 League Avg {league_avg_ppg:.1f} ppg\n{table}")
+        embed.set_footer(text=f"Season Points Leader: {season_leader['name']} \u00b7 {season_leader['total_points']:.1f}")
+        await interaction.followup.send(embed=embed)
     except Exception as e:
         print(f"Insights command error: {e}")
         await safe_interaction_response(interaction, f"\u274c Error generating insights: {e}", ephemeral=True)
+
+
+def _reference_embed(data):
+    """Same {'title','subtitle','sections','footer'} contract the old Pillow
+    reference card used -- each section becomes an embed field, side-by-side
+    column pairs stay inline just like the card's layout did."""
+    embed = discord.Embed(color=EMBED_COLOR_BRAND, description=f"-# {data['subtitle']}")
+    for section in data['sections']:
+        row = section if isinstance(section, list) else [section]
+        for sec in row:
+            value = "\n".join(f"**{label}** {desc}" for label, desc in sec['items'])
+            embed.add_field(name=sec['title'], value=value, inline=len(row) > 1)
+    if data.get('footer'):
+        embed.set_footer(text=data['footer'])
+    return embed
 
 
 @client.tree.command(name="welcome", description="Get started guide for using the Fantasy Football bot.")
@@ -2922,7 +3764,6 @@ async def welcome(interaction: discord.Interaction):
                     ("/standings", "Regular season standings"),
                     ("/playoffs", "Playoff bracket"),
                     ("/team [name]", "Team roster & stats"),
-                    ("/bench [name]", "Bench players"),
                     ("/player [name]", "Player details"),
                 ]},
                 {'title': "Advanced Features", 'items': [
@@ -2950,8 +3791,7 @@ async def welcome(interaction: discord.Interaction):
         ],
         'footer': "Pro tip: Pin this message for easy reference! Run /help any time for the full command list.",
     }
-    image_buf = render_reference_card(card_data)
-    await interaction.response.send_message(file=discord.File(fp=image_buf, filename="welcome.png"))
+    await interaction.response.send_message(embed=_reference_embed(card_data))
 
 @client.tree.command(name="help", description="Quick command reference and help.")
 async def help_command(interaction: discord.Interaction):
@@ -2971,7 +3811,6 @@ async def help_command(interaction: discord.Interaction):
                     ("/standings", "Regular season standings"),
                     ("/playoffs", "Playoff bracket"),
                     ("/team [name]", "Team roster"),
-                    ("/bench [name]", "Bench players"),
                     ("/player [name]", "Player stats"),
                     ("/league_info", "League settings"),
                 ]},
@@ -2993,12 +3832,13 @@ async def help_command(interaction: discord.Interaction):
         ],
         'footer': "Use /welcome for detailed setup instructions and finding your ESPN League ID",
     }
-    image_buf = render_reference_card(card_data)
-    await interaction.response.send_message(file=discord.File(fp=image_buf, filename="help.png"), ephemeral=True)
+    await interaction.response.send_message(embed=_reference_embed(card_data), ephemeral=True)
 
 if __name__ == '__main__':
     import time
     import traceback
+
+    _test_table_row()
 
     max_restarts = 5
     restart_count = 0

@@ -156,10 +156,43 @@ as a `discord.ui.Thumbnail`/`Section` accessory inside real commands
 
 Every command in the bot has been reviewed against the `/scoreboard` /
 `/matchup` style bar at least once; `/compare`, `/compare_cross_league`,
-and `/trade` all needed real fixes to get there (see bot.py's inline
-comments on `_compare_embed` and `/trade`'s `trade_table` for what broke
-and why). `/compare`'s table keeps a header row repeating both team names
-on purpose — real user feedback overrode the "don't duplicate the header"
-instinct below: unlike `/matchup`, `/compare`'s rows are bare label/number
-pairs with nothing else to anchor a column to, so dropping the header left
-the table ambiguous on its own.
+`/trade`, `/team`, `/standings`, `/detailed_stats`, and `/insights` all
+needed real fixes to get there. The last four moved from a classic
+discord.Embed to a Components V2 Container purely for the wider code-block
+budget (`CODE_BLOCK_MAX_CHARS`, 65 chars, vs. an Embed's 56 -- 44 if it also
+carries a thumbnail and a field, which is what /team's roster table was
+stuck with) -- see `config/discord_display.py` and bot.py's `_roster_table`/
+`_compare_view` docstrings for the exact numbers. `/compare`'s table
+(`_compare_view`) ended up as one ROW per team (PF/PA/PPG/PROJ as columns,
+like `/standings`' TEAM column) rather than one row per stat with both
+team names sharing a header -- two names sharing one row's width meant an
+outlier name always forced itself onto its own bare line no matter how
+that width was split; putting each team on its own row means a long name
+only ever competes with its own short numbers, never with the other
+team's name.
+
+## Before committing: nothing private, nothing that isn't behind .gitignore
+
+Check this every time, not just when something looks obviously sensitive:
+- `git status` before staging, and actually read the untracked-files list
+  -- don't `git add -A`/`git add .` on autopilot.
+- Anything matching the categories already in `.gitignore` (`.env`,
+  `*.token`, `user_leagues.json`, league/user data files, `logs/`, private
+  working notes under `docs/`) must actually BE ignored, not just
+  resemble something that should be. If a new file in one of these
+  categories doesn't show up grayed-out/untracked as expected, the
+  `.gitignore` pattern is wrong -- fix the pattern, don't hand-exclude the
+  file from just this one commit.
+- Before widening or narrowing any `.gitignore` pattern (e.g. the
+  `docs/*` / `!docs/screenshots/` split -- docs/ holds both private
+  scratch notes and the README's own screenshot source, which need
+  opposite treatment), re-derive what's currently tracked
+  (`git ls-files`) and what's currently ignored-but-present on disk
+  before changing the rule, so the change doesn't silently start
+  tracking something private or silently drop something the README
+  depends on.
+- If a file that should be private is already tracked in git history
+  from before it was added to `.gitignore`, say so explicitly instead of
+  assuming the ignore rule alone fixed it -- ignoring a file only stops
+  *future* changes from being staged; it does not untrack or purge
+  anything already committed.

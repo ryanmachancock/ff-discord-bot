@@ -12,7 +12,13 @@ secrets.json
 user_leagues.json
 league_data.json
 user_data.json
-docs/
+
+# docs/ is for private working notes (session handoffs, scratch analysis --
+# already caught by the *.md rule below too) -- but docs/screenshots/ is
+# the README's own image source and must stay trackable, or README.md's
+# <img> tags break for anyone who doesn't already have those PNGs locally.
+docs/*
+!docs/screenshots/
 
 # Downloaded player headshots / team logos (fetched on demand, not source)
 cache/

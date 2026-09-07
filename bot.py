@@ -9,14 +9,13 @@ import statistics
 from datetime import datetime
 import discord
 from discord import app_commands
-from discord.ui import View
 from dotenv import load_dotenv
 from espn_api.football import League
 import json
 import time
 from typing import Dict, Any, Optional
 from image_cache import get_images, get_logos_by_url
-from config.discord_display import CODE_BLOCK_MAX_CHARS, EMBED_CODE_BLOCK_MAX_CHARS, EMBED_THUMBNAIL_CODE_BLOCK_MAX_CHARS
+from config.discord_display import CODE_BLOCK_MAX_CHARS
 
 # Shared visual style so every command's embeds look like one bot instead of
 # ~15 unrelated ad-hoc colors. BRAND = normal content, the rest are for
@@ -812,12 +811,11 @@ async def detailed_stats(interaction: discord.Interaction, league):
 
     top_proj = max(teams_analysis, key=lambda t: t['week_proj'])
 
-    # This table is a classic discord.Embed description, not a
-    # Components V2 Container, so it budgets against
-    # EMBED_CODE_BLOCK_MAX_CHARS (56), not the wider Container-only
-    # CODE_BLOCK_MAX_CHARS (65) -- see config/discord_display.py.
+    # Components V2 Container, not a classic discord.Embed, so this
+    # budgets against the wider CODE_BLOCK_MAX_CHARS (65) instead of
+    # EMBED_CODE_BLOCK_MAX_CHARS (56) -- see config/discord_display.py.
     FIXED = (3, 5, 5, 4)  # RK, REC, PPG, PWR
-    name_w = min(_flex_width(EMBED_CODE_BLOCK_MAX_CHARS, *FIXED), max(len(r['name']) for r in rankings))
+    name_w = min(_flex_width(CODE_BLOCK_MAX_CHARS, *FIXED), max(len(r['name']) for r in rankings))
     header = _table_row([("RK", 3), ("TEAM", name_w), ("REC", 5), ("PPG", 5), ("PWR", 4)])[0]
     rows = []
     for r in rankings:
@@ -830,9 +828,17 @@ async def detailed_stats(interaction: discord.Interaction, league):
         ]))
     table = _frame_table([header], rows)
 
-    embed = discord.Embed(color=EMBED_COLOR_BRAND, description=f"**Power Rankings**  \u00b7  Top 5\n{table}")
-    embed.set_footer(text=f"Top Week {current_week} Proj: {top_proj['name']} \u00b7 {top_proj['week_proj']:.1f}  \u00b7  League Total {total_points:,.1f}  \u00b7  Avg {avg_ppg:.1f} PPG")
-    await interaction.followup.send(embed=embed)
+    footer = f"-# Top Week {current_week} Proj: {top_proj['name']} \u00b7 {top_proj['week_proj']:.1f}  \u00b7  League Total {total_points:,.1f}  \u00b7  Avg {avg_ppg:.1f} PPG"
+    body = f"**Power Rankings**  \u00b7  Top 5\n{table}\n{footer}"
+
+    class DetailedStatsView(discord.ui.LayoutView):
+        def __init__(self):
+            super().__init__(timeout=1800)
+            container = discord.ui.Container(accent_colour=EMBED_COLOR_BRAND)
+            container.add_item(discord.ui.TextDisplay(body))
+            self.add_item(container)
+
+    await interaction.followup.send(view=DetailedStatsView())
 
 
 @client.tree.command(name="ping", description="Check if the bot is alive.")
@@ -1235,26 +1241,27 @@ def _roster_table(rows):
     measured from CODE_BLOCK_MAX_CHARS, not a guessed cap, same fix
     _matchup_table got: the truncation length should come from real
     display-width measurements (config/discord_display.py), so a name
-    only truncates when it's a genuine outlier, not just because 20 was
-    picked once and never revisited."""
+    only overflows onto its own line when it's a genuine outlier, not a
+    completely ordinary NFL name.
+
+    /team used to be a classic discord.Embed with BOTH a thumbnail (team
+    logo) and a field (bench), which only gets a 44-char budget
+    (EMBED_THUMBNAIL_CODE_BLOCK_MAX_CHARS) -- too tight for a 6-column
+    table to leave real player names any room; "Tetairoa McMillan" and
+    "Michael Pittman Jr." (17-19 chars, nothing exotic) were wrapping
+    onto their own line on nearly every real roster, not just genuine
+    outliers. /team is a Components V2 Container now (same fix /trade
+    got earlier this session), so this budgets against the wider
+    CODE_BLOCK_MAX_CHARS (65) instead.
+
+    Column widths sized to their REAL content, not round numbers: SLOT
+    tops out at "FLEX"/"D/ST" (4), OPP at 3-letter team codes, PTS/PROJ
+    at "999.9" (5), ST at 2-letter status codes.
+    """
     if not rows:
         return "_Empty_"
-    # /team's embed has BOTH a thumbnail (team logo) and a field (bench),
-    # which narrows the real code-block width further than a plain embed
-    # -- budgets against EMBED_THUMBNAIL_CODE_BLOCK_MAX_CHARS (44), not
-    # EMBED_CODE_BLOCK_MAX_CHARS (56) or CODE_BLOCK_MAX_CHARS (65). See
-    # config/discord_display.py.
-    #
-    # Column widths sized to their REAL content, not round numbers: SLOT
-    # tops out at "FLEX"/"D/ST" (4), OPP at 3-letter team codes, PTS/PROJ
-    # at "999.9" (5), ST at 2-letter status codes. The old (5,6,7,7,3)
-    # wasted 2-4 unused chars in every column, which starved this budget's
-    # already-tight name column down to 7 -- so literally every player
-    # name overflowed onto its own line, not just genuine outliers. That's
-    # the actual bug: this table looked broken not because _table_row was
-    # wrong, but because these columns left it almost nothing to work with.
     FIXED = (4, 3, 5, 5, 2)  # SLOT, OPP, PTS, PROJ, ST
-    name_w = min(_flex_width(EMBED_THUMBNAIL_CODE_BLOCK_MAX_CHARS, *FIXED), max(len(r['name']) for r in rows))
+    name_w = min(_flex_width(CODE_BLOCK_MAX_CHARS, *FIXED), max(len(r['name']) for r in rows))
     header = _table_row([("SLOT", 4), ("PLAYER", name_w), ("OPP", 3), ("PTS", 5), ("PROJ", 5), ("ST", 2)])[0]
     lines = []
     for r in rows:
@@ -1269,7 +1276,13 @@ def _roster_table(rows):
     return _frame_table([header], lines)
 
 
-def _team_embed(data):
+def _build_team_container(data, accent=EMBED_COLOR_BRAND):
+    """Builds /team's Components V2 Container -- shared by the initial
+    /team command and every TeamNavView re-render (Prev/Next team/week).
+    Replaces the old classic discord.Embed + set_thumbnail + add_field
+    version: a Container gets CODE_BLOCK_MAX_CHARS (65) instead of the
+    embed-with-thumbnail-and-field context's 44, which is what actually
+    keeps ordinary player names from wrapping (see _roster_table)."""
     starters_table = _roster_table(data['starters'])
     bench = data['bench']
 
@@ -1278,19 +1291,25 @@ def _team_embed(data):
     if season_spark:
         week_line += f"   ·   Season {season_spark}"
 
-    embed = discord.Embed(color=EMBED_COLOR_BRAND, description=(
+    body = (
         f"**{data['team_name']}**  ·  {data['owner_name']}  ·  {data['record']}  ·  Rank {data['rank']} of {data['total_teams']}\n"
         f"{week_line}\n"
         f"{starters_table}"
-    ))
-    embed.add_field(name=f"Bench ({len(bench)})", value=_roster_table(bench), inline=False)
-    embed.set_footer(text=f"Starters Total: {data['starters_total_actual']:.1f} (proj {data['starters_total_proj']:.1f})")
+    )
+    footer = f"-# Starters Total: {data['starters_total_actual']:.1f} (proj {data['starters_total_proj']:.1f})"
 
+    container = discord.ui.Container(accent_colour=accent)
     logo_file = None
     if data['logo_path']:
         logo_file = discord.File(data['logo_path'], filename=os.path.basename(data['logo_path']))
-        embed.set_thumbnail(url=f"attachment://{logo_file.filename}")
-    return embed, logo_file
+        section = discord.ui.Section(discord.ui.TextDisplay(body), accessory=discord.ui.Thumbnail(f"attachment://{logo_file.filename}"))
+        container.add_item(section)
+    else:
+        container.add_item(discord.ui.TextDisplay(body))
+    container.add_item(discord.ui.Separator())
+    container.add_item(discord.ui.TextDisplay(f"**Bench ({len(bench)})**\n{_roster_table(bench)}"))
+    container.add_item(discord.ui.TextDisplay(footer))
+    return container, logo_file
 
 
 async def _prefetch_all_team_logos(league):
@@ -1307,7 +1326,7 @@ async def _prefetch_all_team_logos(league):
         pass
 
 
-class TeamNavView(View):
+class TeamNavView(discord.ui.LayoutView):
     """Prev/Next arrows for team (ordered best-to-worst by record, mirroring
     the visible RANK X OF Y already on the card) and week (capped at the
     league's current week -- future weeks aren't reliably populated yet).
@@ -1316,9 +1335,18 @@ class TeamNavView(View):
     "Rank 2 / 12" / "Wk 1 / 1" label buttons. Those used to exist, but
     they were pure duplication (the card's own body text already says
     "Rank 2 of 12") and made the control twice as bulky as it needed to
-    be. Boundary arrows disable themselves rather than wrapping around."""
+    be. Boundary arrows disable themselves rather than wrapping around.
 
-    def __init__(self, user_id, league, team_order, team_idx, week):
+    A Components V2 LayoutView doesn't support the classic
+    @discord.ui.button decorator pattern (that's a plain-View-only
+    feature) -- every button here is built manually and wired to a
+    callback in __init__, same as every other LayoutView in this bot
+    (MatchupView, WaiverView, etc.). Clicking Team/Week builds a whole
+    new TeamNavView (fresh container, fresh buttons) rather than mutating
+    this one in place, since the container's content has to be rebuilt
+    from the new team/week's data anyway."""
+
+    def __init__(self, user_id, league, team_order, team_idx, week, container):
         super().__init__(timeout=1800)
         self.user_id = user_id
         self.league = league
@@ -1326,42 +1354,45 @@ class TeamNavView(View):
         self.team_idx = team_idx
         self.week = week
         self.max_week = getattr(league, 'current_week', 1)
-        self._sync()
 
-    def _sync(self):
-        self.prev_team.disabled = self.team_idx == 0
-        self.next_team.disabled = self.team_idx == len(self.team_order) - 1
-        self.prev_week.disabled = self.week <= 1
-        self.next_week.disabled = self.week >= self.max_week
+        async def go(interaction: discord.Interaction, d_team=0, d_week=0):
+            await interaction.response.defer()
+            new_idx, new_week = self.team_idx + d_team, self.week + d_week
+            team = next(t for t in self.league.teams if t.team_name == self.team_order[new_idx])
+            card_data = await _build_team_card_data(self.league, team, new_week)
+            new_container, logo_file = _build_team_container(card_data)
+            new_view = TeamNavView(self.user_id, self.league, self.team_order, new_idx, new_week, new_container)
+            attachments = [logo_file] if logo_file else []
+            await interaction.edit_original_response(attachments=attachments, view=new_view)
 
-    async def _render(self, interaction: discord.Interaction):
-        await interaction.response.defer()
-        team = next(t for t in self.league.teams if t.team_name == self.team_order[self.team_idx])
-        card_data = await _build_team_card_data(self.league, team, self.week)
-        embed, logo_file = _team_embed(card_data)
-        self._sync()
-        attachments = [logo_file] if logo_file else []
-        await interaction.edit_original_response(embed=embed, attachments=attachments, view=self)
+        async def on_prev_team(i: discord.Interaction):
+            await go(i, d_team=-1)
 
-    @discord.ui.button(label="◀ Team", style=discord.ButtonStyle.secondary, row=0)
-    async def prev_team(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.team_idx -= 1
-        await self._render(interaction)
+        async def on_next_team(i: discord.Interaction):
+            await go(i, d_team=1)
 
-    @discord.ui.button(label="Team ▶", style=discord.ButtonStyle.secondary, row=0)
-    async def next_team(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.team_idx += 1
-        await self._render(interaction)
+        async def on_prev_week(i: discord.Interaction):
+            await go(i, d_week=-1)
 
-    @discord.ui.button(label="◀ Week", style=discord.ButtonStyle.secondary, row=1)
-    async def prev_week(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.week -= 1
-        await self._render(interaction)
+        async def on_next_week(i: discord.Interaction):
+            await go(i, d_week=1)
 
-    @discord.ui.button(label="Week ▶", style=discord.ButtonStyle.secondary, row=1)
-    async def next_week(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.week += 1
-        await self._render(interaction)
+        row1, row2 = discord.ui.ActionRow(), discord.ui.ActionRow()
+        prev_team_btn = discord.ui.Button(label="◀ Team", style=discord.ButtonStyle.secondary, disabled=team_idx == 0)
+        next_team_btn = discord.ui.Button(label="Team ▶", style=discord.ButtonStyle.secondary, disabled=team_idx == len(team_order) - 1)
+        prev_week_btn = discord.ui.Button(label="◀ Week", style=discord.ButtonStyle.secondary, disabled=week <= 1)
+        next_week_btn = discord.ui.Button(label="Week ▶", style=discord.ButtonStyle.secondary, disabled=week >= self.max_week)
+        prev_team_btn.callback, next_team_btn.callback = on_prev_team, on_next_team
+        prev_week_btn.callback, next_week_btn.callback = on_prev_week, on_next_week
+        row1.add_item(prev_team_btn)
+        row1.add_item(next_team_btn)
+        row2.add_item(prev_week_btn)
+        row2.add_item(next_week_btn)
+
+        container.add_item(discord.ui.Separator())
+        container.add_item(row1)
+        container.add_item(row2)
+        self.add_item(container)
 
 
 @client.tree.command(name="team", description="Generate a visual roster card for a team.")
@@ -1388,16 +1419,16 @@ async def team(interaction: discord.Interaction, league, team_name: str):
 
     current_week = getattr(league, 'current_week', 1)
     card_data = await _build_team_card_data(league, team, current_week)
-    embed, logo_file = _team_embed(card_data)
+    container, logo_file = _build_team_container(card_data)
 
     ranked_teams = sorted(league.teams, key=lambda t: (getattr(t, 'wins', 0), getattr(t, 'points_for', 0)), reverse=True)
     team_order = [t.team_name for t in ranked_teams]
-    view = TeamNavView(interaction.user.id, league, team_order, team_order.index(team.team_name), current_week)
+    view = TeamNavView(interaction.user.id, league, team_order, team_order.index(team.team_name), current_week, container)
 
     if logo_file:
-        await interaction.followup.send(embed=embed, file=logo_file, view=view)
+        await interaction.followup.send(view=view, file=logo_file)
     else:
-        await interaction.followup.send(embed=embed, view=view)
+        await interaction.followup.send(view=view)
 
 
 # ============================================================================
@@ -1694,7 +1725,7 @@ async def _build_compare_card(league, team1_obj, team2_obj, user_id, league1_nam
     }
 
 
-def _compare_embed(data):
+def _compare_view(data):
     """Aligned monospace table shared by /compare and /compare_cross_league
     -- one ROW per team (PF/PA/PPG/PROJ as columns), not one row per stat
     with both team names crammed into a shared header.
@@ -1716,10 +1747,12 @@ def _compare_embed(data):
 
     # One fixed width per stat column, wide enough for its own header
     # abbreviation and both teams' values -- summed by _flex_width from
-    # real widths (this is a classic discord.Embed, not a Container, see
-    # config/discord_display.py) rather than a hand-counted constant.
+    # real widths (config/discord_display.py) rather than a hand-counted
+    # constant. This is a Components V2 Container, not a classic
+    # discord.Embed, so it budgets against the wider CODE_BLOCK_MAX_CHARS
+    # (65), not EMBED_CODE_BLOCK_MAX_CHARS (56).
     stat_widths = [max(len(r['abbrev']), len(r['left_val']), len(r['right_val'])) for r in data['rows']]
-    name_w = min(_flex_width(EMBED_CODE_BLOCK_MAX_CHARS, *stat_widths), max(len(name1), len(name2), 6))
+    name_w = min(_flex_width(CODE_BLOCK_MAX_CHARS, *stat_widths), max(len(name1), len(name2), 6))
 
     header_lines = _table_row([("", name_w, '<', True)] + [(r['abbrev'], w, '>') for r, w in zip(data['rows'], stat_widths)])
     row1 = _table_row([(name1, name_w, '<', True)] + [(r['left_val'], w, '>') for r, w in zip(data['rows'], stat_widths)])
@@ -1727,8 +1760,16 @@ def _compare_embed(data):
     table = _frame_table(header_lines, [*row1, *row2])
 
     header_line = f"**{name1}**  `{t1['record']}`  vs  **{name2}**  `{t2['record']}`  ·  Week {data['current_week']}"
-    desc = (f"-# {data['series_note']}\n" if data['series_note'] else "") + f"{header_line}\n{table}"
-    return discord.Embed(color=EMBED_COLOR_BRAND, description=desc)
+    body = (f"-# {data['series_note']}\n" if data['series_note'] else "") + f"{header_line}\n{table}"
+
+    class CompareView(discord.ui.LayoutView):
+        def __init__(self):
+            super().__init__(timeout=1800)
+            container = discord.ui.Container(accent_colour=EMBED_COLOR_BRAND)
+            container.add_item(discord.ui.TextDisplay(body))
+            self.add_item(container)
+
+    return CompareView()
 
 
 @client.tree.command(name="compare", description="Visual season-long comparison of two teams.")
@@ -1746,7 +1787,7 @@ async def compare(interaction: discord.Interaction, league, team1: str, team2: s
         return
 
     card_data = await _build_compare_card(league, team1_obj, team2_obj, interaction.user.id)
-    await interaction.followup.send(embed=_compare_embed(card_data))
+    await interaction.followup.send(view=_compare_view(card_data))
 
 
 @client.tree.command(name="standings", description="Show league standings with records and points.")
@@ -1766,15 +1807,15 @@ async def standings(interaction: discord.Interaction, league):
     teams_data.sort(key=lambda t: (t['win_pct'], t['pf']), reverse=True)
 
     # Name column width comes from the real measured code-block budget
-    # (config/discord_display.py), not a guessed-then-tuned cap. This
-    # table is a classic discord.Embed, so it budgets against
-    # EMBED_CODE_BLOCK_MAX_CHARS (56), not the Container-only
-    # CODE_BLOCK_MAX_CHARS (65). Names longer than the budget don't
-    # truncate -- they get their own line via _table_row instead
-    # (e.g. "Swift Nation (Travis version)"), per explicit feedback
-    # that truncation isn't acceptable even for outliers.
+    # (config/discord_display.py), not a guessed-then-tuned cap. This is a
+    # Components V2 Container, so it budgets against the wider
+    # CODE_BLOCK_MAX_CHARS (65), not the classic-Embed-only
+    # EMBED_CODE_BLOCK_MAX_CHARS (56). Names longer than even that budget
+    # don't truncate -- they get their own line via _table_row instead
+    # (e.g. "Swift Nation (Travis version)"), per explicit feedback that
+    # truncation isn't acceptable even for outliers.
     FIXED = (3, 5, 7, 4)  # RK, W-L, PF, STRK
-    name_w = min(_flex_width(EMBED_CODE_BLOCK_MAX_CHARS, *FIXED), max(len(t['team'].team_name) for t in teams_data))
+    name_w = min(_flex_width(CODE_BLOCK_MAX_CHARS, *FIXED), max(len(t['team'].team_name) for t in teams_data))
     header = _table_row([("RK", 3), ("TEAM", name_w), ("W-L", 5), ("PF", 7), ("STRK", 4)])[0]
     rows = []
     for i, t in enumerate(teams_data):
@@ -1810,10 +1851,18 @@ async def standings(interaction: discord.Interaction, league):
         gb = ((leader['wins'] - chaser['wins']) + (chaser['losses'] - leader['losses'])) / 2
         footer_text = f"Playoff cutoff: {playoff_team_count} teams · {chaser['team'].team_name} is {gb:.1f} games back"
 
-    embed = discord.Embed(color=EMBED_COLOR_BRAND, description=f"**{week_label}**\n{table}")
+    body = f"**{week_label}**\n{table}"
     if footer_text:
-        embed.set_footer(text=footer_text)
-    await interaction.followup.send(embed=embed)
+        body += f"\n-# {footer_text}"
+
+    class StandingsView(discord.ui.LayoutView):
+        def __init__(self):
+            super().__init__(timeout=1800)
+            container = discord.ui.Container(accent_colour=EMBED_COLOR_BRAND)
+            container.add_item(discord.ui.TextDisplay(body))
+            self.add_item(container)
+
+    await interaction.followup.send(view=StandingsView())
 
 
 
@@ -3082,7 +3131,7 @@ async def compare_cross_league(interaction: discord.Interaction, team1: str, tea
         #
         # league1_name/league2_name are what trigger the "Different Leagues"
         # note and the "(League Name)" suffix on each team's display name in
-        # _compare_embed -- only pass them when the leagues are genuinely
+        # _compare_view -- only pass them when the leagues are genuinely
         # different. Both optional args default to the caller's own league,
         # so calling this with neither `league1` nor `league2` given always
         # resolved to the SAME League object, but this used to pass the
@@ -3096,7 +3145,7 @@ async def compare_cross_league(interaction: discord.Interaction, team1: str, tea
             league1_name=None if same_league else league1_name,
             league2_name=None if same_league else league2_name,
         )
-        await interaction.followup.send(embed=_compare_embed(card_data))
+        await interaction.followup.send(view=_compare_view(card_data))
     except Exception as e:
         print(f"Compare cross-league command error: {e}")
         await safe_interaction_response(interaction, f"\u274c Error comparing teams: {e}", ephemeral=True)
@@ -3199,11 +3248,11 @@ async def insights(interaction: discord.Interaction, league):
 
     season_leader = max(teams_data, key=lambda t: t['total_points'])
 
-    # This is a classic discord.Embed description, so it budgets
-    # against EMBED_CODE_BLOCK_MAX_CHARS (56), not the Container-only
-    # CODE_BLOCK_MAX_CHARS (65).
+    # Components V2 Container, so this budgets against the wider
+    # CODE_BLOCK_MAX_CHARS (65), not the classic-Embed-only
+    # EMBED_CODE_BLOCK_MAX_CHARS (56).
     FIXED = (5, 5, 1)  # PPG, DIFF, emoji
-    name_w = min(_flex_width(EMBED_CODE_BLOCK_MAX_CHARS, *FIXED), max(len(t['name']) for t in hot + cold))
+    name_w = min(_flex_width(CODE_BLOCK_MAX_CHARS, *FIXED), max(len(t['name']) for t in hot + cold))
 
     def insight_lines(t, emoji):
         return _table_row([(t['name'], name_w, '<', True), (f"{t['ppg']:.1f}", 5), (f"{t['diff']:+.1f}", 5), (emoji, 1)])
@@ -3213,9 +3262,19 @@ async def insights(interaction: discord.Interaction, league):
     cold_rows = [line for t in cold for line in insight_lines(t, "\ud83e\uddca")]
     table = _frame_table([header], hot_rows, cold_rows)
 
-    embed = discord.Embed(color=EMBED_COLOR_BRAND, description=f"-# Week {current_week} \u00b7 League Avg {league_avg_ppg:.1f} ppg\n{table}")
-    embed.set_footer(text=f"Season Points Leader: {season_leader['name']} \u00b7 {season_leader['total_points']:.1f}")
-    await interaction.followup.send(embed=embed)
+    body = (
+        f"-# Week {current_week} \u00b7 League Avg {league_avg_ppg:.1f} ppg\n{table}\n"
+        f"-# Season Points Leader: {season_leader['name']} \u00b7 {season_leader['total_points']:.1f}"
+    )
+
+    class InsightsView(discord.ui.LayoutView):
+        def __init__(self):
+            super().__init__(timeout=1800)
+            container = discord.ui.Container(accent_colour=EMBED_COLOR_BRAND)
+            container.add_item(discord.ui.TextDisplay(body))
+            self.add_item(container)
+
+    await interaction.followup.send(view=InsightsView())
 
 
 def _reference_embed(data):

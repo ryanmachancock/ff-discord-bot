@@ -20,12 +20,13 @@ Covers, in order:
      (colors count toward len() but not toward visible width -- a real
      historical bug).
   3. The higher-level table-building functions that take plain data and
-     return a string/embed without needing a live league or interaction
-     object: _roster_table, _matchup_table, _compare_embed.
+     return a string/view without needing a live league or interaction
+     object: _roster_table, _matchup_table, _compare_view.
 
 No pytest/unittest -- plain functions and asserts, run in sequence from
 __main__.
 """
+import asyncio
 import os
 import sys
 
@@ -271,13 +272,32 @@ def test_matchup_table():
     print(f"OK: _matchup_table -- both sides overflowed independently, {len(lines)} lines all width {width}, divider never vanishes")
 
 
+def _view_body_text(view):
+    """Pulls the plain text back out of a LayoutView built as `Container
+    > TextDisplay` (every command's view in bot.py follows this exact
+    shape) -- the Components V2 equivalent of reading `.description` off
+    a classic discord.Embed."""
+    return view.children[0].children[0].content
+
+
+async def _make(build_fn, data):
+    """discord.ui.LayoutView.__init__ needs a running event loop
+    (asyncio.get_running_loop()), so any view-building function must be
+    called from inside one -- test functions themselves stay plain sync
+    calls via asyncio.run(_make(...)), same as bot.py's own command
+    handlers are always called from inside discord.py's loop."""
+    return build_fn(data)
+
+
 def test_compare_embed():
-    """_compare_embed (/compare and /compare_cross_league): one row per
+    """_compare_view (/compare and /compare_cross_league): one row per
     team (PF/PA/PPG/PROJ as columns, like /standings' TEAM column), not
     one row per stat with both team names sharing a header -- so a real
     outlier name (LONG_TEAM_NAME, 30 chars) must now fit on a single line
     with no overflow at all, and an even more extreme synthetic name must
-    still never truncate even when it does overflow."""
+    still never truncate even when it does overflow. Also confirms this
+    renders as a Components V2 Container (CODE_BLOCK_MAX_CHARS, 65), not
+    a classic discord.Embed (EMBED_CODE_BLOCK_MAX_CHARS, 56)."""
     data = {
         'team1': {'name': LONG_TEAM_NAME, 'record': '8-3'},
         'team2': {'name': 'Tyler is Fine', 'record': '5-6', 'league': 'Dynasty'},
@@ -289,13 +309,13 @@ def test_compare_embed():
             {'abbrev': 'STRK', 'left_val': 'W3', 'right_val': 'L1'},
         ],
     }
-    embed = bot._compare_embed(data)
-    desc = embed.description
+    view = asyncio.run(_make(bot._compare_view, data))
+    desc = _view_body_text(view)
     assert "…" not in desc
     assert LONG_TEAM_NAME in desc, "full outlier team name must appear verbatim"
 
     lines = _table_lines_from(desc)
-    _assert_uniform_width(lines, "_compare_embed (realistic outlier)")
+    _assert_uniform_width(lines, "_compare_view (realistic outlier)")
     assert any(LONG_TEAM_NAME in l and "112.4" in l for l in lines), \
         "a realistic 30-char outlier name should fit on the SAME line as its own stats now, not overflow onto its own bare line"
 
@@ -303,11 +323,11 @@ def test_compare_embed():
     # does overflow onto its own line at this length.
     extreme_name = "The " + LONG_TEAM_NAME * 2
     data2 = {**data, 'team1': {'name': extreme_name, 'record': '8-3'}}
-    desc2 = bot._compare_embed(data2).description
+    desc2 = _view_body_text(asyncio.run(_make(bot._compare_view, data2)))
     assert "…" not in desc2
     assert extreme_name in desc2, "even an extreme outlier name must appear verbatim, never truncated"
-    width = _assert_uniform_width(_table_lines_from(desc2), "_compare_embed (extreme outlier)")
-    print(f"OK: _compare_embed -- realistic outlier fits inline, extreme outlier still never truncates, width {width}")
+    width = _assert_uniform_width(_table_lines_from(desc2), "_compare_view (extreme outlier)")
+    print(f"OK: _compare_view -- realistic outlier fits inline, extreme outlier still never truncates, width {width}")
 
 
 TESTS = [

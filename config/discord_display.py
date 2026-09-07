@@ -1,10 +1,14 @@
-"""Empirically measured Discord fenced-code-block wrap widths, per render
-context -- never hard-code a wrap-width number anywhere else.
+"""Empirically measured Discord fenced-code-block wrap width -- never
+hard-code a wrap-width number anywhere else.
 
-Every live command renders natively (Components V2 Container or classic
-discord.Embed); there is no Pillow-image path left in the bot. These three
-constants are what every table-building function in bot.py budgets its
-column widths against (see bot.py's `_flex_width`), one per render context.
+Every table-bearing command renders as a Components V2 Container now
+(LayoutView + discord.ui.Container + TextDisplay) -- /standings, /compare,
+/detailed_stats, and /insights were the last ones still on a classic
+discord.Embed, converted this session for exactly this reason: an Embed's
+code block only gets a 56-char budget (44 if it also carries a thumbnail
+and a field, as /team's roster card did), and both were narrow enough that
+completely ordinary names -- not just genuine outliers -- were wrapping
+onto their own line. A Container gets 65, measured below.
 """
 
 # --- Fenced ```code block``` wrap width -------------------------------
@@ -32,44 +36,3 @@ column widths against (see bot.py's `_flex_width`), one per render context.
 # desktop width, re-measure via /testwidth if a table wraps unexpectedly
 # on a much narrower client.
 CODE_BLOCK_MAX_CHARS = 65
-
-# --- Fenced code block wrap width inside a classic discord.Embed -------
-#
-# CODE_BLOCK_MAX_CHARS above was measured from a Components V2 Container
-# (LayoutView + discord.ui.Container), which is a different render context
-# from a classic discord.Embed(description=...) -- and they turned out to
-# have different real caps. Discovered 2026-09-06 when the standings table
-# (an embed, not a Container) wrapped its border badly even though it was
-# well under CODE_BLOCK_MAX_CHARS: measured via /testwidth2, the same
-# digit-string-at-increasing-n technique as CODE_BLOCK_MAX_CHARS, but
-# posted as `discord.Embed(description=f"```\n{line}\n```")`. The embed's
-# code block tops out at 488px of content width (vs. the Container's
-# 566px) and the real wrap boundary is 56 chars: 56 stays on one line
-# (height 34px), 57 wraps (height 52px).
-#
-# Any table built with a classic discord.Embed description (standings,
-# compare, insights, detailed_stats, trade) must budget against this
-# constant, not CODE_BLOCK_MAX_CHARS -- only Components V2 Container-based
-# commands (matchup, bench, scoreboard, waiver, sleeper) get the wider one.
-EMBED_CODE_BLOCK_MAX_CHARS = 56
-
-# --- Fenced code block wrap width inside a discord.Embed that ALSO has a
-# --- thumbnail and a field (e.g. /team's roster card) -----------------
-#
-# /team's roster table wrapped badly even though it was sized under
-# EMBED_CODE_BLOCK_MAX_CHARS (56) -- a THIRD render context. Measured
-# 2026-09-06 via /testwidth3: a synthetic embed with set_thumbnail() (a
-# real attached file, not a raw external URL -- that silently failed to
-# render at all on the first attempt, which is why the very first
-# measurement attempt didn't reproduce the bug) plus one
-# add_field(inline=False). That test found 47 as the boundary and still
-# wrapped in the real /team card at 47 -- the synthetic embed didn't
-# fully match /team's actual structure (longer multi-line description,
-# a footer, and an attached View with nav buttons all plausibly narrow
-# it further; not isolated one-by-one, given how long this had already
-# taken). Rather than keep chasing the exact structural cause, bisected
-# directly against the real /team command instead: 44 confirmed clean
-# (no wrap, verified live) with some headroom to spare, so this is a
-# slightly conservative real-world-verified value rather than a
-# from-first-principles exact boundary.
-EMBED_THUMBNAIL_CODE_BLOCK_MAX_CHARS = 44

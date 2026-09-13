@@ -1,66 +1,48 @@
 # 🏈 ESPN Fantasy Football Discord Bot
 
-A comprehensive Discord bot that integrates with ESPN Fantasy Football API to provide real-time league data, analytics, and interactive features for your fantasy football server.
+A Discord bot for ESPN Fantasy Football leagues — standings, matchups, waiver suggestions, trade analysis, and a bunch of other stuff, pulled live from ESPN's API and posted as clean, readable tables right in your server.
 
-> **Note:** This is a personal project shared for educational purposes. Feel free to use and modify for your own needs, but please note that active maintenance and support are not guaranteed.
+> This is a personal project I built for my own league and I'm sharing it in case it's useful to someone else. It works well for me; I can't promise ongoing support, but feel free to use it, fork it, or send a PR.
 
-## ✨ Features
+## Features
 
-- **Multi-League Support** - Register and manage multiple ESPN Fantasy leagues
-- **Real-Time Data** - Live scoring, standings, and player statistics with caching
-- **Advanced Analytics** - Power rankings, efficiency metrics, and weekly insights
-- **Smart Autocomplete** - Type-ahead suggestions for team and player names
-- **Background Refresh** - Automatic data updates for faster response times
-- **Interactive Commands** - Visual team cards, scoreboards, and matchup analysis
-- **Cross-League Comparisons** - Compare teams from different leagues
-- **Private League Support** - Full access to private ESPN leagues with authentication
-- **Performance Optimized** - 5-minute caching with sub-second response times
+Handles multiple leagues at once — your own, and everyone else's in the server if they want to register theirs too. Pulls live scores and standings with a short cache so it's not hammering ESPN's API every time someone runs a command, and has a handful of commands beyond the basics: power rankings, who's actually been lucky this season, waiver pickups, sleeper picks, trade analysis. Works with private leagues too, if you're willing to hand it your ESPN session cookies (read the warning below before you do that).
 
-## 🚀 Quick Start
+Everything renders as plain bordered tables instead of an image — loads instantly, stays sharp at any zoom level, and nothing ever gets cut off with an ellipsis, even a 30-character joke team name. The playoff bracket is a real bracket too, built from actual recorded matchups rather than a guessed seeding formula.
+
+## Quick Start
 
 ### Prerequisites
 
-- Python 3.8 or higher
-- Discord Developer Account
-- ESPN Fantasy Football League (public or private)
+- Python 3.8+
+- A Discord bot application (see below)
+- An ESPN Fantasy Football league — public or private
 
 ### Installation
 
-1. **Clone the repository**
-   ```bash
-   git clone https://github.com/ryanmachancock/ff-discord-bot.git
-   cd ff-discord-bot
-   ```
+```bash
+git clone https://github.com/ryanmachancock/ff-discord-bot.git
+cd ff-discord-bot
+pip install -r requirements.txt
+cp .env.example .env
+```
 
-2. **Install dependencies**
-   ```bash
-   pip install -r requirements.txt
-   ```
+Fill in `.env` (see [Configuration](#configuration)), then run:
 
-3. **Create environment file**
-   ```bash
-   cp .env.example .env
-   ```
+```bash
+python bot.py
+```
 
-4. **Configure your bot** (see [Configuration](#-configuration) section)
-
-5. **Run the bot**
-   ```bash
-   python bot.py
-   ```
-
-## ⚙️ Configuration
+## Configuration
 
 ### Discord Bot Setup
 
 1. Go to the [Discord Developer Portal](https://discord.com/developers/applications)
 2. Create a new application and bot
 3. Copy the bot token
-4. Invite the bot to your server with appropriate permissions
+4. Invite the bot to your server with the permissions it needs (Send Messages, Use Slash Commands, Embed Links)
 
 ### Environment Variables
-
-Edit your `.env` file with the following configuration:
 
 ```env
 # Discord Bot Configuration
@@ -70,84 +52,87 @@ DISCORD_TOKEN=your_discord_bot_token_here
 ESPN_LEAGUE_ID=your_league_id_here
 ESPN_SEASON_ID=2025
 
-# ESPN Authentication (Required for private leagues only)
+# ESPN Authentication (only needed if this is a private league)
 ESPN_SWID=your_swid_cookie_value_here
 ESPN_S2=your_espn_s2_cookie_value_here
 ```
 
 ### Finding ESPN Credentials
 
-For **private leagues**, you'll need to get your ESPN authentication cookies:
+Public leagues don't need any of this — skip straight to running the bot. For a private league:
 
-1. Login to [ESPN Fantasy Football](https://fantasy.espn.com)
-2. Open browser developer tools (F12)
-3. Go to Application/Storage → Cookies → fantasy.espn.com
-4. Find and copy the values for:
-   - `SWID` (including the curly braces)
-   - `espn_s2` (long URL-encoded string)
+1. Log into [ESPN Fantasy Football](https://fantasy.espn.com)
+2. Open dev tools (F12) → Application/Storage → Cookies → fantasy.espn.com
+3. Copy `SWID` (including the curly braces) and `espn_s2` (a long URL-encoded string)
 
-**Note:** Public leagues don't require ESPN authentication credentials.
+**⚠️ Know what you're sharing:** `SWID` and `espn_s2` are your live ESPN
+login session, not a throwaway ID — anyone who has both can act as you on
+ESPN (mess with your fantasy lineup, and whatever else that ESPN account is
+signed into) until the session expires or you log out elsewhere. If members
+of your server are registering their own private leagues, tell them to DM
+the bot with these instead of typing them in a channel — Discord shows a
+slash command's typed arguments to everyone in the channel even when the
+bot's own reply is private. The bot encrypts them at rest with Windows
+DPAPI before they touch disk, but whoever's running the bot still has to be
+someone you'd trust with an ESPN session, same as any bot you hand
+credentials to.
 
-## 📋 Commands Reference
+## Commands Reference
 
-Data commands render natively in Discord (bordered monospace tables inside
-Components V2 Containers or classic Embeds) rather than a hand-drawn image,
-so results stay readable, load instantly, and never truncate a name or
-value no matter how much data they carry. See `CLAUDE.md` for the visual
-style standard these commands are held to.
+Data commands render as bordered monospace tables rather than an image, so results load instantly and nothing truncates no matter how much data or how long a name gets. See `CLAUDE.md` for the exact style these are held to.
 
-### 🎯 Core Team Commands
+### Core Team Commands
 
 | Command | Description | Parameters |
 |---------|-------------|------------|
-| `/team` | Visual roster card for a team (starters and bench), with Prev/Next buttons to browse teams and weeks | `team_name` |
-| `/compare` | Visual season-long comparison of two teams | `team1`, `team2` |
-| `/player` | Visual player card with season stats | `player_name` |
+| `/team` | Roster card for a team (starters and bench), with Prev/Next buttons to browse teams and weeks | `team_name` |
+| `/compare` | Season-long comparison of two teams | `team1`, `team2` |
+| `/player` | Player card with season stats | `player_name` |
 
-### 📊 League Information & Analytics
+### League Information & Analytics
 
 | Command | Description | Parameters |
 |---------|-------------|------------|
 | `/standings` | Regular season standings with records and points | None |
-| `/playoffs` | Visual championship playoff bracket | None |
+| `/playoffs` | Championship playoff bracket, built from real recorded matchups | None |
 | `/stats` | League superlatives -- consistency, luck, schedule strength | None |
 | `/insights` | League pulse -- who's hot, who's cold, by season PPG | None |
 | `/detailed_stats` | Power rankings and league-wide scoring analytics | None |
-| `/scoreboard` | Visual scoreboard for all of this week's matchups | None |
+| `/scoreboard` | Live scoreboard for all of this week's matchups | None |
 | `/league_info` | Display league settings and configuration | None |
 
-### 🔍 Analysis & Strategy
+### Analysis & Strategy
 
 | Command | Description | Parameters |
 |---------|-------------|------------|
-| `/matchup` | Head-to-head visual matchup card for this week | `team1`, `team2` (optional) |
-| `/trade` | Visual trade analysis between two teams | `team1`, `team2`, `team1_players`, `team2_players` |
+| `/matchup` | Head-to-head matchup card for this week | `team1`, `team2` (optional) |
+| `/trade` | Trade analysis between two teams | `team1`, `team2`, `team1_players`, `team2_players` |
 | `/waiver` | Top waiver wire pickup recommendations | `position` (optional), `min_owned`, `max_owned` |
 | `/sleeper` | Find undervalued sleeper picks | `position` (optional) |
 
-### 🏆 Multi-League Management
+### Multi-League Management
 
 | Command | Description | Parameters |
 |---------|-------------|------------|
-| `/register_league` | Register a new ESPN league | `league_id`, `league_name`, `swid` (optional), `espn_s2` (optional) |
+| `/register_league` | Register a new ESPN league | `league_id`, `league_name`, `swid` (optional), `espn_s2` (optional) -- DM the bot if providing swid/espn_s2 |
 | `/my_leagues` | View your registered leagues | None |
 | `/switch_league` | Switch your default league | `league_name` |
 | `/remove_league` | Remove a league from your account | `league_name` |
 | `/all_leagues` | View all available server leagues | None |
 | `/compare_cross_league` | Compare teams from different leagues | `team1`, `team2`, `league1` (optional), `league2` (optional) |
 
-### 🛠️ Utility & Debug Commands
+### Utility & Debug Commands
 
 | Command | Description | Parameters |
 |---------|-------------|------------|
-| `/help` | Quick command reference | None |
-| `/welcome` | Complete setup and usage guide | None |
+| `/help` | Quick command reference for members | None |
+| `/welcome` | Admin setup and operations guide (admin only) | None |
 | `/league_status` | Show current default league and status | None |
 | `/ping` | Check if bot is responsive | None |
 | `/sync_commands` | Manually sync commands (admin only) | None |
 | `/debug_autocomplete` | Test autocomplete functionality (admin only) | None |
 
-## 📸 Command Examples
+## Command Examples
 
 ### `/team` - Team Roster Display
 ><img width="640" alt="/team command example" src="docs/screenshots/team.png" />
@@ -164,30 +149,12 @@ style standard these commands are held to.
 ### `/playoffs` - Playoff Bracket
 ><img width="640" alt="/playoffs command example" src="docs/screenshots/playoffs.png" />
 
-## 🆕 Recent Improvements
+### `/waiver` - Waiver Wire Recommendations
+><img width="640" alt="/waiver command example" src="docs/screenshots/waiver.png" />
 
-### Native Rendering, Never Truncated
-- **Bordered tables, not images** - Tabular data (rosters, standings, matchups, scoreboards) renders as aligned monospace tables through a shared layout system (`_table_row`/`_frame_table` in `bot.py`), not a hand-drawn PNG, so it loads instantly and stays sharp at any Discord zoom level
-- **Nothing ever truncates** - Even a genuine outlier (an unusually long team or player name) always renders in full; the layout system gives it its own line rather than cutting it off with an ellipsis
-- **Smart Autocomplete** - Team-name commands share one cached autocomplete lookup for instant suggestions
-- **Real playoff bracket** - `/playoffs` renders an actual bracket with connector lines, byes, and the reigning champion, built from real recorded matchups (not a hardcoded seeding formula)
-
-### Performance Optimizations
-- **Background Refresh** - Data pre-loads every 3 minutes for instant responses
-- **Smart Caching** - 5-minute TTL cache reduces ESPN API calls by 80%
-- **Non-blocking ESPN calls** - Box-score lookups run off the main event loop, so one slow ESPN request can't stall the whole bot for every other server
-- **Better Error Handling** - Helpful error messages with suggestions instead of technical errors
-
-### New Analytics Commands
-- **`/insights`** - Weekly performance dashboard with hot/cold teams and trends
-- **`/detailed_stats`** - Advanced analytics with power rankings and efficiency metrics
-- **Enhanced `/compare`** - Side-by-side team analysis with win probability
-
-## 🔧 Advanced Usage
+## Advanced Usage
 
 ### Multi-League Setup
-
-The bot supports managing multiple ESPN leagues simultaneously:
 
 1. Use `/register_league` to add each of your leagues
 2. Use `/switch_league` to change your default league
@@ -196,15 +163,13 @@ The bot supports managing multiple ESPN leagues simultaneously:
 
 ### Private League Access
 
-For private leagues, you'll need to provide ESPN authentication:
-
 ```bash
 /register_league league_id:123456 league_name:"My Private League" swid:"{YOUR-SWID}" espn_s2:"YOUR-ESPN-S2-COOKIE"
 ```
 
-## 🐛 Troubleshooting
+**DM the bot this command** rather than running it in a server channel -- see the warning under [Finding ESPN Credentials](#finding-espn-credentials) for why.
 
-### Common Issues
+## Troubleshooting
 
 **Bot not responding to commands:**
 - Check that the bot has proper permissions in your Discord server
@@ -212,28 +177,32 @@ For private leagues, you'll need to provide ESPN authentication:
 - Use `/ping` to test basic connectivity
 
 **"League not found" errors:**
-- Verify your league ID is correct (found in ESPN URL)
-- For private leagues, ensure SWID and espn_s2 cookies are valid
+- Verify your league ID is correct (found in the ESPN URL)
+- For private leagues, make sure your SWID and espn_s2 cookies are still valid -- they do expire
 - Check that the season year matches your league settings
 
 **ESPN API timeout errors:**
-- ESPN API can be slow during peak times (Sunday game days)
-- The bot includes automatic retry logic for temporary failures
-- Commands will show "Fetching data..." while processing
+- ESPN's API can be slow during peak times (Sunday game days especially)
+- The bot retries automatically on a timeout
+- Commands will show "Fetching data..." while they wait on ESPN
 
 ### Getting Help
 
 - Use `/help` for a quick command reference
-- Use `/welcome` for a comprehensive setup guide
+- Server admins: use `/welcome` for the setup and operations guide
 
-## 📝 Requirements
+## Requirements
 
-See `requirements.txt` for the complete list of Python dependencies. Key libraries include:
+See `requirements.txt` for the full list. The main ones:
 
 - `discord.py` - Discord bot framework
 - `espn-api` - ESPN Fantasy Sports API wrapper
 - `python-dotenv` - Environment variable management
 
+## License
+
+MIT -- see [LICENSE](LICENSE).
+
 ---
 
-**Note:** This bot is not affiliated with ESPN or Discord. ESPN Fantasy Football is a trademark of ESPN, Inc.
+This bot isn't affiliated with ESPN or Discord. ESPN Fantasy Football is a trademark of ESPN, Inc.

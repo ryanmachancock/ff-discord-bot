@@ -3,6 +3,8 @@ print("Starting Fantasy Football bot...")
 import os
 import re
 import asyncio
+import base64
+import ctypes
 import functools
 import inspect
 import statistics
@@ -124,7 +126,7 @@ class BackgroundRefreshManager:
                     # Refresh this league's data
                     league = await asyncio.to_thread(
                         fetch_league_sync, league_info['league_id'], league_info['year'],
-                        league_info.get('swid'), league_info.get('espn_s2'))
+                        _dpapi_decrypt(league_info.get('swid')), _dpapi_decrypt(league_info.get('espn_s2')))
 
                     # Cache the refreshed data
                     espn_cache.set(cache_key, league)
@@ -257,6 +259,84 @@ async def player_name_autocomplete(interaction: discord.Interaction, current: st
         traceback.print_exc()
         return []
 
+# Windows DPAPI (crypt32.dll via ctypes -- no extra dependency): encrypts
+# ESPN swid/espn_s2 cookies before they touch disk in user_leagues.json.
+# CRYPTPROTECT_LOCAL_MACHINE ties the ciphertext to this machine rather than
+# to one Windows user profile, since the bot runs as a pm2 Windows Service
+# under LocalSystem but may also get run manually under a real login --
+# either way it can decrypt what it wrote. It does NOT hide the cookie from
+# whoever runs the bot process on this machine (nothing can -- the bot must
+# decrypt on its own for the unattended 3-minute background refresh). What
+# it stops is the plaintext leaking if user_leagues.json itself ever ends up
+# somewhere else -- an accidental commit, a folder backup, a copied drive --
+# where it becomes inert without this exact machine's DPAPI key.
+_CRYPTPROTECT_LOCAL_MACHINE = 0x4
+_CRYPTPROTECT_UI_FORBIDDEN = 0x1
+
+class _DATA_BLOB(ctypes.Structure):
+    _fields_ = [('cbData', ctypes.c_uint32), ('pbData', ctypes.c_void_p)]
+
+# Explicit argtypes/restype: ctypes defaults to c_int for unmarshalled args,
+# which silently truncates/overflows real 64-bit pointers on this ABI.
+ctypes.windll.crypt32.CryptProtectData.argtypes = [
+    ctypes.POINTER(_DATA_BLOB), ctypes.c_wchar_p, ctypes.POINTER(_DATA_BLOB),
+    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(_DATA_BLOB)]
+ctypes.windll.crypt32.CryptProtectData.restype = ctypes.c_int
+ctypes.windll.crypt32.CryptUnprotectData.argtypes = [
+    ctypes.POINTER(_DATA_BLOB), ctypes.c_wchar_p, ctypes.POINTER(_DATA_BLOB),
+    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(_DATA_BLOB)]
+ctypes.windll.crypt32.CryptUnprotectData.restype = ctypes.c_int
+ctypes.windll.kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+ctypes.windll.kernel32.LocalFree.restype = ctypes.c_void_p
+
+def _dpapi_blob(data: bytes):
+    buf = ctypes.create_string_buffer(data, len(data))
+    return _DATA_BLOB(len(data), ctypes.cast(buf, ctypes.c_void_p)), buf
+
+def _dpapi_encrypt(plaintext: str) -> str:
+    """Encrypt a string with DPAPI, base64-encoded for JSON storage."""
+    in_blob, _buf = _dpapi_blob(plaintext.encode('utf-8'))
+    out_blob = _DATA_BLOB()
+    flags = _CRYPTPROTECT_LOCAL_MACHINE | _CRYPTPROTECT_UI_FORBIDDEN
+    if not ctypes.windll.crypt32.CryptProtectData(
+        ctypes.byref(in_blob), None, None, None, None, flags, ctypes.byref(out_blob)
+    ):
+        raise ctypes.WinError()
+    try:
+        ciphertext = ctypes.string_at(out_blob.pbData, out_blob.cbData)
+    finally:
+        ctypes.windll.kernel32.LocalFree(out_blob.pbData)
+    return "dpapi:" + base64.b64encode(ciphertext).decode('ascii')
+
+def _dpapi_decrypt(value: str) -> str:
+    """Decrypt a value from _dpapi_encrypt. Passes plain strings through
+    unchanged so cookies saved before this feature existed still work --
+    they just won't be encrypted until the user re-registers."""
+    if not value or not value.startswith("dpapi:"):
+        return value
+    in_blob, _buf = _dpapi_blob(base64.b64decode(value[len("dpapi:"):]))
+    out_blob = _DATA_BLOB()
+    if not ctypes.windll.crypt32.CryptUnprotectData(
+        ctypes.byref(in_blob), None, None, None, None, _CRYPTPROTECT_UI_FORBIDDEN, ctypes.byref(out_blob)
+    ):
+        raise ctypes.WinError()
+    try:
+        return ctypes.string_at(out_blob.pbData, out_blob.cbData).decode('utf-8')
+    finally:
+        ctypes.windll.kernel32.LocalFree(out_blob.pbData)
+
+def _test_dpapi_roundtrip():
+    """Smoke test: encrypted cookies must round-trip, be unreadable as
+    plaintext on disk, and pre-existing plaintext values must pass through
+    untouched (migration safety)."""
+    secret = "{AAAA1111-BBBB-2222-CCCC-333344445555}"
+    encrypted = _dpapi_encrypt(secret)
+    assert encrypted != secret, "ciphertext must not equal the plaintext"
+    assert secret not in encrypted, "plaintext must not be recoverable by substring"
+    assert _dpapi_decrypt(encrypted) == secret, "must decrypt back to the original value"
+    assert _dpapi_decrypt(None) is None, "None must pass through untouched"
+    assert _dpapi_decrypt("plain-old-cookie") == "plain-old-cookie", "pre-migration plaintext must pass through"
+
 class LeagueManager:
     def __init__(self):
         self.data_file = 'user_leagues.json'
@@ -310,8 +390,8 @@ class LeagueManager:
             'name': league_name_from_api or league_name,
             'league_id': league_id,
             'owner_id': user_id,
-            'swid': swid,
-            'espn_s2': espn_s2,
+            'swid': _dpapi_encrypt(swid) if swid else swid,
+            'espn_s2': _dpapi_encrypt(espn_s2) if espn_s2 else espn_s2,
             'year': season_year
         }
 
@@ -364,8 +444,8 @@ class LeagueManager:
                 return League(
                     league_id=league_info['league_id'],
                     year=league_info['year'],
-                    swid=league_info['swid'],
-                    espn_s2=league_info['espn_s2']
+                    swid=_dpapi_decrypt(league_info['swid']),
+                    espn_s2=_dpapi_decrypt(league_info['espn_s2'])
                 )
             else:
                 return League(
@@ -431,8 +511,8 @@ class LeagueManager:
                 return League(
                     league_id=league_info['league_id'],
                     year=league_info['year'],
-                    swid=league_info['swid'],
-                    espn_s2=league_info['espn_s2']
+                    swid=_dpapi_decrypt(league_info['swid']),
+                    espn_s2=_dpapi_decrypt(league_info['espn_s2'])
                 )
             else:
                 return League(
@@ -2916,6 +2996,15 @@ async def scoreboard(interaction: discord.Interaction, league):
 )
 async def register_league(interaction: discord.Interaction, league_id: str, league_name: str, swid: str = None, espn_s2: str = None):
     """Register a user's ESPN Fantasy League"""
+    if (swid or espn_s2) and interaction.guild is not None:
+        await interaction.response.send_message(
+            "🔒 SWID/ESPN_S2 are your ESPN login cookies -- typing them here would post them in this "
+            "channel for everyone to see, even though my reply is private.\n"
+            "DM me `/register_league` instead so they never appear in a server channel "
+            "(public leagues don't need them at all).",
+            ephemeral=True
+        )
+        return
     try:
         await interaction.response.defer(ephemeral=True)
 
@@ -3479,80 +3568,67 @@ def _reference_embed(data):
     return embed
 
 
-@client.tree.command(name="welcome", description="Get started guide for using the Fantasy Football bot.")
+@client.tree.command(name="welcome", description="Bot admin setup guide (admin only).")
+@app_commands.checks.has_permissions(administrator=True)
 async def welcome(interaction: discord.Interaction):
-    """Comprehensive welcome and setup guide"""
+    """Admin-focused setup and operations guide"""
     card_data = {
-        'title': "Welcome to Fantasy Football Bot",
-        'subtitle': "Your complete guide to dominating fantasy football with data-driven insights",
+        'title': "Fantasy Football Bot -- Admin Guide",
+        'subtitle': "Setup and operations for whoever runs this bot",
         'sections': [
-            {'title': "Quick Start (New Users)", 'items': [
-                ("1.", "Run /register_league with your ESPN League ID"),
-                ("2.", "Try /scoreboard to see live scores"),
-                ("3.", "Check out /league_info for your league details"),
-                ("4.", "Run /help any time for the full command reference"),
+            {'title': "Default Server League", 'items': [
+                ("•", "Set once via .env: ESPN_LEAGUE_ID, ESPN_SEASON_ID"),
+                ("•", "Private default league also needs ESPN_SWID, ESPN_S2 in .env"),
+                ("•", "Members use it automatically -- no per-user setup needed"),
             ]},
             [
-                {'title': "How to Find Your ESPN League ID", 'items': [
-                    ("1.", "Go to your ESPN Fantasy Football league"),
-                    ("2.", "URL: fantasy.espn.com/football/league?leagueId=XXXXXX"),
-                    ("3.", "Copy the numbers after leagueId="),
-                    ("4.", "That's your League ID!"),
+                {'title': "Members' Own Leagues", 'items': [
+                    ("•", "Members self-serve with /register_league"),
+                    ("•", "Public leagues: just a league_id, safe in any channel"),
+                    ("•", "Private leagues need swid/espn_s2 -- tell members to DM "
+                          "me the command, never type cookies in a server channel"),
                 ]},
-                {'title': "Private Leagues (Need SWID & ESPN_S2 Cookies)", 'items': [
-                    ("•", "Log into ESPN in your browser"),
-                    ("•", "Open Developer Tools (F12)"),
-                    ("•", "Go to Application → Cookies"),
-                    ("•", "Find SWID and espn_s2 values"),
-                    ("•", "Use them in /register_league"),
-                ]},
-            ],
-            [
-                {'title': "Most Popular Commands", 'items': [
-                    ("/scoreboard", "Live weekly scores"),
-                    ("/standings", "Regular season standings"),
-                    ("/playoffs", "Playoff bracket"),
-                    ("/team [name]", "Team roster & stats"),
-                    ("/player [name]", "Player details"),
-                ]},
-                {'title': "Advanced Features", 'items': [
-                    ("/compare [team1] [team2]", "Team comparison"),
-                    ("/stats", "League analytics"),
-                    ("/trade", "Trade analyzer"),
-                    ("/sleeper", "Sleeper pick finder"),
-                    ("/waiver", "Waiver wire analysis"),
-                    ("/matchup", "Weekly matchup preview"),
+                {'title': "Where Data Lives", 'items': [
+                    ("•", "user_leagues.json, next to the bot, gitignored"),
+                    ("•", "Holds Discord user IDs, league IDs, and any ESPN "
+                          "cookies members registered"),
+                    ("•", "swid/espn_s2 are DPAPI-encrypted at rest (tied to "
+                          "this PC) -- but this bot's process still decrypts "
+                          "them on its own, so only run trusted code here"),
                 ]},
             ],
-            [
-                {'title': "Multiple Leagues", 'items': [
-                    ("•", "Register multiple leagues with /register_league"),
-                    ("•", "View all your leagues: /my_leagues"),
-                    ("•", "Switch active league: /switch_league"),
-                    ("•", "Remove leagues: /remove_league"),
-                    ("•", "Check current status: /league_status"),
-                ]},
-                {'title': "Need Help?", 'items': [
-                    ("•", "Run /help for quick command reference"),
-                    ("•", "All commands work with your registered league automatically"),
-                ]},
-            ],
+            {'title': "Admin-Only Commands", 'items': [
+                ("/sync_commands", "Force Discord to re-sync the command list"),
+                ("/debug_autocomplete", "Check autocomplete is pulling league data"),
+            ]},
+            {'title': "Your Responsibility as Admin", 'items': [
+                ("•", "swid/espn_s2 are members' live ESPN login sessions, "
+                      "not disposable IDs -- /help spells this out to them, "
+                      "but it's your bot holding that trust"),
+            ]},
         ],
-        'footer': "Pro tip: Pin this message for easy reference! Run /help any time for the full command list.",
+        'footer': "Members should use /help -- this guide is for whoever administers the bot.",
     }
-    await interaction.response.send_message(embed=_reference_embed(card_data))
+    await interaction.response.send_message(embed=_reference_embed(card_data), ephemeral=True)
 
 @client.tree.command(name="help", description="Quick command reference and help.")
 async def help_command(interaction: discord.Interaction):
-    """Quick help and command reference"""
+    """Quick help and command reference for server members"""
     card_data = {
         'title': "Fantasy Football Bot Help",
-        'subtitle': "Quick command reference · Use /welcome for the full setup guide",
+        'subtitle': "Quick command reference",
         'sections': [
             {'title': "Getting Started", 'items': [
-                ("New users:", "Run /welcome for complete setup guide"),
-                ("Register league:", "/register_league [league_id] [name]"),
-                ("Finding League ID?", "Check /welcome"),
+                ("Public league:", "/register_league [league_id] [name]"),
+                ("Private league:", "DM me the same command with swid/espn_s2 -- "
+                                    "never type cookies in a server channel"),
+                ("Finding League ID?", "It's the number in your ESPN league URL: "
+                                       "fantasy.espn.com/football/league?leagueId=XXXXXX"),
+                ("Before you share swid/espn_s2:", "These are your live ESPN login "
+                                                    "cookies, not throwaway IDs -- anyone "
+                                                    "with them can act as you on ESPN. Only "
+                                                    "provide them if you trust whoever runs "
+                                                    "this bot with that."),
             ]},
             [
                 {'title': "Core Commands", 'items': [
@@ -3579,7 +3655,7 @@ async def help_command(interaction: discord.Interaction):
                 ("/all_leagues", "Available leagues"),
             ]},
         ],
-        'footer': "Use /welcome for detailed setup instructions and finding your ESPN League ID",
+        'footer': "All commands work with your registered league automatically.",
     }
     await interaction.response.send_message(embed=_reference_embed(card_data), ephemeral=True)
 
@@ -3588,6 +3664,7 @@ if __name__ == '__main__':
     import traceback
 
     _test_table_row()
+    _test_dpapi_roundtrip()
 
     max_restarts = 5
     restart_count = 0

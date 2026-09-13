@@ -50,7 +50,7 @@ DISCORD_TOKEN=your_discord_bot_token_here
 
 # ESPN Fantasy Football League Configuration
 ESPN_LEAGUE_ID=your_league_id_here
-ESPN_SEASON_ID=2025
+ESPN_SEASON_ID=2026
 
 # ESPN Authentication (only needed if this is a private league)
 ESPN_SWID=your_swid_cookie_value_here

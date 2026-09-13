@@ -2,7 +2,7 @@
 
 A Discord bot for ESPN Fantasy Football leagues — standings, matchups, waiver suggestions, trade analysis, and a bunch of other stuff, pulled live from ESPN's API and posted as clean, readable tables right in your server.
 
-> This is a personal project I built for my own league and I'm sharing it in case it's useful to someone else. It works well for me; I can't promise ongoing support, but feel free to use it, fork it, or send a PR.
+> This is a personal project I built for my own league and I'm sharing it in case it's useful to someone else. It works well for me; I can't promise ongoing support, but feel free to use it or fork it yourself.
 
 ## Features
 
